@@ -10,7 +10,7 @@ export function ProcessingView() {
   useEffect(() => {
     const interval = setInterval(() => {
       setStage((s) => Math.min(s + 1, PROCESSING_STAGES.length - 1))
-    }, 500)
+    }, 600)
     return () => clearInterval(interval)
   }, [])
 

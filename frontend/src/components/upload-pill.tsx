@@ -135,14 +135,14 @@ export function UploadPill({ onAnalyze }: UploadPillProps) {
                   className="w-full text-left px-4 py-3 rounded-xl hover:bg-white/5 flex items-center gap-3 text-sm text-white/80 font-medium transition-colors"
                 >
                   <ImageIcon className="h-4 w-4 text-neuro-cyan" />
-                  <span>Add 2D MRI slice (.jpg)</span>
+                  <span>Add 2D MRI slice (.jpg / .png)</span>
                 </button>
                 <button
                   onClick={() => fileInputRef.current?.click()}
                   className="w-full text-left px-4 py-3 rounded-xl hover:bg-white/5 flex items-center gap-3 text-sm text-white/80 font-medium transition-colors"
                 >
                   <Box className="h-4 w-4 text-neuro-violet" />
-                  <span>Add 3D NIfTI volume (.nii)</span>
+                  <span>Add 3D NIfTI volume (.nii / .nii.gz)</span>
                 </button>
               </div>
             )}
@@ -151,10 +151,10 @@ export function UploadPill({ onAnalyze }: UploadPillProps) {
           <button
             type="button"
             onClick={() => !file && fileInputRef.current?.click()}
-            className="flex-1 px-2 sm:px-3 text-left"
+            className="flex-1 px-2 sm:px-3 text-left cursor-pointer"
           >
             <span className={`text-sm sm:text-base font-medium ${file ? "text-white/80" : "text-white/40"}`}>
-              {file ? "Ready to analyze scan…" : "Upload an MRI scan or 3D volume…"}
+              {file ? "Ready to analyze scan..." : "Upload an MRI scan or 3D volume..."}
             </span>
           </button>
 
@@ -169,7 +169,7 @@ export function UploadPill({ onAnalyze }: UploadPillProps) {
             aria-label="Analyze scan"
             className={`w-10 h-10 rounded-full flex items-center justify-center transition-all duration-300 shrink-0 ${
               file
-                ? "bg-white text-black shadow-[0_0_18px_rgba(255,255,255,0.35)] hover:bg-white/90"
+                ? "bg-white text-black shadow-[0_0_18px_rgba(255,255,255,0.35)] hover:bg-white/90 cursor-pointer"
                 : "bg-white/10 text-white/40 cursor-not-allowed"
             }`}
           >

@@ -17,6 +17,7 @@ torchvision==0.17.0
 numpy==1.26.3
 Pillow==10.2.0
 nibabel==5.2.0
+opencv-python-headless==5.0.0.93
 
 # Storage & Utilities
 minio==7.2.4

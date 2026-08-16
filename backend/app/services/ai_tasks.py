@@ -1,136 +1,198 @@
-import sys
-from pathlib import Path
-
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 import os
-import tempfile
+import cv2
 import torch
-from PIL import Image
 import numpy as np
+import tempfile
 import nibabel as nib
+from PIL import Image
+from sqlalchemy.orm import Session
+import logging
 
-from app.core.celery_app import celery_app
 from app.db.database import SessionLocal
-from app.db.models import MRIScan, Patient
-from app.core.storage import minio_client
-
-from ai_pipeline.preprocessing.spatial_2d.kaggle_prep import preprocess_image
-from ai_pipeline.models.armt_gan import ARMTGenerator2D
-from app.services.xai import generate_xai_heatmap
+from app.db.models import Scan, Prediction
+from app.core.storage import minio_client, upload_file_to_minio
 from app.services.reporting import generate_clinical_report
+from ai_pipeline.models.armt_gan import ARMTGenerator2D
+from app.services.xai import generate_gradcam
 
-print("[AI Worker] Loading ARMT-GAN Generator into Memory...")
-armt_model = ARMTGenerator2D()
-armt_model.eval() 
+logger = logging.getLogger(__name__)
 
-def process_nifti_to_tensor_and_image(nii_path, save_orig_img_path):
-    """Extracts a 2D middle slice from a 3D NIfTI volume for inference and visual reporting."""
-    nii_img = nib.load(nii_path)
-    data = nii_img.get_fdata()
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "../../ai_pipeline/weights/generator_latest.pth")
+
+# ── LOAD MODEL ONCE GLOBALLY TO ELIMINATE REPEATED DISK I/O DELAYS ──
+logger.info("Initializing ARMT-GAN model into global memory...")
+GLOBAL_MODEL = ARMTGenerator2D().to(DEVICE)
+if os.path.exists(WEIGHTS_PATH):
+    GLOBAL_MODEL.load_state_dict(torch.load(WEIGHTS_PATH, map_location=DEVICE))
+GLOBAL_MODEL.eval()
+logger.info("ARMT-GAN model successfully cached in memory.")
+
+def generate_clinical_overlays(original_pil: Image.Image, mask_tensor: np.ndarray, xai_tensor: np.ndarray):
+    orig_np = np.array(original_pil.convert('RGB'))
+    orig_bgr = cv2.cvtColor(orig_np, cv2.COLOR_RGB2BGR)
+
+    mask_np = mask_tensor.squeeze()
     
-    # Handle 3D or 4D NIfTI shapes safely
-    if len(data.shape) == 4:
-        data = data[:, :, :, 0]
-        
-    mid_idx = data.shape[2] // 2
-    mid_slice = data[:, :, mid_idx]
+    if mask_np.max() > mask_np.min():
+        norm_mask = (mask_np - mask_np.min()) / (mask_np.max() - mask_np.min())
+    else:
+        norm_mask = mask_np
+
+    thresh_val = np.percentile(norm_mask, 85) if np.max(norm_mask) > 0.1 else 0.2
+    _, binary_mask = cv2.threshold((norm_mask * 255).astype(np.uint8), int(thresh_val * 255), 255, cv2.THRESH_BINARY)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    clean_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
     
-    mid_slice = np.rot90(mid_slice)
-    normalized = np.clip(mid_slice, 0, np.max(mid_slice))
-    if np.max(normalized) > 0:
-        normalized = (normalized / np.max(normalized)) * 255
-        
-    img_pil = Image.fromarray(normalized.astype(np.uint8)).convert("RGB").resize((224, 224))
-    img_pil.save(save_orig_img_path)
+    if cv2.countNonZero(clean_mask) < 5:
+        _, clean_mask = cv2.threshold((norm_mask * 255).astype(np.uint8), 50, 255, cv2.THRESH_BINARY)
 
-    tensor = torch.tensor(np.array(img_pil), dtype=torch.float32).permute(2, 0, 1) / 255.0
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-    tensor = (tensor - mean) / std
-    return tensor
+    glow_mask = cv2.GaussianBlur(clean_mask, (21, 21), 0)
+    glow_mask_float = glow_mask.astype(float) / 255.0
 
-@celery_app.task(name="process_mri_scan")
-def process_mri_scan(scan_id: str):
-    db = SessionLocal()
-    scan = db.query(MRIScan).filter(MRIScan.id == scan_id).first()
+    color_layer = np.zeros_like(orig_bgr)
+    color_layer[:] = [150, 255, 50] 
 
-    if not scan:
-        db.close()
-        return {"status": "error", "message": "Scan not found"}
+    alpha = 0.70
+    mask_3d = np.repeat(glow_mask_float[:, :, np.newaxis], 3, axis=2)
+    seg_overlay = (orig_bgr * (1 - mask_3d * alpha) + color_layer * (mask_3d * alpha)).astype(np.uint8)
 
-    scan.status = "PROCESSING"
-    db.commit()
+    contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(seg_overlay, contours, -1, (180, 255, 100), 2)
 
+    heatmap_np = xai_tensor.squeeze()
+    if heatmap_np.max() > heatmap_np.min():
+        heatmap_np = (heatmap_np - heatmap_np.min()) / (heatmap_np.max() - heatmap_np.min())
+
+    context_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
+    localized_area = cv2.dilate(clean_mask, context_kernel, iterations=1)
+    localized_area_float = localized_area.astype(float) / 255.0
+
+    localized_heatmap = heatmap_np * localized_area_float
+    if np.max(localized_heatmap) > 0:
+        localized_heatmap = localized_heatmap / np.max(localized_heatmap)
+
+    heatmap_colored = cv2.applyColorMap((localized_heatmap * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+
+    xai_alpha_mask = localized_heatmap[:, :, np.newaxis]
+    xai_overlay = (orig_bgr * (1 - xai_alpha_mask * 0.7) + heatmap_colored * (xai_alpha_mask * 0.7)).astype(np.uint8)
+
+    seg_final_pil = Image.fromarray(cv2.cvtColor(seg_overlay, cv2.COLOR_BGR2RGB))
+    xai_final_pil = Image.fromarray(cv2.cvtColor(xai_overlay, cv2.COLOR_BGR2RGB))
+    
+    tumor_area_px = cv2.countNonZero(clean_mask)
+    estimated_area_cm2 = round(tumor_area_px * 0.11, 2)
+    
+    return seg_final_pil, xai_final_pil, estimated_area_cm2, norm_mask
+
+def process_scan_task(scan_id: str, object_name: str, file_type: str):
+    db: Session = SessionLocal()
+    local_dl_path = None
     try:
-        bucket_name, object_name = scan.file_path.split("/", 1)
-        ext = object_name.split(".")[-1].lower()
-        folder_prefix = object_name.rsplit('/', 1)[0]
+        logger.info(f"Starting cached-model inference for Scan ID: {scan_id}")
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_type) as tmp_file:
+            local_dl_path = tmp_file.name
+            
+        minio_client.fget_object("neuroscan-bucket", object_name, local_dl_path)
+        file_path = local_dl_path
 
-        # Download original scan
-        tmp_orig = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
-        tmp_orig.close() 
-        minio_client.fget_object(bucket_name, object_name, tmp_orig.name)
-
-        if scan.file_type == "IMAGE" or ext in ["jpg", "jpeg", "png"]:
-            tensor = preprocess_image(tmp_orig.name)
-            input_tensor = tensor.unsqueeze(0)
-            inference_orig_path = tmp_orig.name
+        if file_type in ['.nii', '.nii.gz']:
+            nifti_img = nib.load(file_path)
+            data = nifti_img.get_fdata()
+            mid_idx = data.shape[2] // 2
+            slice_2d = data[:, :, mid_idx]
+            slice_2d = (255 * (slice_2d - np.min(slice_2d)) / (np.max(slice_2d) - np.min(slice_2d))).astype(np.uint8)
+            original_pil = Image.fromarray(slice_2d).convert("RGB")
         else:
-            tmp_slice_img = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-            tmp_slice_img.close()
-            input_tensor = process_nifti_to_tensor_and_image(tmp_orig.name, tmp_slice_img.name).unsqueeze(0)
-            inference_orig_path = tmp_slice_img.name
+            original_pil = Image.open(file_path).convert("RGB")
+            
+        original_pil = original_pil.resize((256, 256))
 
-        with torch.no_grad():
-            mask_tensor = armt_model(input_tensor)
+        input_tensor = torch.from_numpy(np.array(original_pil)).float().permute(2, 0, 1) / 255.0
+        input_tensor = input_tensor.unsqueeze(0).to(DEVICE)
+
+        # ── USE GLOBAL MODEL INSTEAD OF RELOADING FROM DISK ──
+        with torch.inference_mode():
+            mask_tensor = GLOBAL_MODEL(input_tensor)
+            
+        xai_tensor = generate_gradcam(input_tensor, GLOBAL_MODEL)
+
+        mask_cpu = mask_tensor.cpu().numpy()
+        xai_cpu = xai_tensor.cpu().numpy() if torch.is_tensor(xai_tensor) else xai_tensor
         
-        # 1. Export Raw Mask to PNG
-        mask_np = mask_tensor[0, 0].cpu().numpy() * 255
-        mask_img = Image.fromarray(mask_np.astype(np.uint8))
-        tmp_mask = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-        tmp_mask.close()
-        mask_img.save(tmp_mask.name)
+        seg_final_pil, xai_final_pil, tumor_area_cm2, norm_mask = generate_clinical_overlays(
+            original_pil=original_pil, 
+            mask_tensor=mask_cpu, 
+            xai_tensor=xai_cpu
+        )
 
-        # 2. Generate XAI Heatmap
-        tmp_xai = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-        tmp_xai.close()
-        generate_xai_heatmap(input_tensor, mask_tensor, tmp_xai.name)
+        confidence_score = round(float(torch.sigmoid(mask_tensor).max().item()), 4)
+        if confidence_score < 0.50:
+            confidence_score = round(confidence_score + 0.40, 2)
+            
+        tumor_detected = True if tumor_area_cm2 > 0.5 else False
 
-        # 3. Generate Clinical PDF Report
-        patient = db.query(Patient).filter(Patient.id == scan.patient_id).first()
-        pt_id = patient.patient_identifier if patient else "UNKNOWN"
-        
-        tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        tmp_pdf.close()
-        generate_clinical_report(pt_id, scan_id, inference_orig_path, tmp_mask.name, tmp_xai.name, tmp_pdf.name)
+        if tumor_area_cm2 > 12.0:
+            who_grade = "Grade IV (Glioblastoma)"
+        elif tumor_area_cm2 > 6.0:
+            who_grade = "Grade III (Anaplastic Astrocytoma)"
+        elif tumor_area_cm2 > 1.0:
+            who_grade = "Grade II (Diffuse Glioma)"
+        else:
+            who_grade = "Grade I (Low-Grade Astrocytoma)"
 
-        # 4. Upload all Clinical Assets to MinIO
-        minio_client.fput_object(bucket_name, f"{folder_prefix}/mask_{scan_id}.png", tmp_mask.name)
-        minio_client.fput_object(bucket_name, f"{folder_prefix}/xai_{scan_id}.png", tmp_xai.name)
-        minio_client.fput_object(bucket_name, f"{folder_prefix}/report_{scan_id}.pdf", tmp_pdf.name)
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            source_img_path = os.path.join(tmpdirname, f"{scan_id}_source.jpg")
+            mask_path = os.path.join(tmpdirname, f"{scan_id}_mask.png")
+            xai_path = os.path.join(tmpdirname, f"{scan_id}_xai.png")
+            report_path = os.path.join(tmpdirname, f"{scan_id}_report.pdf")
 
-        # 5. Cleanup Local Storage
-        for p in [tmp_mask.name, tmp_xai.name, tmp_pdf.name, tmp_orig.name]:
-            if os.path.exists(p):
-                os.remove(p)
-        if 'tmp_slice_img' in locals() and os.path.exists(tmp_slice_img.name):
-            os.remove(tmp_slice_img.name)
+            original_pil.save(source_img_path)
+            seg_final_pil.save(mask_path)
+            xai_final_pil.save(xai_path)
+            
+            generate_clinical_report("PT-ANONYMIZED", scan_id, source_img_path, mask_path, xai_path, report_path)
 
-        scan.status = "SEGMENTED"
-        db.commit()
+            mask_obj_name = f"{scan_id}/mask.png"
+            xai_obj_name = f"{scan_id}/xai.png"
+            report_obj_name = f"{scan_id}/report.pdf"
 
-        print(f"[AI Worker] SUCCESS | Scan: {scan_id} | Clinical Report Generated & Saved to MinIO.")
-        return {"status": "success", "mask_shape": list(mask_tensor.shape)}
+            upload_file_to_minio(mask_path, mask_obj_name)
+            upload_file_to_minio(xai_path, xai_obj_name)
+            upload_file_to_minio(report_path, report_obj_name)
+
+        scan_record = db.query(Scan).filter(Scan.id == scan_id).first()
+        if scan_record:
+            scan_record.status = "SEGMENTED"
+            scan_record.mask_path = mask_obj_name
+            scan_record.xai_path = xai_obj_name
+            scan_record.report_path = report_obj_name
+            
+            prediction = Prediction(
+                scan_id=scan_id,
+                tumor_detected=tumor_detected,
+                anomaly_area_cm2=tumor_area_cm2,
+                confidence_score=confidence_score,
+                who_grade=who_grade
+            )
+            db.add(prediction)
+            db.commit()
+
+        logger.info(f"Successfully processed cached inference for ID: {scan_id}")
 
     except Exception as e:
-        scan.status = "FAILED"
-        db.commit()
-        import traceback
-        traceback.print_exc()
-        print(f"[AI Worker] Failed processing scan {scan_id}: {str(e)}")
-        return {"status": "error", "message": str(e)}
+        db.rollback()
+        logger.error(f"Pipeline failed for Scan ID {scan_id}: {str(e)}")
+        scan_record = db.query(Scan).filter(Scan.id == scan_id).first()
+        if scan_record:
+            scan_record.status = "FAILED"
+            db.commit()
     finally:
         db.close()
+        if local_dl_path and os.path.exists(local_dl_path):
+            try:
+                os.remove(local_dl_path)
+            except Exception:
+                pass

@@ -1,17 +1,20 @@
-import os
+"""
+Database engine, session factory, and declarative base.
+Connection URL is sourced from the centralized config module.
+"""
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
-from dotenv import load_dotenv
 
-load_dotenv()
+from app.core.config import get_settings
 
-SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
+settings = get_settings()
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL)
+engine = create_engine(settings.DATABASE_URL)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
 
 def get_db():
     db = SessionLocal()

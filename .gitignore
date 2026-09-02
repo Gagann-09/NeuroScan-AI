@@ -61,10 +61,12 @@ backend/datasets/
 *.nii.gz
 
 # =========================
-# OS & IDE
+# OS & IDE & Local Configs
 # =========================
 .DS_Store
 Thumbs.db
 *.log
 .vscode/
 .idea/
+.openclaude*
+neuroscan_inspection.txt

@@ -1,53 +1,112 @@
+const API_BASE_URL = "http://127.0.0.1:8000"
 
-const API_BASE_URL = "http://127.0.0.1:8000";
+export type BraTSModality =
+  | "t1"
+  | "t1ce"
+  | "t2"
+  | "flair"
 
-export async function uploadScan(file: File): Promise<{ scan_id: string; status: string }> {
-    const formData = new FormData();
-    formData.append("file", file);
+export type BraTSFiles = Record<BraTSModality, File>
 
-    const response = await fetch(`${API_BASE_URL}/api/v1/scans/upload`, {
-        method: "POST",
-        body: formData,
-    });
-
-    if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.detail || "Failed to upload scan to backend.");
-    }
-
-    return response.json();
+export type UploadResponse = {
+  scan_id: string
+  status: string
+  message: string
 }
 
-export async function getScanStatus(scanId: string): Promise<{ scan_id: string; status: string; file_type?: string }> {
-    const response = await fetch(`${API_BASE_URL}/api/v1/scans/status/${scanId}`, {
-        method: "GET",
-    });
-
-    if (!response.ok) {
-        throw new Error("Failed to fetch scan status.");
-    }
-
-    return response.json();
+export type ScanStatus = {
+  scan_id: string
+  status: string
 }
 
-export async function getScanResults(scanId: string): Promise<{ scan_id: string; mask_url: string; xai_url: string; report_url?: string }> {
-    const response = await fetch(`${API_BASE_URL}/api/v1/scans/results/${scanId}`, {
-        method: "GET",
-    });
+export type ScanResults = {
+  scan_id: string
+  mask_url: string | null
+  xai_url: string | null
+  report_url: string | null
+  tumor_detected: boolean
+  anomaly_area_cm2: number | null
+  confidence_score: number | null
+  who_grade: string | null
+}
 
-    if (!response.ok) {
-        throw new Error("Failed to fetch scan results.");
-    }
+async function parseError(response: Response): Promise<string> {
+  const data = await response.json().catch(() => null)
 
-    const data = await response.json();
+  if (data?.detail) {
+    return String(data.detail)
+  }
 
-    // Normalize URLs if they are relative paths from backend
-    const fixUrl = (url: string) => (url && url.startsWith("http") ? url : `${API_BASE_URL}${url}`);
+  if (data?.message) {
+    return String(data.message)
+  }
 
-    return {
-        scan_id: data.scan_id,
-        mask_url: fixUrl(data.mask_url),
-        xai_url: fixUrl(data.xai_url),
-        report_url: data.report_url ? fixUrl(data.report_url) : undefined,
-    };
+  return `Request failed with HTTP ${response.status}.`
+}
+
+export async function uploadScan(
+  files: BraTSFiles,
+): Promise<UploadResponse> {
+  const formData = new FormData()
+
+  formData.append("t1", files.t1)
+  formData.append("t1ce", files.t1ce)
+  formData.append("t2", files.t2)
+  formData.append("flair", files.flair)
+
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/scans/upload`,
+    {
+      method: "POST",
+      body: formData,
+    },
+  )
+
+  if (!response.ok) {
+    throw new Error(await parseError(response))
+  }
+
+  return response.json()
+}
+
+export async function getScanStatus(
+  scanId: string,
+): Promise<ScanStatus> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/scans/status/${scanId}`,
+  )
+
+  if (!response.ok) {
+    throw new Error(await parseError(response))
+  }
+
+  return response.json()
+}
+
+export async function getScanResults(
+  scanId: string,
+): Promise<ScanResults> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/scans/results/${scanId}`,
+  )
+
+  if (!response.ok) {
+    throw new Error(await parseError(response))
+  }
+
+  const data = await response.json()
+
+  return {
+    scan_id: data.scan_id,
+    mask_url: data.mask_url ?? null,
+    xai_url: data.xai_url ?? null,
+    report_url: data.report_url ?? null,
+    tumor_detected: Boolean(data.tumor_detected),
+    anomaly_area_cm2:
+      data.anomaly_area_cm2 ?? null,
+    confidence_score:
+      data.confidence_score ?? null,
+    who_grade:
+      data.who_grade ?? null,
+  }
 }

@@ -3,13 +3,12 @@ sys.path.insert(0, r"C:\Users\gagan\Downloads\Major project\neuroscan-ai\backend
 
 from ai_pipeline.evaluation.evaluate_armt_gan_baseline import (
     discover_complete_patients,
-    split_patients,
+    split_patients_three_way,
     load_checkpoint,
     evaluate,
     build_result,
     print_result,
-    EvaluationConfig,
-    BASELINE_EVAL_CONFIG,
+    EvaluationProtocol,
 )
 import torch
 from pathlib import Path
@@ -17,21 +16,28 @@ from pathlib import Path
 data_dir = Path(r"C:\Users\gagan\AppData\Local\Temp\synthetic_brats_hkk22lfk")
 checkpoint_path = Path(r"C:\Users\gagan\Downloads\Major project\neuroscan-ai\backend\ai_pipeline\weights\generator_best.pth")
 
-eval_config = BASELINE_EVAL_CONFIG
+protocol = EvaluationProtocol(
+    train_fraction=0.5,
+    validation_fraction=0.25,
+    test_fraction=0.25,
+)
 device = torch.device("cpu")
 
 print("Discovering patients...")
 all_patients = discover_complete_patients(data_dir)
 
-training_patients, validation_patients = split_patients(
+training_patients, validation_patients, test_patients = split_patients_three_way(
     patients=all_patients,
-    validation_fraction=eval_config.validation_fraction,
-    seed=eval_config.seed,
+    train_fraction=protocol.train_fraction,
+    validation_fraction=protocol.validation_fraction,
+    test_fraction=protocol.test_fraction,
+    seed=protocol.seed,
 )
 
 print(f"Complete labeled patients: {len(all_patients)}")
 print(f"Training split: {len(training_patients)}")
-print(f"Held-out split: {len(validation_patients)}")
+print(f"Validation split: {len(validation_patients)}")
+print(f"Test split: {len(test_patients)}")
 
 model, checkpoint_metadata = load_checkpoint(
     checkpoint_path=checkpoint_path,
@@ -50,23 +56,23 @@ print(f"Checkpoint metadata: {checkpoint_metadata}")
     skipped_slices,
     total_inference_seconds,
     mean_slice_latency_ms,
+    raw_artifacts,
 ) = evaluate(
     model=model,
-    patients=validation_patients,
+    patients=test_patients,  # Evaluate on TEST split
     device=device,
-    image_size=eval_config.image_size,
-    min_tumor_pixels=eval_config.min_tumor_pixels,
+    protocol=protocol,
+    output_dir=None,
 )
 
 result = build_result(
     checkpoint_path=checkpoint_path,
     device=device,
-    seed=eval_config.seed,
-    image_size=eval_config.image_size,
-    validation_fraction=eval_config.validation_fraction,
+    protocol=protocol,
     all_patients=all_patients,
     training_patients=training_patients,
     validation_patients=validation_patients,
+    test_patients=test_patients,
     slice_metrics=(
         slice_dice,
         slice_iou,
@@ -79,6 +85,7 @@ result = build_result(
     total_inference_seconds=total_inference_seconds,
     mean_slice_latency_ms=mean_slice_latency_ms,
     checkpoint_metadata=checkpoint_metadata,
+    raw_artifacts=raw_artifacts,
 )
 
 print_result(result)

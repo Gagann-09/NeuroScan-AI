@@ -106,19 +106,25 @@ Measure segmentation performance correctly.
 
 ### Tasks
 
--   [ ] Build patient-disjoint test split.
--   [ ] Implement Dice.
--   [ ] Implement IoU.
--   [ ] Implement precision.
--   [ ] Implement sensitivity.
--   [ ] Add per-patient metrics.
--   [ ] Add aggregate statistics.
--   [ ] Preserve raw prediction artifacts.
--   [ ] Generate baseline evaluation report.
+-   [x] Build patient-disjoint test split.
+-   [x] Implement Dice.
+-   [x] Implement IoU.
+-   [x] Implement precision.
+-   [x] Implement sensitivity.
+-   [x] Add per-patient metrics.
+-   [x] Add aggregate statistics.
+-   [x] Preserve raw prediction artifacts.
+-   [x] Generate baseline evaluation report.
+-   [x] Freeze evaluation protocol.
+-   [x] Add metric unit tests.
+-   [x] Add split/leakage tests.
+-   [x] Verify evaluation reproducibility.
 
 ### Gate
 
-Metrics are reproducible from stored predictions.
+Metrics are reproducible from stored predictions. **VERIFIED: 26 tests pass; two evaluation runs produce identical metrics; raw prediction artifacts saved as .npy files.**
+
+> **Note:** Full BraTS scientific evaluation pending real BraTS data. Mechanism is verified on synthetic data.
 
 ------------------------------------------------------------------------
 

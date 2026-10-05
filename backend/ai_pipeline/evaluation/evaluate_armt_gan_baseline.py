@@ -66,8 +66,11 @@ SEGMENTATION_SUFFIXES = (
 
 DEFAULT_IMAGE_SIZE = 224
 DEFAULT_SEED = 42
-DEFAULT_VALIDATION_FRACTION = 0.20
+DEFAULT_TRAIN_FRACTION = 0.70
+DEFAULT_VALIDATION_FRACTION = 0.15
+DEFAULT_TEST_FRACTION = 0.15
 DEFAULT_MIN_TUMOR_PIXELS = 1
+DEFAULT_THRESHOLD = 0.5
 
 MODALITY_NAMES = (
     "t1",
@@ -78,25 +81,71 @@ MODALITY_NAMES = (
 
 
 @dataclass(frozen=True)
-class EvaluationConfig:
-    """Immutable evaluation configuration for reproducibility."""
+class EvaluationProtocol:
+    """
+    Frozen evaluation protocol for ARMT-GAN scientific evaluation.
+    
+    This protocol is immutable. Any change requires a new protocol version
+    and must be recorded in memory.md with a new decision ID.
+    """
+    # Data
     image_size: int = DEFAULT_IMAGE_SIZE
-    seed: int = DEFAULT_SEED
-    validation_fraction: float = DEFAULT_VALIDATION_FRACTION
     min_tumor_pixels: int = DEFAULT_MIN_TUMOR_PIXELS
-    device: str = "auto"  # "auto", "cpu", "cuda"
+    
+    # Split fractions (must sum to 1.0)
+    train_fraction: float = DEFAULT_TRAIN_FRACTION
+    validation_fraction: float = DEFAULT_VALIDATION_FRACTION
+    test_fraction: float = DEFAULT_TEST_FRACTION
+    
+    # Metric computation
+    threshold: float = DEFAULT_THRESHOLD
+    
+    # Reproducibility
+    seed: int = DEFAULT_SEED
+    device: str = "auto"
+    
+    def __post_init__(self) -> None:
+        # Validate fractions sum to 1.0
+        total = self.train_fraction + self.validation_fraction + self.test_fraction
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(f"Split fractions must sum to 1.0, got {total}")
     
     def to_dict(self) -> dict:
         return {
             "image_size": self.image_size,
-            "seed": self.seed,
-            "validation_fraction": self.validation_fraction,
             "min_tumor_pixels": self.min_tumor_pixels,
+            "train_fraction": self.train_fraction,
+            "validation_fraction": self.validation_fraction,
+            "test_fraction": self.test_fraction,
+            "threshold": self.threshold,
+            "seed": self.seed,
             "device": self.device,
         }
 
 
-BASELINE_EVAL_CONFIG = EvaluationConfig()
+BASELINE_PROTOCOL = EvaluationProtocol()
+
+
+@dataclass(frozen=True)
+class EvaluationConfig:
+    """Immutable evaluation configuration for a specific run."""
+    protocol: EvaluationProtocol = BASELINE_PROTOCOL
+    data_dir: str = ""
+    checkpoint: str = ""
+    output_dir: str = ""
+    save_predictions: bool = True
+    
+    def to_dict(self) -> dict:
+        return {
+            "protocol": self.protocol.to_dict(),
+            "data_dir": self.data_dir,
+            "checkpoint": self.checkpoint,
+            "output_dir": self.output_dir,
+            "save_predictions": self.save_predictions,
+        }
+
+
+BASELINE_EVAL_CONFIG = EvaluationConfig(protocol=BASELINE_PROTOCOL)
 
 
 @dataclass(frozen=True)
@@ -120,10 +169,13 @@ class EvaluationResult:
     device: str
     seed: int
     image_size: int
+    train_fraction: float
     validation_fraction: float
+    test_fraction: float
     total_labeled_patients: int
     train_patients: int
-    held_out_patients: int
+    validation_patients: int
+    test_patients: int
     evaluated_patients: int
     evaluated_slices: int
     skipped_slices: int
@@ -139,6 +191,7 @@ class EvaluationResult:
     mean_batch_latency_ms: float
     mean_slice_latency_ms: float
     checkpoint_metadata: dict[str, Any]
+    raw_artifacts: list[dict]
 
 
 def set_seed(seed: int) -> None:
@@ -264,14 +317,70 @@ def discover_complete_patients(data_dir: Path) -> list[PatientRecord]:
     return records
 
 
+def split_patients_three_way(
+    patients: list[PatientRecord],
+    train_fraction: float,
+    validation_fraction: float,
+    test_fraction: float,
+    seed: int,
+) -> tuple[list[PatientRecord], list[PatientRecord], list[PatientRecord]]:
+    """
+    Reproduce the deterministic patient-level three-way split.
+
+    The list is sorted before shuffling so filesystem traversal order cannot
+    change the split. Fractions must sum to 1.0.
+    """
+    if not (0.0 < train_fraction < 1.0 and 0.0 < validation_fraction < 1.0 and 0.0 < test_fraction < 1.0):
+        raise ValueError("All fractions must be between 0 and 1.")
+    
+    total = train_fraction + validation_fraction + test_fraction
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError(f"Split fractions must sum to 1.0, got {total}")
+
+    patients = sorted(patients, key=lambda record: record.patient_id)
+
+    rng = random.Random(seed)
+    shuffled = patients.copy()
+    rng.shuffle(shuffled)
+
+    n = len(shuffled)
+    train_count = max(1, int(round(n * train_fraction)))
+    val_count = max(1, int(round(n * validation_fraction)))
+    
+    # Adjust to ensure all patients are allocated
+    if train_count + val_count >= n:
+        val_count = n - train_count - 1
+        if val_count < 1:
+            raise RuntimeError("Not enough patients for three-way split")
+
+    training_patients = shuffled[:train_count]
+    validation_patients = shuffled[train_count:train_count + val_count]
+    test_patients = shuffled[train_count + val_count:]
+
+    # Verify no patient leakage
+    train_ids = {record.patient_id for record in training_patients}
+    val_ids = {record.patient_id for record in validation_patients}
+    test_ids = {record.patient_id for record in test_patients}
+
+    if train_ids & val_ids:
+        raise RuntimeError("Patient leakage detected between train and validation.")
+    if train_ids & test_ids:
+        raise RuntimeError("Patient leakage detected between train and test.")
+    if val_ids & test_ids:
+        raise RuntimeError("Patient leakage detected between validation and test.")
+
+    return training_patients, validation_patients, test_patients
+
+
 def split_patients(
     patients: list[PatientRecord],
     validation_fraction: float,
     seed: int,
 ) -> tuple[list[PatientRecord], list[PatientRecord]]:
     """
+    Two-way split (backward compatible).
+    
     Reproduce the deterministic patient-level split used by the baseline.
-
     The list is sorted before shuffling so filesystem traversal order cannot
     change the split.
     """
@@ -573,8 +682,8 @@ def evaluate(
     model: nn.Module,
     patients: list[PatientRecord],
     device: torch.device,
-    image_size: int,
-    min_tumor_pixels: int,
+    protocol: EvaluationProtocol,
+    output_dir: Path | None = None,
 ) -> tuple[
     list[float],
     list[float],
@@ -585,12 +694,13 @@ def evaluate(
     int,
     float,
     float,
+    list[dict],  # Raw prediction artifacts for provenance
 ]:
     """
     Evaluate every tumor-containing slice in the held-out patients.
 
     Returns slice-level metric lists, patient-level metrics, counts and
-    latency measurements.
+    latency measurements, plus raw prediction artifacts.
     """
     slice_dice: list[float] = []
     slice_iou: list[float] = []
@@ -605,11 +715,18 @@ def evaluate(
     total_inference_seconds = 0.0
     inference_calls = 0
 
+    raw_artifacts: list[dict] = []  # For provenance
+
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        pred_dir = output_dir / "predictions"
+        pred_dir.mkdir(parents=True, exist_ok=True)
+
     for patient in sorted(patients, key=lambda record: record.patient_id):
         samples = load_patient_slices(
             patient=patient,
-            image_size=image_size,
-            min_tumor_pixels=min_tumor_pixels,
+            image_size=protocol.image_size,
+            min_tumor_pixels=protocol.min_tumor_pixels,
         )
 
         if not samples:
@@ -621,7 +738,7 @@ def evaluate(
         patient_precision: list[float] = []
         patient_sensitivity: list[float] = []
 
-        for image_np, mask_np, _slice_index in samples:
+        for image_np, mask_np, slice_index in samples:
             image = torch.from_numpy(image_np).unsqueeze(0).to(device)
 
             if device.type == "cuda":
@@ -640,24 +757,16 @@ def evaluate(
             total_inference_seconds += elapsed
             inference_calls += 1
 
-            prediction_np = (
-                prediction.squeeze(0)
-                .squeeze(0)
-                .detach()
-                .cpu()
-                .numpy()
-                >= 0.5
-            )
+            # Raw probability mask [H, W]
+            pred_prob = prediction.squeeze(0).squeeze(0).detach().cpu().numpy()
+            # Binary prediction at threshold
+            pred_binary = pred_prob >= protocol.threshold
+            target_binary = (mask_np.squeeze(0) >= 0.5)
 
-            target_np = (
-                mask_np.squeeze(0)
-                >= 0.5
-            )
-
-            dice = dice_score(prediction_np, target_np)
-            iou = iou_score(prediction_np, target_np)
-            precision = precision_score(prediction_np, target_np)
-            sensitivity = sensitivity_score(prediction_np, target_np)
+            dice = dice_score(pred_binary, target_binary)
+            iou = iou_score(pred_binary, target_binary)
+            precision = precision_score(pred_binary, target_binary)
+            sensitivity = sensitivity_score(pred_binary, target_binary)
 
             slice_dice.append(dice)
             slice_iou.append(iou)
@@ -670,6 +779,25 @@ def evaluate(
             patient_sensitivity.append(sensitivity)
 
             evaluated_slices += 1
+
+            # Save raw prediction artifact
+            if output_dir is not None:
+                pred_filename = f"{patient.patient_id}_slice{slice_index:03d}_pred.npy"
+                pred_path = pred_dir / pred_filename
+                np.save(pred_path, pred_prob.astype(np.float32))
+                
+                raw_artifacts.append({
+                    "patient_id": patient.patient_id,
+                    "slice_index": slice_index,
+                    "prediction_path": str(pred_path.relative_to(output_dir)),
+                    "shape": list(pred_prob.shape),
+                    "min": float(pred_prob.min()),
+                    "max": float(pred_prob.max()),
+                    "dice": dice,
+                    "iou": iou,
+                    "precision": precision,
+                    "sensitivity": sensitivity,
+                })
 
         patient_metrics[patient.patient_id] = {
             "dice": float(mean(patient_dice)),
@@ -685,8 +813,6 @@ def evaluate(
         else 0.0
     )
 
-    # Every inference call here contains one slice, so this is also the
-    # measured mean per-slice inference latency.
     mean_slice_latency_ms = mean_batch_latency_ms
 
     return (
@@ -699,18 +825,18 @@ def evaluate(
         skipped_slices,
         total_inference_seconds,
         mean_slice_latency_ms,
+        raw_artifacts,
     )
 
 
 def build_result(
     checkpoint_path: Path,
     device: torch.device,
-    seed: int,
-    image_size: int,
-    validation_fraction: float,
+    protocol: EvaluationProtocol,
     all_patients: list[PatientRecord],
     training_patients: list[PatientRecord],
     validation_patients: list[PatientRecord],
+    test_patients: list[PatientRecord],
     slice_metrics: tuple[
         list[float],
         list[float],
@@ -723,6 +849,7 @@ def build_result(
     total_inference_seconds: float,
     mean_slice_latency_ms: float,
     checkpoint_metadata: dict[str, Any],
+    raw_artifacts: list[dict],
 ) -> EvaluationResult:
     (
         slice_dice,
@@ -754,12 +881,15 @@ def build_result(
     return EvaluationResult(
         checkpoint=str(checkpoint_path),
         device=str(device),
-        seed=seed,
-        image_size=image_size,
-        validation_fraction=validation_fraction,
+        seed=protocol.seed,
+        image_size=protocol.image_size,
+        train_fraction=protocol.train_fraction,
+        validation_fraction=protocol.validation_fraction,
+        test_fraction=protocol.test_fraction,
         total_labeled_patients=len(all_patients),
         train_patients=len(training_patients),
-        held_out_patients=len(validation_patients),
+        validation_patients=len(validation_patients),
+        test_patients=len(test_patients),
         evaluated_patients=len(patient_metrics),
         evaluated_slices=evaluated_slices,
         skipped_slices=skipped_slices,
@@ -775,6 +905,7 @@ def build_result(
         mean_batch_latency_ms=mean_slice_latency_ms,
         mean_slice_latency_ms=mean_slice_latency_ms,
         checkpoint_metadata=checkpoint_metadata,
+        raw_artifacts=raw_artifacts,
     )
 
 
@@ -791,12 +922,15 @@ def print_result(result: EvaluationResult) -> None:
     print(f"Device:                 {result.device}")
     print(f"Seed:                   {result.seed}")
     print(f"Image size:             {result.image_size}x{result.image_size}")
+    print(f"Train fraction:         {result.train_fraction:.2f}")
     print(f"Validation fraction:    {result.validation_fraction:.2f}")
+    print(f"Test fraction:          {result.test_fraction:.2f}")
 
     print("\nPATIENT SPLIT")
     print(f"Complete labeled:       {result.total_labeled_patients}")
     print(f"Training patients:      {result.train_patients}")
-    print(f"Held-out patients:      {result.held_out_patients}")
+    print(f"Validation patients:    {result.validation_patients}")
+    print(f"Test patients:          {result.test_patients}")
     print(f"Evaluated patients:     {result.evaluated_patients}")
 
     print("\nSAMPLES")
@@ -861,13 +995,15 @@ def print_result(result: EvaluationResult) -> None:
         f"{result.mean_slice_latency_ms:.4f} ms"
     )
 
+    print(f"\nRAW PREDICTION ARTIFACTS: {len(result.raw_artifacts)} files saved")
+
     print("\nCHECKPOINT METADATA")
     for key, value in result.checkpoint_metadata.items():
         print(f"{key}: {value}")
 
     print("\nINTERPRETATION")
     print(
-        "This is a held-out validation evaluation from the labeled "
+        "This is a held-out test evaluation from the labeled "
         "BraTS training cohort. It is NOT an independent test-set result."
     )
     print(
@@ -904,39 +1040,74 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--output_dir",
+        type=Path,
+        default=None,
+        help="Optional directory for raw prediction artifacts.",
+    )
+
+    parser.add_argument(
         "--seed",
         type=int,
-        default=BASELINE_EVAL_CONFIG.seed,
+        default=BASELINE_PROTOCOL.seed,
         help="Patient split seed. Default: 42.",
+    )
+
+    parser.add_argument(
+        "--train_fraction",
+        type=float,
+        default=BASELINE_PROTOCOL.train_fraction,
+        help="Training patient fraction. Default: 0.70.",
     )
 
     parser.add_argument(
         "--validation_fraction",
         type=float,
-        default=BASELINE_EVAL_CONFIG.validation_fraction,
-        help="Held-out patient fraction. Default: 0.20.",
+        default=BASELINE_PROTOCOL.validation_fraction,
+        help="Validation patient fraction. Default: 0.15.",
+    )
+
+    parser.add_argument(
+        "--test_fraction",
+        type=float,
+        default=BASELINE_PROTOCOL.test_fraction,
+        help="Test patient fraction. Default: 0.15.",
     )
 
     parser.add_argument(
         "--image_size",
         type=int,
-        default=BASELINE_EVAL_CONFIG.image_size,
+        default=BASELINE_PROTOCOL.image_size,
         help="Evaluation image size. Default: 224.",
     )
 
     parser.add_argument(
         "--min_tumor_pixels",
         type=int,
-        default=BASELINE_EVAL_CONFIG.min_tumor_pixels,
+        default=BASELINE_PROTOCOL.min_tumor_pixels,
         help="Minimum original-mask tumor pixels required for a slice.",
+    )
+
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=BASELINE_PROTOCOL.threshold,
+        help="Binary prediction threshold. Default: 0.5.",
     )
 
     parser.add_argument(
         "--device",
         type=str,
-        default=BASELINE_EVAL_CONFIG.device,
+        default=BASELINE_PROTOCOL.device,
         choices=["auto", "cpu", "cuda"],
         help="Evaluation device. Defaults to CUDA when available.",
+    )
+
+    parser.add_argument(
+        "--save_predictions",
+        action="store_true",
+        default=True,
+        help="Save raw prediction artifacts.",
     )
 
     return parser.parse_args()
@@ -945,64 +1116,75 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # Build config from args
-    eval_config = EvaluationConfig(
+    # Build protocol from args
+    protocol = EvaluationProtocol(
         seed=args.seed,
+        train_fraction=args.train_fraction,
         validation_fraction=args.validation_fraction,
+        test_fraction=args.test_fraction,
         image_size=args.image_size,
         min_tumor_pixels=args.min_tumor_pixels,
+        threshold=args.threshold,
         device=args.device,
     )
 
-    set_seed(eval_config.seed)
+    set_seed(protocol.seed)
 
     # Resolve device
-    if eval_config.device == "cuda" and not torch.cuda.is_available():
+    if protocol.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA was explicitly requested but is not available."
         )
 
     device = torch.device(
-        "cuda" if (eval_config.device == "cuda" or (eval_config.device == "auto" and torch.cuda.is_available())) else "cpu"
+        "cuda" if (protocol.device == "cuda" or (protocol.device == "auto" and torch.cuda.is_available())) else "cpu"
     )
+
+    output_dir = args.output_dir if args.save_predictions else None
 
     print("Discovering complete labeled BraTS patients...")
 
     all_patients = discover_complete_patients(args.data_dir)
 
-    training_patients, validation_patients = split_patients(
+    training_patients, validation_patients, test_patients = split_patients_three_way(
         patients=all_patients,
-        validation_fraction=eval_config.validation_fraction,
-        seed=eval_config.seed,
+        train_fraction=protocol.train_fraction,
+        validation_fraction=protocol.validation_fraction,
+        test_fraction=protocol.test_fraction,
+        seed=protocol.seed,
     )
 
     train_ids = {patient.patient_id for patient in training_patients}
-    validation_ids = {patient.patient_id for patient in validation_patients}
+    val_ids = {patient.patient_id for patient in validation_patients}
+    test_ids = {patient.patient_id for patient in test_patients}
 
-    if train_ids & validation_ids:
-        raise RuntimeError(
-            "Fatal patient overlap detected before evaluation."
-        )
+    if train_ids & val_ids:
+        raise RuntimeError("Fatal patient overlap detected between train and validation.")
+    if train_ids & test_ids:
+        raise RuntimeError("Fatal patient overlap detected between train and test.")
+    if val_ids & test_ids:
+        raise RuntimeError("Fatal patient overlap detected between validation and test.")
 
     print(f"Complete labeled patients: {len(all_patients)}")
     print(f"Training split:            {len(training_patients)}")
-    print(f"Held-out split:            {len(validation_patients)}")
+    print(f"Validation split:          {len(validation_patients)}")
+    print(f"Test split:                {len(test_patients)}")
 
     model, checkpoint_metadata = load_checkpoint(
         checkpoint_path=args.checkpoint,
         device=device,
     )
 
-    if checkpoint_metadata["seed"] != eval_config.seed:
+    if checkpoint_metadata["seed"] != protocol.seed:
         raise RuntimeError(
             "Checkpoint seed does not match evaluator seed: "
-            f"{checkpoint_metadata['seed']} != {eval_config.seed}"
+            f"{checkpoint_metadata['seed']} != {protocol.seed}"
         )
 
-    if checkpoint_metadata["image_size"] != eval_config.image_size:
+    if checkpoint_metadata["image_size"] != protocol.image_size:
         raise RuntimeError(
             "Checkpoint image size does not match evaluator config: "
-            f"{checkpoint_metadata['image_size']} != {eval_config.image_size}"
+            f"{checkpoint_metadata['image_size']} != {protocol.image_size}"
         )
 
     (
@@ -1015,28 +1197,28 @@ def main() -> None:
         skipped_slices,
         total_inference_seconds,
         mean_slice_latency_ms,
+        raw_artifacts,
     ) = evaluate(
         model=model,
-        patients=validation_patients,
+        patients=test_patients,  # Evaluate on TEST split
         device=device,
-        image_size=eval_config.image_size,
-        min_tumor_pixels=eval_config.min_tumor_pixels,
+        protocol=protocol,
+        output_dir=output_dir,
     )
 
     if not patient_metrics:
         raise RuntimeError(
-            "No held-out patients produced evaluable tumor-containing slices."
+            "No test patients produced evaluable tumor-containing slices."
         )
 
     result = build_result(
         checkpoint_path=args.checkpoint,
         device=device,
-        seed=eval_config.seed,
-        image_size=eval_config.image_size,
-        validation_fraction=eval_config.validation_fraction,
+        protocol=protocol,
         all_patients=all_patients,
         training_patients=training_patients,
         validation_patients=validation_patients,
+        test_patients=test_patients,
         slice_metrics=(
             slice_dice,
             slice_iou,
@@ -1049,6 +1231,7 @@ def main() -> None:
         total_inference_seconds=total_inference_seconds,
         mean_slice_latency_ms=mean_slice_latency_ms,
         checkpoint_metadata=checkpoint_metadata,
+        raw_artifacts=raw_artifacts,
     )
 
     print_result(result)

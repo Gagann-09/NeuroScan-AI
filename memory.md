@@ -247,6 +247,65 @@ management.
 
 **Status:** Complete.
 
+### D-022 --- Frozen EvaluationProtocol for ARMT-GAN scientific evaluation
+
+**Date:** 2026-10-05
+
+**Context:** Evaluation protocol parameters (split fractions, threshold, min_tumor_pixels, device) were scattered across CLI args and constants without a single frozen configuration.
+
+**Decision:** Create immutable `EvaluationProtocol` dataclass with all protocol parameters. Three-way split (train/val/test) with default 0.70/0.15/0.15. Binary threshold fixed at 0.5. Protocol serialized in JSON experiment records.
+
+**Reason:** Scientific evaluation requires a fully documented, versioned protocol. Evaluation Design (design.md #4): "Metrics must be computed on patient-disjoint evaluation data."
+
+**Affected files:**
+- `backend/ai_pipeline/evaluation/evaluate_armt_gan_baseline.py` (EvaluationProtocol, split_patients_three_way)
+- `backend/tests/test_evaluation_protocol.py` (new)
+
+**Status:** Complete.
+
+**Verification:** 
+- 26 evaluation protocol tests pass (metrics, split, protocol)
+- 9 preprocessing parity tests pass
+- Two evaluation runs produce identical metrics (Dice=0.980835, IoU=0.962391)
+- Raw prediction artifacts saved as .npy files (12 files for test patient)
+
+### D-023 --- Three-way patient-disjoint split
+
+**Date:** 2026-10-05
+
+**Context:** Previous evaluation used only train/validation split. Scientific evaluation requires a held-out test set that is never seen during training or validation.
+
+**Decision:** Extend split logic to three-way (train/validation/test) with deterministic seed-based shuffling. Split sorts patient IDs before shuffling so filesystem order cannot affect split. Validates no patient leakage across any pair of splits.
+
+**Reason:** Data Rules (rules.md #6): "Patient-level splitting is mandatory. No patient may appear in multiple evaluation partitions." PRD FR-03.
+
+**Affected files:**
+- `backend/ai_pipeline/evaluation/evaluate_armt_gan_baseline.py` (split_patients_three_way)
+
+**Status:** Complete.
+
+**Verification:** 
+- Unit tests verify no leakage (train∩val=∅, train∩test=∅, val∩test=∅)
+- Deterministic: same seed → identical splits
+- All patients allocated exactly once
+
+### D-024 --- Raw prediction artifact preservation
+
+**Date:** 2026-10-05
+
+**Context:** Evaluation computed metrics but did not save raw probability masks, preventing audit and re-analysis.
+
+**Decision:** Evaluation saves raw probability masks as .npy files per slice in `output_dir/predictions/`. Each artifact includes metadata (patient_id, slice_index, shape, min/max, per-slice metrics). Artifact list serialized in JSON experiment record.
+
+**Reason:** Storage Rules (rules.md #16): "Every artifact belongs to a study. Every derived artifact references its source study. Never overwrite artifacts without versioning."
+
+**Affected files:**
+- `backend/ai_pipeline/evaluation/evaluate_armt_gan_baseline.py` (evaluate() output_dir parameter, raw_artifacts)
+
+**Status:** Complete.
+
+**Verification:** 12 .npy files saved for test patient (BraTS20_Training_000), each with shape [224, 224], dtype float32, containing probability values in [0, 1].
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

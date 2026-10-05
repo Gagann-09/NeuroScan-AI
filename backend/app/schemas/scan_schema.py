@@ -6,6 +6,14 @@ from pydantic import BaseModel, Field
 from typing import Optional
 
 
+class UploadRequest(BaseModel):
+    """Request schema for POST /api/v1/scans/upload - four modalities required."""
+    t1: str = Field(..., description="T1 modality file object name in storage")
+    t1ce: str = Field(..., description="T1ce modality file object name in storage")
+    t2: str = Field(..., description="T2 modality file object name in storage")
+    flair: str = Field(..., description="FLAIR modality file object name in storage")
+
+
 class UploadResponse(BaseModel):
     """Response schema for POST /api/v1/scans/upload."""
     message: str = Field(..., description="Human-readable upload status message")
@@ -24,7 +32,7 @@ class ResultsResponse(BaseModel):
     scan_id: str = Field(..., description="Unique identifier for the scan")
     mask_url: Optional[str] = Field(None, description="Presigned URL for the segmentation mask overlay")
     xai_url: Optional[str] = Field(None, description="Presigned URL for the XAI activation map")
-    report_url: Optional[str] = Field(None, description="Presigned URL for the clinical PDF report")
+    report_url: Optional[str] = Field(None, description="Presigned URL for the PDF report")
     tumor_detected: bool = Field(False, description="Whether a tumor was detected")
     anomaly_area_cm2: float = Field(0.0, description="Estimated anomaly area in cm²")
     confidence_score: float = Field(0.0, description="Model confidence score")

@@ -1,0 +1,108 @@
+{
+  "seed": 42,
+  "device": "cpu",
+  "data_dir": "C:\\Users\\gagan\\Downloads\\Major project\\neuroscan-ai\\datasets\\Kaggle_data",
+  "epochs": 5,
+  "batch_size": 32,
+  "learning_rate": 0.001,
+  "validation_fraction": 0.2,
+  "train_samples": 4480,
+  "validation_samples": 1120,
+  "test_samples": 1600,
+  "class_names": [
+    "glioma",
+    "meningioma",
+    "notumor",
+    "pituitary"
+  ],
+  "parameter_count": 1173668,
+  "best_epoch": 5,
+  "best_validation_macro_f1": 0.8365164546466283,
+  "history": [
+    {
+      "epoch": 1,
+      "train": {
+        "accuracy": 0.7138392925262451,
+        "macro_precision": 0.7150833396379352,
+        "macro_recall": 0.7138392857142857,
+        "macro_f1": 0.7127446661660052,
+        "loss": 0.7411300884825843
+      },
+      "validation": {
+        "accuracy": 0.7589285969734192,
+        "macro_precision": 0.7561408475621839,
+        "macro_recall": 0.7589285714285714,
+        "macro_f1": 0.7448276794333899,
+        "loss": 0.7023242950439453
+      }
+    },
+    {
+      "epoch": 2,
+      "train": {
+        "accuracy": 0.7919642925262451,
+        "macro_precision": 0.7929515159654542,
+        "macro_recall": 0.7919642857142857,
+        "macro_f1": 0.7918955934804381,
+        "loss": 0.5606321761650699
+      },
+      "validation": {
+        "accuracy": 0.6866071224212646,
+        "macro_precision": 0.647889704449066,
+        "macro_recall": 0.6866071428571429,
+        "macro_f1": 0.617202688770071,
+        "loss": 0.9198338522442749
+      }
+    },
+    {
+      "epoch": 3,
+      "train": {
+        "accuracy": 0.8082589507102966,
+        "macro_precision": 0.8093446208207449,
+        "macro_recall": 0.8082589285714286,
+        "macro_f1": 0.808358510918102,
+        "loss": 0.5153463282755443
+      },
+      "validation": {
+        "accuracy": 0.706250011920929,
+        "macro_precision": 0.7320836810836762,
+        "macro_recall": 0.70625,
+        "macro_f1": 0.6908141737588578,
+        "loss": 0.8441348501614162
+      }
+    },
+    {
+      "epoch": 4,
+      "train": {
+        "accuracy": 0.8366071581840515,
+        "macro_precision": 0.8379301400557888,
+        "macro_recall": 0.8366071428571429,
+        "macro_f1": 0.8365922575481791,
+        "loss": 0.4463281809219292
+      },
+      "validation": {
+        "accuracy": 0.8053571581840515,
+        "macro_precision": 0.8162622580339957,
+        "macro_recall": 0.8053571428571429,
+        "macro_f1": 0.8083206807133613,
+        "loss": 0.4942974375826972
+      }
+    },
+    {
+      "epoch": 5,
+      "train": {
+        "accuracy": 0.8551339507102966,
+        "macro_precision": 0.8555899855023563,
+        "macro_recall": 0.8551339285714286,
+        "macro_f1": 0.8548518016221892,
+        "loss": 0.4013665546263967
+      },
+      "validation": {
+        "accuracy": 0.8357142806053162,
+        "macro_precision": 0.8447849223144395,
+        "macro_recall": 0.8357142857142859,
+        "macro_f1": 0.8365164546466283,
+        "loss": 0.4053852051496506
+      }
+    }
+  ]
+}

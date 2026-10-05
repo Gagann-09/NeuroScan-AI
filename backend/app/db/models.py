@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Boolean, Float, DateTime, Integer
+from sqlalchemy import Column, String, Boolean, Float, DateTime, Integer, ForeignKey
 from datetime import datetime
 
 # CRUCIAL FIX: Import the exact Base used by the database connection
@@ -14,6 +14,14 @@ class Scan(Base):
     xai_path = Column(String, nullable=True)
     report_path = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class ModalityFile(Base):
+    __tablename__ = "modality_files"
+    
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    scan_id = Column(String, ForeignKey("scans.id"), index=True)
+    modality = Column(String, index=True)  # t1, t1ce, t2, flair
+    object_path = Column(String)
 
 class Prediction(Base):
     __tablename__ = "predictions"

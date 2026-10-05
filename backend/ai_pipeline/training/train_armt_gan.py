@@ -50,6 +50,79 @@ from ai_pipeline.models.armt_gan import (  # noqa: E402
     ARMTDiscriminator2D,
     ARMTGenerator2D,
 )
+from ai_pipeline.preprocessing import BraTSPreprocessor, PreprocessingConfig  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Frozen Training Configuration
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    """
+    Immutable training configuration for ARMT-GAN reproducibility.
+    
+    All hyperparameters are fixed for the baseline. Changes require
+    a new experiment record and versioned checkpoint.
+    """
+    # Data
+    image_size: int = 224
+    validation_fraction: float = 0.2
+    min_tumor_pixels: int = 1
+    
+    # Model
+    in_channels: int = 4
+    out_channels: int = 1
+    generator_features: tuple[int, ...] = (64, 128, 256)
+    discriminator_in_channels: int = 5
+    
+    # Optimization
+    epochs: int = 1
+    batch_size: int = 2
+    learning_rate: float = 0.0002
+    adam_betas: tuple[float, float] = (0.5, 0.999)
+    
+    # Loss weights
+    loss_l1_weight: float = 100.0
+    loss_adv_weight: float = 1.0
+    loss_d_real_weight: float = 0.5
+    loss_d_fake_weight: float = 0.5
+    
+    # Reproducibility
+    seed: int = 42
+    num_workers: int = 0
+    cudnn_deterministic: bool = True
+    cudnn_benchmark: bool = False
+    
+    def to_dict(self) -> dict:
+        return {
+            "image_size": self.image_size,
+            "validation_fraction": self.validation_fraction,
+            "min_tumor_pixels": self.min_tumor_pixels,
+            "in_channels": self.in_channels,
+            "out_channels": self.out_channels,
+            "generator_features": list(self.generator_features),
+            "discriminator_in_channels": self.discriminator_in_channels,
+            "epochs": self.epochs,
+            "batch_size": self.batch_size,
+            "learning_rate": self.learning_rate,
+            "adam_betas": list(self.adam_betas),
+            "loss_l1_weight": self.loss_l1_weight,
+            "loss_adv_weight": self.loss_adv_weight,
+            "loss_d_real_weight": self.loss_d_real_weight,
+            "loss_d_fake_weight": self.loss_d_fake_weight,
+            "seed": self.seed,
+            "num_workers": self.num_workers,
+            "cudnn_deterministic": self.cudnn_deterministic,
+            "cudnn_benchmark": self.cudnn_benchmark,
+        }
+
+
+# Global frozen baseline config
+BASELINE_CONFIG = TrainingConfig()
 
 
 # ---------------------------------------------------------------------------
@@ -425,92 +498,31 @@ class BraTS2DSegmentationDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int,) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         patient_dir, slice_index = self.samples[index]
 
-        modality_files = find_patient_modalities(
-            patient_dir
+        # Use shared preprocessing
+        preprocessor = BraTSPreprocessor(
+            PreprocessingConfig(image_size=self.image_size)
         )
 
-        segmentation_file = find_file(
-            patient_dir,
-            MASK_SUFFIXES,
-        )
+        # Find modality files
+        modality_paths = {}
+        for i, modality in enumerate(preprocessor.config.modality_order):
+            path = preprocessor.find_modality_file(patient_dir, modality)
+            if path is None:
+                raise RuntimeError(f"Missing modality '{modality}' in {patient_dir}")
+            modality_paths[modality] = path
 
-        if (
-            not all(
-                path is not None
-                for path in modality_files
-            )
-            or segmentation_file is None
-        ):
-            raise RuntimeError(
-                f"Incomplete BraTS sample encountered: {patient_dir}"
-            )
+        segmentation_file = preprocessor.find_segmentation_file(patient_dir)
+        if segmentation_file is None:
+            raise RuntimeError(f"Missing segmentation in {patient_dir}")
 
-        # Make sure every required modality is a real file.
-        if not all(
-            path is not None and path.is_file()
-            for path in modality_files
-        ):
-            raise RuntimeError(
-                f"Missing BraTS modality file: {patient_dir}"
-            )
+        # Preprocess using shared pipeline
+        image_tensor = preprocessor.preprocess_modalities(modality_paths, slice_index)
+        mask_tensor = preprocessor.preprocess_segmentation(segmentation_file, slice_index)
 
-        # Load and normalize the four MRI modalities.
-        modality_slices: list[torch.Tensor] = []
-
-        for modality_path in modality_files:
-            assert modality_path is not None
-
-            volume = load_nifti(
-                modality_path
-            )
-
-            volume = normalize_modality(
-                volume
-            )
-
-            slice_2d = volume[
-                :,
-                :,
-                slice_index,
-            ]
-
-            modality_slices.append(
-                resize_slice(
-                    slice_2d,
-                    self.image_size,
-                )
-            )
-
-        image = torch.stack(
-            modality_slices,
-            dim=0,
-        )
-
-        # Real BraTS segmentation annotation.
-        segmentation = load_nifti(
-            segmentation_file
-        )
-
-        mask = (
-            segmentation[
-                :,
-                :,
-                slice_index,
-            ] > 0
-        ).astype(np.float32)
-
-        mask_tensor = resize_mask(
-            mask,
-            self.image_size,
-        )
-
-        return (
-            image.float(),
-            mask_tensor.float(),
-        )
+        return image_tensor.float(), mask_tensor.float()
 
 # ---------------------------------------------------------------------------
 # Patient-level split
@@ -667,16 +679,14 @@ def evaluate(
 
 def train_gan(
     data_dir: Path,
-    epochs: int = 1,
-    batch_size: int = 2,
-    learning_rate: float = 0.0002,
-    validation_fraction: float = 0.2,
-    image_size: int = 224,
-    seed: int = 42,
-    num_workers: int = 0,
+    config: TrainingConfig = BASELINE_CONFIG,
 ) -> None:
 
-    set_seed(seed)
+    set_seed(config.seed)
+
+    # Apply cuDNN settings
+    torch.backends.cudnn.deterministic = config.cudnn_deterministic
+    torch.backends.cudnn.benchmark = config.cudnn_benchmark
 
     print("=" * 72)
     print("NeuroScan-AI | ARMT-GAN Prototype Training")
@@ -688,7 +698,8 @@ def train_gan(
 
     print(f"[*] Device: {device}")
     print(f"[*] Dataset: {data_dir}")
-    print(f"[*] Seed: {seed}")
+    print(f"[*] Seed: {config.seed}")
+    print(f"[*] Config: {config.to_dict()}")
 
     # -----------------------------------------------------------------------
     # Discover patients
@@ -706,8 +717,8 @@ def train_gan(
 
     train_patients, validation_patients = split_patients(
         patients=patients,
-        validation_fraction=validation_fraction,
-        seed=seed,
+        validation_fraction=config.validation_fraction,
+        seed=config.seed,
     )
 
     print(f"[*] Training patients: {len(train_patients)}")
@@ -719,12 +730,14 @@ def train_gan(
 
     train_dataset = BraTS2DSegmentationDataset(
         patient_dirs=train_patients,
-        image_size=image_size,
+        image_size=config.image_size,
+        min_tumor_pixels=config.min_tumor_pixels,
     )
 
     validation_dataset = BraTS2DSegmentationDataset(
         patient_dirs=validation_patients,
-        image_size=image_size,
+        image_size=config.image_size,
+        min_tumor_pixels=config.min_tumor_pixels,
     )
 
     print(f"[*] Training slices: {len(train_dataset)}")
@@ -732,17 +745,17 @@ def train_gan(
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=config.batch_size,
         shuffle=True,
-        num_workers=num_workers,
+        num_workers=config.num_workers,
         pin_memory=torch.cuda.is_available(),
     )
 
     validation_loader = DataLoader(
         validation_dataset,
-        batch_size=batch_size,
+        batch_size=config.batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=config.num_workers,
         pin_memory=torch.cuda.is_available(),
     )
 
@@ -751,12 +764,13 @@ def train_gan(
     # -----------------------------------------------------------------------
 
     generator = ARMTGenerator2D(
-        in_channels=4,
-        out_channels=1,
+        in_channels=config.in_channels,
+        out_channels=config.out_channels,
+        features=list(config.generator_features),
     ).to(device)
 
     discriminator = ARMTDiscriminator2D(
-        in_channels=5,
+        in_channels=config.discriminator_in_channels,
     ).to(device)
 
     # -----------------------------------------------------------------------
@@ -765,14 +779,14 @@ def train_gan(
 
     optimizer_g = optim.Adam(
         generator.parameters(),
-        lr=learning_rate,
-        betas=(0.5, 0.999),
+        lr=config.learning_rate,
+        betas=config.adam_betas,
     )
 
     optimizer_d = optim.Adam(
         discriminator.parameters(),
-        lr=learning_rate,
-        betas=(0.5, 0.999),
+        lr=config.learning_rate,
+        betas=config.adam_betas,
     )
 
     criterion_bce = nn.BCELoss()
@@ -787,7 +801,7 @@ def train_gan(
     weights_dir = PROJECT_ROOT / "ai_pipeline" / "weights"
     weights_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(epochs):
+    for epoch in range(config.epochs):
 
         generator.train()
         discriminator.train()
@@ -828,8 +842,9 @@ def train_gan(
             )
 
             loss_d = (
-                loss_d_real + loss_d_fake
-            ) / 2.0
+                config.loss_d_real_weight * loss_d_real
+                + config.loss_d_fake_weight * loss_d_fake
+            )
 
             loss_d.backward()
             optimizer_d.step()
@@ -859,7 +874,10 @@ def train_gan(
 
             # The segmentation reconstruction term remains the primary
             # prototype objective. The adversarial term is auxiliary.
-            loss_g = loss_g_seg * 100.0 + loss_g_adv
+            loss_g = (
+                config.loss_l1_weight * loss_g_seg
+                + config.loss_adv_weight * loss_g_adv
+            )
 
             loss_g.backward()
             optimizer_g.step()
@@ -868,7 +886,7 @@ def train_gan(
             epoch_discriminator_loss += loss_d.item()
 
             print(
-                f"[Epoch {epoch + 1}/{epochs}] "
+                f"[Epoch {epoch + 1}/{config.epochs}] "
                 f"[Batch {batch_index + 1}/{len(train_loader)}] "
                 f"| D: {loss_d.item():.4f} "
                 f"| G: {loss_g.item():.4f}"
@@ -913,18 +931,19 @@ def train_gan(
 
         latest_path = weights_dir / "generator_latest.pth"
 
-        torch.save(
-            {
-                "model_state_dict": generator.state_dict(),
-                "epoch": epoch + 1,
-                "seed": seed,
-                "image_size": image_size,
-                "in_channels": 4,
-                "out_channels": 1,
-                "validation_metrics": validation_metrics,
-            },
-            latest_path,
-        )
+        checkpoint = {
+            "model_state_dict": generator.state_dict(),
+            "epoch": epoch + 1,
+            "seed": config.seed,
+            "image_size": config.image_size,
+            "in_channels": config.in_channels,
+            "out_channels": config.out_channels,
+            "generator_features": list(config.generator_features),
+            "validation_metrics": validation_metrics,
+            "training_config": config.to_dict(),
+        }
+
+        torch.save(checkpoint, latest_path)
 
         # -------------------------------------------------------------------
         # Save best checkpoint
@@ -936,18 +955,7 @@ def train_gan(
 
             best_path = weights_dir / "generator_best.pth"
 
-            torch.save(
-                {
-                    "model_state_dict": generator.state_dict(),
-                    "epoch": epoch + 1,
-                    "seed": seed,
-                    "image_size": image_size,
-                    "in_channels": 4,
-                    "out_channels": 1,
-                    "validation_metrics": validation_metrics,
-                },
-                best_path,
-            )
+            torch.save(checkpoint, best_path)
 
             print(
                 f"[*] New best checkpoint saved: {best_path}"
@@ -984,57 +992,88 @@ def main() -> None:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=1,
+        default=BASELINE_CONFIG.epochs,
     )
 
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=2,
+        default=BASELINE_CONFIG.batch_size,
     )
 
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=0.0002,
+        default=BASELINE_CONFIG.learning_rate,
     )
 
     parser.add_argument(
         "--validation_fraction",
         type=float,
-        default=0.2,
+        default=BASELINE_CONFIG.validation_fraction,
     )
 
     parser.add_argument(
         "--image_size",
         type=int,
-        default=224,
+        default=BASELINE_CONFIG.image_size,
     )
 
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=BASELINE_CONFIG.seed,
     )
 
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=0,
+        default=BASELINE_CONFIG.num_workers,
+    )
+
+    parser.add_argument(
+        "--output_json",
+        type=Path,
+        default=None,
+        help="Optional path for JSON experiment record.",
     )
 
     args = parser.parse_args()
 
-    train_gan(
-        data_dir=args.data_dir,
+    # Build config from args (allows CLI overrides while keeping defaults frozen)
+    config = TrainingConfig(
+        image_size=args.image_size,
+        validation_fraction=args.validation_fraction,
+        min_tumor_pixels=BASELINE_CONFIG.min_tumor_pixels,
+        in_channels=BASELINE_CONFIG.in_channels,
+        out_channels=BASELINE_CONFIG.out_channels,
+        generator_features=BASELINE_CONFIG.generator_features,
+        discriminator_in_channels=BASELINE_CONFIG.discriminator_in_channels,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
-        validation_fraction=args.validation_fraction,
-        image_size=args.image_size,
+        adam_betas=BASELINE_CONFIG.adam_betas,
+        loss_l1_weight=BASELINE_CONFIG.loss_l1_weight,
+        loss_adv_weight=BASELINE_CONFIG.loss_adv_weight,
+        loss_d_real_weight=BASELINE_CONFIG.loss_d_real_weight,
+        loss_d_fake_weight=BASELINE_CONFIG.loss_d_fake_weight,
         seed=args.seed,
         num_workers=args.num_workers,
+        cudnn_deterministic=BASELINE_CONFIG.cudnn_deterministic,
+        cudnn_benchmark=BASELINE_CONFIG.cudnn_benchmark,
     )
+
+    train_gan(data_dir=args.data_dir, config=config)
+
+    # Write experiment record if requested
+    if args.output_json is not None:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        import json
+        args.output_json.write_text(
+            json.dumps(config.to_dict(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        print(f"\nExperiment config written to: {args.output_json}")
 
 
 if __name__ == "__main__":

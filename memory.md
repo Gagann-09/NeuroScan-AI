@@ -306,6 +306,63 @@ management.
 
 **Verification:** 12 .npy files saved for test patient (BraTS20_Training_000), each with shape [224, 224], dtype float32, containing probability values in [0, 1].
 
+### D-025 --- Frozen AttackConfig for FGSM/PGD robustness evaluation
+
+**Date:** 2026-10-05
+
+**Context:** Adversarial attack parameters (epsilon, step size, iterations, norm, clipping) were not centrally documented.
+
+**Decision:** Create immutable `AttackConfig` dataclass with all attack parameters. Default epsilon=0.03 (L-inf), step_size=0.0075, 10 iterations, random start with fixed seed offset. Clipping bounds [-3.0, 3.0] for Z-score normalized input space.
+
+**Reason:** Robustness Rules (rules.md #9): "Attack parameters must be explicit." Scientific evaluation requires documented attack budgets.
+
+**Affected files:**
+- `backend/ai_pipeline/robustness/attacks.py` (AttackConfig, BASELINE_ATTACK_CONFIG)
+- `backend/ai_pipeline/robustness/config.py` (RobustnessConfig)
+- `backend/tests/test_robustness_attacks.py` (new)
+
+**Status:** Complete.
+
+**Verification:** 23 attack tests pass (FGSM/PGD L∞ bound, projection, deterministic behavior, gradient existence, no weight modification).
+
+### D-026 --- FGSM and PGD attack implementations for segmentation
+
+**Date:** 2026-10-05
+
+**Context:** No adversarial attack implementations existed for the ARMT-GAN segmentation model.
+
+**Decision:** Implement FGSM (single-step) and PGD (iterative) attacks using soft Dice loss (1 - soft Dice) as differentiable attack objective. Attacks operate on model output probabilities (continuous), target ground-truth segmentation mask. Perturbation applied in Z-score normalized input space with single L∞ budget across all 4 modalities. Clean input clamped to [-3, 3] before attack to prevent clamping artifacts.
+
+**Reason:** PRD FR-07 requires "FGSM and PGD use documented budgets." Design.md #5 specifies separate evaluation experiments.
+
+**Affected files:**
+- `backend/ai_pipeline/robustness/attacks.py` (new: soft_dice_loss, fgsm_attack, pgd_attack)
+- `backend/ai_pipeline/robustness/evaluate_robustness.py` (new: run_robustness_evaluation)
+- `backend/ai_pipeline/robustness/__init__.py` (exports)
+- `backend/ai_pipeline/robustness/config.py` (AttackConfig, RobustnessConfig)
+
+**Status:** Complete.
+
+**Verification:** 23 attack unit tests pass. Clean/FGSM/PGD evaluation pipeline verified on synthetic data. Attack constraints verified (L∞ bound, clipping, determinism, no weight modification).
+
+### D-027 --- Robustness evaluation pipeline integration with P3
+
+**Date:** 2026-10-05
+
+**Context:** P3 established clean evaluation protocol. P4 extends it with adversarial evaluation.
+
+**Decision:** Create `run_robustness_evaluation` that reuses P3 evaluation machinery (metrics, patient splitting, artifact preservation). Runs clean, FGSM, and PGD on same test split. Produces `RobustnessResult` with clean/adversarial metrics and deltas. Artifacts saved per attack type (clean, FGSM, PGD). Outputs JSON experiment record.
+
+**Reason:** P3 gate requires "Metrics are reproducible from stored predictions." P4 extends this to adversarial metrics.
+
+**Affected files:**
+- `backend/ai_pipeline/robustness/evaluate_robustness.py` (run_robustness_evaluation, print_robustness_result, save_robustness_result)
+- `backend/ai_pipeline/robustness/__init__.py` (exports)
+
+**Status:** Complete.
+
+**Verification:** 58 total backend tests pass (9 preprocessing + 26 evaluation + 23 robustness). Robustness evaluation runs on synthetic data producing clean/FGSM/PGD metrics with deltas.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

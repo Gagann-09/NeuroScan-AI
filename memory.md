@@ -436,6 +436,38 @@ management.
 - Schema matches design.md §9 ER diagram
 - No breaking changes to existing data (nullable columns for backward compat)
 
+### D-031 --- Wire application services into persistent provenance
+
+**Date:** 2026-10-06
+
+**Context:** Batch 3A established the persistence schema (ModelVersion, Artifact, Prediction.model_version_id, dice, iou, Scan.xai_raw_path). Batch 3B wires the application services to populate these fields during inference.
+
+**Decision:** Wire the inference pipeline (ai_tasks.py) to:
+- Create/reuse ModelVersion with deterministic SHA256 hash of checkpoint
+- Link Prediction to ModelVersion via model_version_id FK
+- Persist Scan.xai_raw_path with permanent MinIO object path
+- Create Artifact records (mask, xai, xai_raw, report) linked to Prediction
+- Set Prediction.dice/iou to None (populated by evaluation pipeline)
+- Use permanent MinIO object paths for all provenance (no presigned URLs)
+- Reuse existing XAIProvenance from P5, store config hash in ModelVersion
+
+**Reason:** design.md §9 requires PREDICTION → MODEL_VERSION linkage and ARTIFACT records. rules.md #16: "Presigned URLs are delivery mechanisms. They are not permanent provenance identifiers." PRD FR-10: "Storage: source and derived artifacts have traceable IDs."
+
+**Affected files:**
+- `backend/app/services/ai_tasks.py` (ModelVersion get-or-create, Artifact creation, xai_raw_path, model_version_id)
+- `backend/tests/test_config_security.py` (fixed .env file precedence test)
+- `backend/tests/test_provenance_wiring.py` (new: 11 provenance wiring tests)
+
+**Status:** Complete.
+
+**Verification:** 
+- All 11 new provenance wiring tests pass
+- All 133 backend tests pass (122 original + 11 new)
+- ModelVersion reuse verified (same checkpoint → same version_id)
+- Artifact records use permanent object paths (not presigned URLs)
+- Prediction.model_version_id FK populated correctly
+- Scan.xai_raw_path populated with permanent MinIO path
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

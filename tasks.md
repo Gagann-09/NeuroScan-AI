@@ -191,9 +191,9 @@ Align backend with the four-modality model.
 -   [ ] Accept T1/T1ce/T2/FLAIR explicitly.
 -   [ ] Store each source modality.
 -   [ ] Create study-level identity.
--   [x] Store model version. (Batch 3A: ModelVersion table + Prediction FK)
+-   [x] Store model version. (Batch 3A: ModelVersion table + Prediction FK; Batch 3B: wired)
 -   [ ] Store preprocessing version.
--   [x] Store result provenance. (Batch 3A: Artifact table + Prediction dice/iou + Scan xai_raw_path)
+-   [x] Store result provenance. (Batch 3A: Artifact table + Prediction dice/iou + Scan xai_raw_path; Batch 3B: wired)
 -   [x] Remove `drop_all()` startup behavior. (Batch 1)
 -   [x] Add migration strategy. (Batch 1)
 -   [x] Remove hard-coded secrets. (Batch 2)

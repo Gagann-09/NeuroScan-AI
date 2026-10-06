@@ -13,7 +13,7 @@ from app.db.models import Scan, ModalityFile, Prediction
 from app.core.storage import minio_client, upload_file_to_minio
 from app.services.reporting import generate_clinical_report
 from ai_pipeline.models.armt_gan import ARMTGenerator2D
-from app.services.xai import generate_gradcam
+from app.services.xai import generate_gradient_saliency, compute_segmentation_alignment, XAIProvenance
 from ai_pipeline.preprocessing import preprocess_brats_study, PreprocessingConfig
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,9 @@ if os.path.exists(WEIGHTS_PATH):
     GLOBAL_MODEL.load_state_dict(torch.load(WEIGHTS_PATH, map_location=DEVICE))
 GLOBAL_MODEL.eval()
 logger.info("ARMT-GAN model successfully cached in memory.")
+
+# Extract checkpoint identifier for provenance
+CHECKPOINT_IDENTIFIER = os.path.basename(WEIGHTS_PATH) if os.path.exists(WEIGHTS_PATH) else "unknown"
 
 
 def generate_clinical_overlays(original_pil: Image.Image, mask_tensor: np.ndarray, xai_tensor: np.ndarray):
@@ -186,12 +189,30 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
             with torch.inference_mode():
                 mask_tensor = GLOBAL_MODEL(image_tensor)
             
-            # Generate XAI attribution
-            xai_tensor = generate_gradcam(image_tensor, GLOBAL_MODEL)
+            # Generate XAI attribution with provenance
+            xai_tensor, xai_provenance = generate_gradient_saliency(
+                image_tensor, 
+                GLOBAL_MODEL,
+                model_checkpoint=CHECKPOINT_IDENTIFIER,
+                model_version="armt-gan-2d-baseline",
+            )
+            
+            # Compute segmentation alignment metric (model-attribution alignment analysis)
+            # Uses the raw probability mask (before thresholding) for alignment
+            alignment = compute_segmentation_alignment(
+                attribution=xai_tensor,
+                segmentation_mask=mask_tensor.cpu().numpy(),
+                threshold=0.5,
+            )
+            
+            logger.info(f"XAI alignment: inside={alignment['mean_inside']:.4f}, "
+                       f"outside={alignment['mean_outside']:.4f}, "
+                       f"ratio={alignment['ratio']}, "
+                       f"tumor_pixels={alignment['tumor_pixel_count']}")
             
             # Convert to CPU numpy
             mask_cpu = mask_tensor.cpu().numpy()
-            xai_cpu = xai_tensor.cpu().numpy() if torch.is_tensor(xai_tensor) else xai_tensor
+            xai_cpu = xai_tensor
             
             # Generate visualization overlays
             seg_final_pil, xai_final_pil, tumor_area_cm2, norm_mask = generate_clinical_overlays(
@@ -216,6 +237,10 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 mask_path = os.path.join(tmpdirname, f"{scan_id}_mask.png")
                 xai_path = os.path.join(tmpdirname, f"{scan_id}_xai.png")
                 report_path = os.path.join(tmpdirname, f"{scan_id}_report.pdf")
+                xai_raw_path = os.path.join(tmpdirname, f"{scan_id}_xai_raw.npy")
+                
+                # Save raw attribution as .npy for auditability
+                np.save(xai_raw_path, xai_cpu)
                 
                 original_pil.save(source_img_path)
                 seg_final_pil.save(mask_path)
@@ -226,10 +251,12 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 mask_obj_name = f"{scan_id}/mask.png"
                 xai_obj_name = f"{scan_id}/xai.png"
                 report_obj_name = f"{scan_id}/report.pdf"
+                xai_raw_obj_name = f"{scan_id}/xai_raw.npy"
                 
                 upload_file_to_minio(mask_path, mask_obj_name)
                 upload_file_to_minio(xai_path, xai_obj_name)
                 upload_file_to_minio(report_path, report_obj_name)
+                upload_file_to_minio(xai_raw_path, xai_raw_obj_name)
             
             # Update database
             scan_record = db.query(Scan).filter(Scan.id == scan_id).first()

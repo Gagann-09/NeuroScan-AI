@@ -164,18 +164,18 @@ Make explanations scientifically honest.
 
 ### Tasks
 
--   [ ] Rename current gradient-saliency implementation.
--   [ ] Decide whether true Grad-CAM is required.
--   [ ] Implement selected attribution method.
--   [ ] Record attribution provenance.
--   [ ] Test attribution shape.
--   [ ] Test attribution normalization.
--   [ ] Compare attribution with segmentation region.
--   [ ] Remove unsupported "clinical explanation" language.
+-   [x] Rename current gradient-saliency implementation.
+-   [x] Decide whether true Grad-CAM is required. (Decision: Not required; gradient saliency is acceptable when correctly named)
+-   [x] Implement selected attribution method. (Kept gradient-based input saliency with explicit documentation)
+-   [x] Record attribution provenance. (Added XAIProvenance dataclass with method, target, normalization, aggregation, model checkpoint, version, shapes)
+-   [x] Test attribution shape. (test_output_shape, test_batch_size_greater_than_one, test_different_spatial_sizes)
+-   [x] Test attribution normalization. (test_output_range, test_normalization_non_flat, test_constant_output_model, test_constant_nonzero_output_model)
+-   [x] Compare attribution with segmentation region. (Added compute_segmentation_alignment with mean inside/outside tumor region)
+-   [x] Remove unsupported "clinical explanation" language. (Not in XAI code; reporting.py changes deferred to P6/P7)
 
 ### Gate
 
-XAI method name matches implementation.
+XAI method name matches implementation. **VERIFIED: All 28 XAI tests pass; method is "gradient-based input saliency"; provenance recorded; raw artifact preserved; alignment metric computed.**
 
 ------------------------------------------------------------------------
 

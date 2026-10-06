@@ -363,6 +363,30 @@ management.
 
 **Verification:** 58 total backend tests pass (9 preprocessing + 26 evaluation + 23 robustness). Robustness evaluation runs on synthetic data producing clean/FGSM/PGD metrics with deltas.
 
+### D-028 --- Gradient-based input saliency as P5 XAI method
+
+**Date:** 2026-10-06
+
+**Context:** XAI method was named `generate_gradcam` but implemented input-gradient saliency. P5 requires method name to match implementation and provenance tracking.
+
+**Decision:** Keep gradient-based input saliency (sensitivity analysis) as the P5 method. Rename function to `generate_gradient_saliency`, add `XAIProvenance` dataclass, remove semantic fallback, add raw attribution artifact preservation, add segmentation alignment metric.
+
+**Reason:** PRD FR-08 requires "Attribution method is explicitly named." Design.md #6: "The current implementation is gradient-based input saliency. It must not be labelled Grad-CAM." Rules.md #13: "Never label input-gradient saliency as Grad-CAM. Store attribution provenance."
+
+**Affected files:**
+- `backend/app/services/xai.py` (rewritten: generate_gradient_saliency, XAIProvenance, compute_segmentation_alignment)
+- `backend/app/services/ai_tasks.py` (updated to use new XAI function, provenance, alignment, raw artifact)
+- `backend/tests/test_xai.py` (new: 28 tests)
+
+**Status:** Complete.
+
+**Verification:** 
+- All 28 XAI tests pass (output shape, normalization range, flat-gradient behavior, deterministic attribution, gradient availability, no model-weight modification, provenance fields, alignment metric, empty-mask behavior)
+- All 9 P1 preprocessing parity tests pass
+- All 26 P3 evaluation protocol tests pass
+- All 23 P4 robustness attack tests pass
+- 86 total backend tests pass
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

@@ -32,7 +32,11 @@ target_metadata = Base.metadata
 # Get database URL from application configuration (environment variables)
 # This ensures Alembic uses the same configuration as the application
 _settings = get_settings()
-config.set_main_option("sqlalchemy.url", _settings.DATABASE_URL)
+# Use psycopg2 driver explicitly (psycopg v3 requires libpq which may not be available on Windows)
+db_url = _settings.DATABASE_URL
+if db_url.startswith("postgresql://"):
+    db_url = "postgresql+psycopg2://" + db_url[len("postgresql://"):]
+config.set_main_option("sqlalchemy.url", db_url)
 
 
 def run_migrations_offline() -> None:

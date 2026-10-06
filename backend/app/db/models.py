@@ -1,8 +1,8 @@
 from sqlalchemy import Column, String, Boolean, Float, DateTime, Integer, ForeignKey
 from datetime import datetime
 
-# CRUCIAL FIX: Import the exact Base used by the database connection
-from app.db.database import Base
+# Import Base from base.py (declarative base without DB connection)
+from app.db.base import Base
 
 class Scan(Base):
     __tablename__ = "scans"

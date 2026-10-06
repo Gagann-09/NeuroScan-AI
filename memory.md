@@ -412,6 +412,30 @@ management.
 - Development workflow preserved via Docker Compose environment variables
 - `.env` file support retained for local development
 
+### D-030 --- Establish persistence and provenance schema
+
+**Date:** 2026-10-06
+
+**Context:** The database schema was missing tables and columns required by design.md §9 for persistent provenance: `ModelVersion`, `Artifact`, `Prediction` model-version linkage, Dice/IoU fields, proper FK from `Prediction` to `Scan`, and raw XAI saliency path persistence.
+
+**Decision:** Add `ModelVersion` and `Artifact` tables per design.md §9 ER diagram. Extend `Prediction` with `model_version_id` FK, `dice`, `iou`, `created_at` columns. Add proper FK from `Prediction.scan_id` to `Scan.id`. Add `xai_raw_path` to `Scan` for raw saliency artifact provenance. All changes via Alembic migration `002`.
+
+**Reason:** design.md §9 requires `MODEL_VERSION`, `ARTIFACT`, `PREDICTION` with `model_version`, `dice`, `iou`. rules.md #16: "Every artifact belongs to a study. Every derived artifact references its source study." PRD FR-10: "Storage: source and derived artifacts have traceable IDs." rules.md #17: "Schema evolution must be migration-based."
+
+**Affected files:**
+- `backend/app/db/models.py` (added ModelVersion, Artifact; extended Prediction, Scan)
+- `backend/alembic/versions/002_add_model_version_artifact_tables.py` (new migration)
+- `backend/tests/test_db_models.py` (new: 26 model tests)
+
+**Status:** Complete.
+
+**Verification:** 
+- All 26 new database model tests pass
+- All 122 backend tests pass (96 previous + 26 new)
+- Migration recognized by Alembic (001 -> 002)
+- Schema matches design.md §9 ER diagram
+- No breaking changes to existing data (nullable columns for backward compat)
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

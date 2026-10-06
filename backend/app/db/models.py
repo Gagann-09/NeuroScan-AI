@@ -39,11 +39,9 @@ class Prediction(Base):
     scan_id = Column(String, ForeignKey("scans.id"), index=True, nullable=False)
     model_version_id = Column(String, ForeignKey("model_versions.id"), index=True, nullable=True)
     tumor_detected = Column(Boolean, default=False)
-    anomaly_area_cm2 = Column(Float, nullable=True)
-    confidence_score = Column(Float, nullable=True)
+    max_tumor_probability = Column(Float, nullable=True)
     dice = Column(Float, nullable=True)
     iou = Column(Float, nullable=True)
-    who_grade = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Artifact(Base):

@@ -126,7 +126,6 @@ def get_scan_results(scan_id: str, db: Session = Depends(get_db)):
         xai_url=get_presigned_url(scan.xai_path) if scan.xai_path else None,
         report_url=get_presigned_url(scan.report_path) if scan.report_path else None,
         tumor_detected=prediction.tumor_detected if prediction else False,
-        anomaly_area_cm2=prediction.anomaly_area_cm2 if prediction else 0.0,
-        confidence_score=prediction.confidence_score if prediction else 0.0,
-        who_grade=prediction.who_grade if prediction else "N/A",
+        max_tumor_probability=prediction.max_tumor_probability if prediction else 0.0,
+        model_version=prediction.model_version_id if prediction else None,
     )

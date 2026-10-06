@@ -34,6 +34,5 @@ class ResultsResponse(BaseModel):
     xai_url: Optional[str] = Field(None, description="Presigned URL for the XAI activation map")
     report_url: Optional[str] = Field(None, description="Presigned URL for the PDF report")
     tumor_detected: bool = Field(False, description="Whether a tumor was detected")
-    anomaly_area_cm2: float = Field(0.0, description="Estimated anomaly area in cm²")
-    confidence_score: float = Field(0.0, description="Model confidence score")
-    who_grade: str = Field("N/A", description="WHO tumor grade classification")
+    max_tumor_probability: float = Field(0.0, description="Maximum tumor probability from model output (raw sigmoid)")
+    model_version: Optional[str] = Field(None, description="Model version identifier")

@@ -45,6 +45,21 @@ class TestModelDefinitions:
         assert dice_col.nullable is True
         assert iou_col.nullable is True
 
+    def test_prediction_has_max_tumor_probability_field(self):
+        """Prediction model has max_tumor_probability field (replaces confidence_score)."""
+        cols = {c.name for c in Prediction.__table__.columns}
+        assert 'max_tumor_probability' in cols
+        
+        col = Prediction.__table__.columns['max_tumor_probability']
+        assert col.nullable is True
+
+    def test_prediction_no_longer_has_unsupported_fields(self):
+        """Prediction model should NOT have unsupported clinical fields."""
+        cols = {c.name for c in Prediction.__table__.columns}
+        unsupported = {'anomaly_area_cm2', 'confidence_score', 'who_grade'}
+        for col in unsupported:
+            assert col not in cols, f"Unsupported field {col} should be removed"
+
     def test_prediction_scan_id_fk_not_null(self):
         """Prediction.scan_id is NOT NULL and has FK."""
         col = Prediction.__table__.columns['scan_id']
@@ -169,6 +184,11 @@ class TestConstants:
         assert "image_size:224" in source
         assert "modality_order:t1,t1ce,t2,flair" in source
         assert "normalize:nonzero_zscore" in source
+        
+        # Verify unsupported constants are removed
+        assert "anomaly_area_cm2" not in source or "REMOVED" in source
+        assert "who_grade" not in source or "REMOVED" in source
+        assert "confidence_score" not in source or "max_tumor_probability" in source
 
 
 if __name__ == "__main__":

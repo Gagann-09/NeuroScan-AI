@@ -51,9 +51,14 @@ class TestModelDefinitions:
         
         cols = {c.name for c in Prediction.__table__.columns}
         expected = {'id', 'scan_id', 'model_version_id', 'tumor_detected', 
-                    'anomaly_area_cm2', 'confidence_score', 'dice', 'iou', 
-                    'who_grade', 'created_at'}
+                    'max_tumor_probability', 'dice', 'iou', 
+                    'created_at'}
         assert expected.issubset(cols)
+        
+        # Verify removed columns are gone
+        removed = {'anomaly_area_cm2', 'confidence_score', 'who_grade'}
+        for col in removed:
+            assert col not in cols, f"Column {col} should have been removed"
 
     def test_artifact_model_exists(self):
         """Artifact model should exist with required columns."""

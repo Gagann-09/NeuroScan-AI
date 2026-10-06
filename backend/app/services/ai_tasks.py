@@ -12,7 +12,7 @@ from pathlib import Path
 from app.db.database import SessionLocal
 from app.db.models import Scan, ModalityFile, Prediction, ModelVersion, Artifact
 from app.core.storage import minio_client, upload_file_to_minio
-from app.services.reporting import generate_clinical_report
+from app.services.reporting import generate_segmentation_report
 from ai_pipeline.models.armt_gan import ARMTGenerator2D
 from app.services.xai import generate_gradient_saliency, compute_segmentation_alignment, XAIProvenance
 from ai_pipeline.preprocessing import preprocess_brats_study, PreprocessingConfig
@@ -123,9 +123,10 @@ def generate_clinical_overlays(original_pil: Image.Image, mask_tensor: np.ndarra
     xai_final_pil = Image.fromarray(cv2.cvtColor(xai_overlay, cv2.COLOR_BGR2RGB))
     
     tumor_area_px = cv2.countNonZero(clean_mask)
-    estimated_area_cm2 = round(tumor_area_px * 0.11, 2)
+    # No heuristic cm² conversion - pixel count only for internal thresholding
+    tumor_detected = tumor_area_px > 0
     
-    return seg_final_pil, xai_final_pil, estimated_area_cm2, norm_mask
+    return seg_final_pil, xai_final_pil, tumor_detected, norm_mask
 
 
 def create_reference_image(modality_arrays: dict[str, np.ndarray], slice_index: int) -> Image.Image:
@@ -250,21 +251,14 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
             xai_cpu = xai_tensor
             
             # Generate visualization overlays
-            seg_final_pil, xai_final_pil, tumor_area_cm2, norm_mask = generate_clinical_overlays(
+            seg_final_pil, xai_final_pil, tumor_detected, norm_mask = generate_clinical_overlays(
                 original_pil=original_pil, 
                 mask_tensor=mask_cpu, 
                 xai_tensor=xai_cpu
             )
             
-            # Compute confidence score from model output (NO HEURISTIC BOOST)
-            confidence_score = round(float(torch.sigmoid(mask_tensor).max().item()), 4)
-            # REMOVED: if confidence_score < 0.50: confidence_score = round(confidence_score + 0.40, 2)
-            
-            tumor_detected = tumor_area_cm2 > 0.5
-            
-            # REMOVED: Heuristic WHO grading based on area
-            # The model does NOT predict WHO grade - this is a research prototype
-            who_grade = "Not predicted (research prototype)"
+            # Compute max tumor probability from model output (raw sigmoid probability)
+            max_tumor_probability = round(float(torch.sigmoid(mask_tensor).max().item()), 4)
             
             # Save artifacts
             with tempfile.TemporaryDirectory() as tmpdirname:
@@ -281,12 +275,24 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 seg_final_pil.save(mask_path)
                 xai_final_pil.save(xai_path)
                 
-                generate_clinical_report("PT-ANONYMIZED", scan_id, source_img_path, mask_path, xai_path, report_path)
+                generate_segmentation_report("PT-ANONYMIZED", scan_id, model_version.id, source_img_path, mask_path, xai_path, report_path)
                 
                 mask_obj_name = f"{scan_id}/mask.png"
                 xai_obj_name = f"{scan_id}/xai.png"
                 report_obj_name = f"{scan_id}/report.pdf"
                 xai_raw_obj_name = f"{scan_id}/xai_raw.npy"
+                
+                # Get or create ModelVersion for this checkpoint (needed for report)
+                db: Session = SessionLocal()
+                try:
+                    model_version = _get_or_create_model_version(
+                        db, MODEL_VERSION_ID, WEIGHTS_PATH, MODEL_VERSION_CONFIG_HASH
+                    )
+                    db.expunge(model_version)
+                finally:
+                    db.close()
+                
+                generate_segmentation_report("PT-ANONYMIZED", scan_id, model_version.id, source_img_path, mask_path, xai_path, report_path)
                 
                 upload_file_to_minio(mask_path, mask_obj_name)
                 upload_file_to_minio(xai_path, xai_obj_name)
@@ -314,11 +320,9 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                     scan_id=scan_id,
                     model_version_id=model_version.id,
                     tumor_detected=tumor_detected,
-                    anomaly_area_cm2=tumor_area_cm2,
-                    confidence_score=confidence_score,
+                    max_tumor_probability=max_tumor_probability,
                     dice=None,  # Populated by evaluation pipeline when ground truth available
                     iou=None,   # Populated by evaluation pipeline when ground truth available
-                    who_grade=who_grade
                 )
                 db.add(prediction)
                 db.flush()  # Get prediction.id for Artifact FK

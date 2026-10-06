@@ -197,7 +197,7 @@ Align backend with the four-modality model.
 -   [x] Remove `drop_all()` startup behavior. (Batch 1)
 -   [x] Add migration strategy. (Batch 1)
 -   [x] Remove hard-coded secrets. (Batch 2)
--   [ ] Replace fake clinical fields.
+-   [x] Replace fake clinical fields. (Batch 5A: removed who_grade, anomaly_area_cm2, confidence_score; renamed to max_tumor_probability; updated report title and model version provenance)
 -   [ ] Make failures transactional.
 
 ### Gate

@@ -468,6 +468,52 @@ management.
 - Prediction.model_version_id FK populated correctly
 - Scan.xai_raw_path populated with permanent MinIO path
 
+### D-032 --- Remove unsupported clinical claims from backend (P6 Batch 5A)
+
+**Date:** 2026-10-06
+
+**Context:** The P6 audit identified several unsupported clinical claims in the backend:
+- `who_grade` field in Prediction model with heuristic area-threshold logic (previously removed in D-018 but field remained in DB)
+- `anomaly_area_cm2` field computed using uncalibrated heuristic `tumor_area_px * 0.11`
+- `confidence_score` field - renamed to `max_tumor_probability` to accurately reflect raw sigmoid output
+- Report title "Clinical Diagnosis Report" - forbidden by rules.md #12
+- Hardcoded "ARMT-GAN v1.0" model version in reports - not traceable to ModelVersion
+
+**Decision:** 
+1. Remove `who_grade`, `anomaly_area_cm2`, `confidence_score` columns from Prediction table via Alembic migration 003
+2. Add `max_tumor_probability` column to store raw model output probability
+3. Rename report function to `generate_segmentation_report` with research-prototype title
+4. Add explicit research disclaimer to report
+5. Use actual ModelVersion.id from provenance in report instead of hardcoded string
+6. Update API schema to return `max_tumor_probability` and `model_version` instead of removed fields
+7. Update all tests to verify unsupported fields are removed
+
+**Reason:** 
+- rules.md #12: "WHO grade prediction" forbidden without validation; "Clinical Diagnosis Report" forbidden
+- PRD §2: Clinical diagnosis, automated WHO grading explicitly out of scope
+- design.md §11: Reports must not call predictions diagnoses; must not assign WHO grade
+- rules.md #11: No fabricated confidence - raw probability is scientifically accurate
+- rules.md #16: Every artifact references its source study - ModelVersion provenance must be used
+
+**Affected files:**
+- `backend/app/db/models.py` (removed fields, added max_tumor_probability)
+- `backend/app/services/ai_tasks.py` (removed computations, updated report call)
+- `backend/app/api/routers/scans.py` (updated response)
+- `backend/app/schemas/scan_schema.py` (updated ResultsResponse)
+- `backend/app/services/reporting.py` (renamed function, updated title, added disclaimer, use ModelVersion)
+- `backend/alembic/versions/003_remove_unsupported_clinical_fields.py` (new migration)
+- `backend/tests/test_db_models.py` (verify removed fields)
+- `backend/tests/test_provenance_wiring.py` (verify new fields, removed fields)
+
+**Status:** Complete.
+
+**Verification:** 
+- All 135 backend tests pass (133 original + 2 new)
+- No references to unsupported fields remain in backend app code
+- Report title is "Research Prototype Segmentation Report"
+- Report uses actual ModelVersion.id from provenance
+- Migration 003 created for schema changes
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

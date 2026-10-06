@@ -30,6 +30,7 @@ class ModelVersion(Base):
     id = Column(String, primary_key=True, index=True)
     checkpoint_path = Column(String, nullable=False)
     config_hash = Column(String, nullable=True)
+    preprocessing_version = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Prediction(Base):

@@ -41,7 +41,7 @@ class TestModelDefinitions:
         assert ModelVersion.__tablename__ == 'model_versions'
         
         cols = {c.name for c in ModelVersion.__table__.columns}
-        expected = {'id', 'checkpoint_path', 'config_hash', 'created_at'}
+        expected = {'id', 'checkpoint_path', 'config_hash', 'preprocessing_version', 'created_at'}
         assert expected.issubset(cols)
 
     def test_prediction_model_exists(self):
@@ -127,6 +127,12 @@ class TestModelVersionModel:
         """ModelVersion.config_hash should be nullable."""
         col = ModelVersion.__table__.columns['config_hash']
         assert col.nullable is True
+
+    def test_model_version_preprocessing_version_column(self):
+        """ModelVersion should have preprocessing_version column for preprocessing provenance."""
+        col = ModelVersion.__table__.columns['preprocessing_version']
+        assert col.nullable is True
+        assert str(col.type) == 'VARCHAR'
 
 
 class TestPredictionModel:

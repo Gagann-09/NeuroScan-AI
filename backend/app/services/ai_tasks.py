@@ -48,9 +48,30 @@ def _compute_model_version_id(checkpoint_path: str) -> str:
 
 # Pre-compute model version ID for the global checkpoint
 MODEL_VERSION_ID = _compute_model_version_id(WEIGHTS_PATH)
-MODEL_VERSION_CONFIG_HASH = "preprocessing:v1|image_size:224|modality_order:t1,t1ce,t2,flair|normalize:nonzero_zscore"
 
-def _get_or_create_model_version(db: Session, version_id: str, checkpoint_path: str, config_hash: str) -> ModelVersion:
+# Compute a deterministic preprocessing version identifier from the preprocessing configuration
+def _compute_preprocessing_version(config: PreprocessingConfig) -> str:
+    """
+    Compute a deterministic preprocessing version identifier from the preprocessing config.
+    Uses a hash of the canonical preprocessing parameters for reproducibility.
+    """
+    import hashlib
+    import json
+    
+    # Create a canonical representation of the preprocessing config
+    config_dict = config.to_dict()
+    # Sort keys for deterministic serialization
+    canonical_str = json.dumps(config_dict, sort_keys=True)
+    return hashlib.sha256(canonical_str.encode()).hexdigest()[:16]
+
+# Pre-compute preprocessing version for the default inference config
+DEFAULT_PREPROCESSING_CONFIG = PreprocessingConfig(image_size=224)
+PREPROCESSING_VERSION = _compute_preprocessing_version(DEFAULT_PREPROCESSING_CONFIG)
+
+# Model config hash (only model configuration, NOT preprocessing)
+MODEL_VERSION_CONFIG_HASH = "arch:armt-gan-2d-unet|generator:lightweight|discriminator:conditional-patchgan|loss:l1_100_adv_1"
+
+def _get_or_create_model_version(db: Session, version_id: str, checkpoint_path: str, config_hash: str, preprocessing_version: str) -> ModelVersion:
     """
     Get existing ModelVersion or create new one.
     Ensures deterministic reuse of the same model version for the same checkpoint.
@@ -61,6 +82,7 @@ def _get_or_create_model_version(db: Session, version_id: str, checkpoint_path: 
             id=version_id,
             checkpoint_path=checkpoint_path,
             config_hash=config_hash,
+            preprocessing_version=preprocessing_version,
         )
         db.add(model_version)
         db.flush()  # Ensure ID is available
@@ -286,7 +308,7 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 db: Session = SessionLocal()
                 try:
                     model_version = _get_or_create_model_version(
-                        db, MODEL_VERSION_ID, WEIGHTS_PATH, MODEL_VERSION_CONFIG_HASH
+                        db, MODEL_VERSION_ID, WEIGHTS_PATH, MODEL_VERSION_CONFIG_HASH, PREPROCESSING_VERSION
                     )
                     db.expunge(model_version)
                 finally:
@@ -310,7 +332,7 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 
                 # Get or create ModelVersion for this checkpoint
                 model_version = _get_or_create_model_version(
-                    db, MODEL_VERSION_ID, WEIGHTS_PATH, MODEL_VERSION_CONFIG_HASH
+                    db, MODEL_VERSION_ID, WEIGHTS_PATH, MODEL_VERSION_CONFIG_HASH, PREPROCESSING_VERSION
                 )
                 
                 # Create Prediction with model version linkage and nullable metrics

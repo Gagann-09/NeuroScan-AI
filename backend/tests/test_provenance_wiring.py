@@ -81,13 +81,18 @@ class TestModelDefinitions:
     def test_model_version_table_exists(self):
         """ModelVersion table exists with correct columns."""
         cols = {c.name for c in ModelVersion.__table__.columns}
-        expected = {'id', 'checkpoint_path', 'config_hash', 'created_at'}
+        expected = {'id', 'checkpoint_path', 'config_hash', 'preprocessing_version', 'created_at'}
         assert expected.issubset(cols)
         
         # Check primary key
         pk_cols = [c for c in ModelVersion.__table__.columns if c.primary_key]
         assert len(pk_cols) == 1
         assert pk_cols[0].name == 'id'
+
+    def test_model_version_preprocessing_version_column(self):
+        """ModelVersion should have preprocessing_version column for preprocessing provenance."""
+        col = ModelVersion.__table__.columns['preprocessing_version']
+        assert col.nullable is True
 
     def test_artifact_table_exists(self):
         """Artifact table exists with correct columns."""
@@ -178,12 +183,14 @@ class TestConstants:
         assert "CHECKPOINT_IDENTIFIER" in source
         assert "MODEL_VERSION_ID" in source
         assert "MODEL_VERSION_CONFIG_HASH" in source
+        assert "PREPROCESSING_VERSION" in source
+        assert "_compute_preprocessing_version" in source
         
         assert "generator_latest.pth" in source
-        assert "preprocessing:v1" in source
-        assert "image_size:224" in source
-        assert "modality_order:t1,t1ce,t2,flair" in source
-        assert "normalize:nonzero_zscore" in source
+        assert "arch:armt-gan-2d-unet" in source
+        
+        # Verify old conflated config hash is removed
+        assert "preprocessing:v1|image_size:224|modality_order:t1,t1ce,t2,flair|normalize:nonzero_zscore" not in source
         
         # Verify unsupported constants are removed
         assert "anomaly_area_cm2" not in source or "REMOVED" in source

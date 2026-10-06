@@ -172,6 +172,12 @@ MINIO_SECRET_KEY=fromenvsecret
 MINIO_ENDPOINT=custom:9000
 """)
         
+        # Remove environment variables so .env file takes precedence
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.delenv("MINIO_ACCESS_KEY", raising=False)
+        monkeypatch.delenv("MINIO_SECRET_KEY", raising=False)
+        monkeypatch.delenv("MINIO_ENDPOINT", raising=False)
+        
         # Change to temp directory and test
         old_cwd = os.getcwd()
         os.chdir(tmp_path)

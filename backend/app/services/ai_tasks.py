@@ -3,13 +3,14 @@ import cv2
 import torch
 import numpy as np
 import tempfile
+import hashlib
 from PIL import Image
 from sqlalchemy.orm import Session
 import logging
 from pathlib import Path
 
 from app.db.database import SessionLocal
-from app.db.models import Scan, ModalityFile, Prediction
+from app.db.models import Scan, ModalityFile, Prediction, ModelVersion, Artifact
 from app.core.storage import minio_client, upload_file_to_minio
 from app.services.reporting import generate_clinical_report
 from ai_pipeline.models.armt_gan import ARMTGenerator2D
@@ -31,6 +32,40 @@ logger.info("ARMT-GAN model successfully cached in memory.")
 
 # Extract checkpoint identifier for provenance
 CHECKPOINT_IDENTIFIER = os.path.basename(WEIGHTS_PATH) if os.path.exists(WEIGHTS_PATH) else "unknown"
+
+# Compute a deterministic model version identifier from the checkpoint
+def _compute_model_version_id(checkpoint_path: str) -> str:
+    """
+    Compute a deterministic model version identifier from the checkpoint file.
+    Uses SHA256 of the checkpoint file for reproducibility.
+    Falls back to basename if file doesn't exist.
+    """
+    if os.path.exists(checkpoint_path):
+        with open(checkpoint_path, "rb") as f:
+            file_hash = hashlib.sha256(f.read()).hexdigest()[:16]
+        return f"armt-gan-{file_hash}"
+    return "armt-gan-unknown"
+
+# Pre-compute model version ID for the global checkpoint
+MODEL_VERSION_ID = _compute_model_version_id(WEIGHTS_PATH)
+MODEL_VERSION_CONFIG_HASH = "preprocessing:v1|image_size:224|modality_order:t1,t1ce,t2,flair|normalize:nonzero_zscore"
+
+def _get_or_create_model_version(db: Session, version_id: str, checkpoint_path: str, config_hash: str) -> ModelVersion:
+    """
+    Get existing ModelVersion or create new one.
+    Ensures deterministic reuse of the same model version for the same checkpoint.
+    """
+    model_version = db.query(ModelVersion).filter(ModelVersion.id == version_id).first()
+    if model_version is None:
+        model_version = ModelVersion(
+            id=version_id,
+            checkpoint_path=checkpoint_path,
+            config_hash=config_hash,
+        )
+        db.add(model_version)
+        db.flush()  # Ensure ID is available
+        logger.info(f"Created new ModelVersion: {version_id}")
+    return model_version
 
 
 def generate_clinical_overlays(original_pil: Image.Image, mask_tensor: np.ndarray, xai_tensor: np.ndarray):
@@ -258,22 +293,47 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 upload_file_to_minio(report_path, report_obj_name)
                 upload_file_to_minio(xai_raw_path, xai_raw_obj_name)
             
-            # Update database
+            # Update database with full provenance
             scan_record = db.query(Scan).filter(Scan.id == scan_id).first()
             if scan_record:
                 scan_record.status = "SEGMENTED"
                 scan_record.mask_path = mask_obj_name
                 scan_record.xai_path = xai_obj_name
                 scan_record.report_path = report_obj_name
+                scan_record.xai_raw_path = xai_raw_obj_name  # Persist raw XAI object path
                 
+                # Get or create ModelVersion for this checkpoint
+                model_version = _get_or_create_model_version(
+                    db, MODEL_VERSION_ID, WEIGHTS_PATH, MODEL_VERSION_CONFIG_HASH
+                )
+                
+                # Create Prediction with model version linkage and nullable metrics
+                # Note: dice/iou are nullable here since inference doesn't compute ground-truth metrics
+                # They are populated by the evaluation pipeline when ground truth is available
                 prediction = Prediction(
                     scan_id=scan_id,
+                    model_version_id=model_version.id,
                     tumor_detected=tumor_detected,
                     anomaly_area_cm2=tumor_area_cm2,
                     confidence_score=confidence_score,
+                    dice=None,  # Populated by evaluation pipeline when ground truth available
+                    iou=None,   # Populated by evaluation pipeline when ground truth available
                     who_grade=who_grade
                 )
                 db.add(prediction)
+                db.flush()  # Get prediction.id for Artifact FK
+                
+                # Create Artifact records for all derived artifacts
+                # Using permanent object paths (not presigned URLs) for provenance
+                artifacts_to_create = [
+                    Artifact(prediction_id=prediction.id, type="mask", object_path=mask_obj_name),
+                    Artifact(prediction_id=prediction.id, type="xai", object_path=xai_obj_name),
+                    Artifact(prediction_id=prediction.id, type="xai_raw", object_path=xai_raw_obj_name),
+                    Artifact(prediction_id=prediction.id, type="report", object_path=report_obj_name),
+                ]
+                for artifact in artifacts_to_create:
+                    db.add(artifact)
+                
                 db.commit()
             
             logger.info(f"Successfully processed 4-modality inference for ID: {scan_id}")

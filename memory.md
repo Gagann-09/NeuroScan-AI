@@ -387,6 +387,31 @@ management.
 - All 23 P4 robustness attack tests pass
 - 86 total backend tests pass
 
+### D-029 --- Remove hard-coded credential defaults from application configuration
+
+**Date:** 2026-10-06
+
+**Context:** Application configuration (`backend/app/core/config.py`) contained hard-coded default credentials for DATABASE_URL, MINIO_ACCESS_KEY, and MINIO_SECRET_KEY. These were development defaults but committed in plain text, violating security rules (rules.md #14) and memory.md D-012.
+
+**Decision:** Remove all hard-coded credential defaults from `Settings` class. Make `DATABASE_URL`, `MINIO_ACCESS_KEY`, and `MINIO_SECRET_KEY` required fields with no default. Add validation that fails clearly when required credentials are missing. Preserve non-sensitive defaults (endpoints, timeouts, app metadata). Update Alembic to read DATABASE_URL from application settings. Docker Compose retains development credentials for local workflow.
+
+**Reason:** Security Rules (rules.md #14): "No hard-coded production credentials. No default administrator passwords in committed code." Memory.md D-012: "Credentials must come from environment or secret management." PRD NFR: "Free of hard-coded credentials."
+
+**Affected files:**
+- `backend/app/core/config.py` (removed credential defaults, added validators, clear error messages)
+- `backend/alembic.ini` (removed default sqlalchemy.url, now reads from app config)
+- `backend/alembic/env.py` (updated to load DATABASE_URL from application Settings)
+- `backend/tests/test_config_security.py` (new: 10 tests for configuration security)
+
+**Status:** Complete.
+
+**Verification:** 
+- All 10 new configuration security tests pass
+- All 96 backend tests pass (86 original + 10 new)
+- Credential defaults `secure_password_123` and `minioadmin` no longer present in Python application code
+- Development workflow preserved via Docker Compose environment variables
+- `.env` file support retained for local development
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

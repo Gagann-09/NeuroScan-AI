@@ -194,9 +194,9 @@ Align backend with the four-modality model.
 -   [ ] Store model version.
 -   [ ] Store preprocessing version.
 -   [ ] Store result provenance.
--   [ ] Remove `drop_all()` startup behavior.
--   [ ] Add migration strategy.
--   [ ] Remove hard-coded secrets.
+-   [x] Remove `drop_all()` startup behavior. (Batch 1)
+-   [x] Add migration strategy. (Batch 1)
+-   [x] Remove hard-coded secrets. (Batch 2)
 -   [ ] Replace fake clinical fields.
 -   [ ] Make failures transactional.
 

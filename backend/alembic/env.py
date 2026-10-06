@@ -24,7 +24,15 @@ if config.config_file_name is not None:
 from app.db.base import Base
 from app.db import models  # noqa: F401
 
+# Import application settings to get DATABASE_URL from environment
+from app.core.config import get_settings
+
 target_metadata = Base.metadata
+
+# Get database URL from application configuration (environment variables)
+# This ensures Alembic uses the same configuration as the application
+_settings = get_settings()
+config.set_main_option("sqlalchemy.url", _settings.DATABASE_URL)
 
 
 def run_migrations_offline() -> None:

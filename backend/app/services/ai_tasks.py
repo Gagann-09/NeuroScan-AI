@@ -6,8 +6,11 @@ import tempfile
 import hashlib
 from PIL import Image
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 import logging
 from pathlib import Path
+from datetime import datetime, timezone
+from typing import Literal
 
 from app.db.database import SessionLocal
 from app.db.models import Scan, ModalityFile, Prediction, ModelVersion, Artifact
@@ -19,57 +22,157 @@ from ai_pipeline.preprocessing import preprocess_brats_study, PreprocessingConfi
 
 logger = logging.getLogger(__name__)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "../../ai_pipeline/weights/generator_latest.pth")
 
-# ── LOAD MODEL ONCE GLOBALLY TO ELIMINATE REPEATED DISK I/O DELAYS ──
-logger.info("Initializing ARMT-GAN model into global memory...")
-GLOBAL_MODEL = ARMTGenerator2D().to(DEVICE)
-if os.path.exists(WEIGHTS_PATH):
-    GLOBAL_MODEL.load_state_dict(torch.load(WEIGHTS_PATH, map_location=DEVICE))
-GLOBAL_MODEL.eval()
-logger.info("ARMT-GAN model successfully cached in memory.")
+# ── LAZY MODEL LOADING ──
+_DEVICE = None
+_GLOBAL_MODEL = None
+_WEIGHTS_PATH = None
+_CHECKPOINT_IDENTIFIER = None
+_MODEL_VERSION_ID = None
+_DEFAULT_PREPROCESSING_CONFIG = None
+_PREPROCESSING_VERSION = None
+_MODEL_VERSION_CONFIG_HASH = "arch:armt-gan-2d-unet|generator:lightweight|discriminator:conditional-patchgan|loss:l1_100_adv_1"
 
-# Extract checkpoint identifier for provenance
-CHECKPOINT_IDENTIFIER = os.path.basename(WEIGHTS_PATH) if os.path.exists(WEIGHTS_PATH) else "unknown"
 
-# Compute a deterministic model version identifier from the checkpoint
-def _compute_model_version_id(checkpoint_path: str) -> str:
-    """
-    Compute a deterministic model version identifier from the checkpoint file.
-    Uses SHA256 of the checkpoint file for reproducibility.
-    Falls back to basename if file doesn't exist.
-    """
-    if os.path.exists(checkpoint_path):
-        with open(checkpoint_path, "rb") as f:
-            file_hash = hashlib.sha256(f.read()).hexdigest()[:16]
-        return f"armt-gan-{file_hash}"
-    return "armt-gan-unknown"
+def _get_device():
+    global _DEVICE
+    if _DEVICE is None:
+        _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return _DEVICE
 
-# Pre-compute model version ID for the global checkpoint
-MODEL_VERSION_ID = _compute_model_version_id(WEIGHTS_PATH)
 
-# Compute a deterministic preprocessing version identifier from the preprocessing configuration
-def _compute_preprocessing_version(config: PreprocessingConfig) -> str:
-    """
-    Compute a deterministic preprocessing version identifier from the preprocessing config.
-    Uses a hash of the canonical preprocessing parameters for reproducibility.
-    """
-    import hashlib
-    import json
+def _get_weights_path():
+    global _WEIGHTS_PATH
+    if _WEIGHTS_PATH is None:
+        _WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "../../ai_pipeline/weights/generator_latest.pth")
+    return _WEIGHTS_PATH
+
+
+def _get_global_model():
+    """Lazily load and return the global ARMT-GAN model."""
+    global _GLOBAL_MODEL, _CHECKPOINT_IDENTIFIER
+    if _GLOBAL_MODEL is None:
+        logger.info("Initializing ARMT-GAN model into global memory...")
+        _GLOBAL_MODEL = ARMTGenerator2D().to(_get_device())
+        weights_path = _get_weights_path()
+        if os.path.exists(weights_path):
+            _GLOBAL_MODEL.load_state_dict(torch.load(weights_path, map_location=_get_device()))
+        _GLOBAL_MODEL.eval()
+        _CHECKPOINT_IDENTIFIER = os.path.basename(weights_path) if os.path.exists(weights_path) else "unknown"
+        logger.info("ARMT-GAN model successfully cached in memory.")
+    return _GLOBAL_MODEL
+
+
+def _get_checkpoint_identifier():
+    _get_global_model()  # Ensures model is loaded and identifier set
+    return _CHECKPOINT_IDENTIFIER
+
+
+def _get_model_version_id():
+    global _MODEL_VERSION_ID
+    if _MODEL_VERSION_ID is None:
+        weights_path = _get_weights_path()
+        _MODEL_VERSION_ID = _compute_model_version_id(weights_path)
+    return _MODEL_VERSION_ID
+
+
+def _get_default_preprocessing_config():
+    global _DEFAULT_PREPROCESSING_CONFIG
+    if _DEFAULT_PREPROCESSING_CONFIG is None:
+        _DEFAULT_PREPROCESSING_CONFIG = PreprocessingConfig(image_size=224)
+    return _DEFAULT_PREPROCESSING_CONFIG
+
+
+def _get_preprocessing_version():
+    global _PREPROCESSING_VERSION
+    if _PREPROCESSING_VERSION is None:
+        _PREPROCESSING_VERSION = _compute_preprocessing_version(_get_default_preprocessing_config())
+    return _PREPROCESSING_VERSION
+
+
+def _get_model_version_config_hash():
+    return _MODEL_VERSION_CONFIG_HASH
+
+
+class ScanClaimResult:
+    """Result of attempting to claim a scan for processing."""
     
-    # Create a canonical representation of the preprocessing config
-    config_dict = config.to_dict()
-    # Sort keys for deterministic serialization
-    canonical_str = json.dumps(config_dict, sort_keys=True)
-    return hashlib.sha256(canonical_str.encode()).hexdigest()[:16]
+    def __init__(
+        self,
+        success: bool,
+        reason: Literal["CLAIMED", "ALREADY_PROCESSING", "ALREADY_COMPLETE", "NOT_FOUND"] | None = None,
+        scan_id: str | None = None,
+    ):
+        self.success = success
+        self.reason = reason
+        self.scan_id = scan_id
+    
+    def __bool__(self) -> bool:
+        return self.success
+    
+    def __repr__(self) -> str:
+        if self.success:
+            return f"ScanClaimResult(success=True, scan_id={self.scan_id})"
+        return f"ScanClaimResult(success=False, reason={self.reason}, scan_id={self.scan_id})"
 
-# Pre-compute preprocessing version for the default inference config
-DEFAULT_PREPROCESSING_CONFIG = PreprocessingConfig(image_size=224)
-PREPROCESSING_VERSION = _compute_preprocessing_version(DEFAULT_PREPROCESSING_CONFIG)
 
-# Model config hash (only model configuration, NOT preprocessing)
-MODEL_VERSION_CONFIG_HASH = "arch:armt-gan-2d-unet|generator:lightweight|discriminator:conditional-patchgan|loss:l1_100_adv_1"
+def claim_scan_for_processing(db: Session, scan_id: str) -> ScanClaimResult:
+    """
+    Atomically claim a scan for processing using PostgreSQL row-level locking.
+    
+    Uses SELECT FOR UPDATE NOWAIT to acquire an exclusive lock on the Scan row.
+    If another transaction holds the lock, returns immediately with failure.
+    
+    State transitions:
+    - PENDING    → PROCESSING (claimed, processing_started_at set)
+    - FAILED     → PROCESSING (claimed, processing_started_at set)  
+    - PROCESSING → REJECTED (another worker holds the lock)
+    - SEGMENTED  → REJECTED (already complete)
+    - NOT FOUND  → REJECTED (scan does not exist)
+    
+    Args:
+        db: Database session
+        scan_id: Scan identifier to claim
+        
+    Returns:
+        ScanClaimResult with success status and reason
+    """
+    # Attempt to acquire row lock with NOWAIT - fails immediately if locked
+    try:
+        row = db.execute(
+            text("SELECT id, status FROM scans WHERE id = :scan_id FOR UPDATE NOWAIT"),
+            {"scan_id": scan_id}
+        ).fetchone()
+    except Exception as e:
+        # Lock not available - another transaction holds it (PROCESSING)
+        if "could not obtain lock" in str(e).lower() or "lock_not_available" in str(e).lower():
+            return ScanClaimResult(success=False, reason="ALREADY_PROCESSING", scan_id=scan_id)
+        raise
+    
+    if not row:
+        return ScanClaimResult(success=False, reason="NOT_FOUND", scan_id=scan_id)
+    
+    current_status = row.status
+    
+    # Check current state and decide
+    if current_status == "SEGMENTED":
+        return ScanClaimResult(success=False, reason="ALREADY_COMPLETE", scan_id=scan_id)
+    
+    if current_status == "PROCESSING":
+        # Another worker already claimed it (we got the lock but status is PROCESSING)
+        # This shouldn't happen with NOWAIT but handle defensively
+        return ScanClaimResult(success=False, reason="ALREADY_PROCESSING", scan_id=scan_id)
+    
+    # Claim the scan: PENDING or FAILED
+    now = datetime.now(timezone.utc)
+    db.execute(
+        text("UPDATE scans SET status = 'PROCESSING', processing_started_at = :now WHERE id = :scan_id"),
+        {"scan_id": scan_id, "now": now}
+    )
+    db.flush()
+    
+    return ScanClaimResult(success=True, reason="CLAIMED", scan_id=scan_id)
+
 
 def _get_or_create_model_version(db: Session, version_id: str, checkpoint_path: str, config_hash: str, preprocessing_version: str) -> ModelVersion:
     """
@@ -210,7 +313,7 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
             )
             
             # Move to device
-            image_tensor = image_tensor.to(DEVICE)
+            image_tensor = image_tensor.to(_get_device())
             
             # Load segmentation if available for reference image
             seg_path = None
@@ -244,14 +347,15 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
             original_pil = original_pil.resize((224, 224))
             
             # ── RUN INFERENCE WITH GLOBAL MODEL ──
+            model = _get_global_model()
             with torch.inference_mode():
-                mask_tensor = GLOBAL_MODEL(image_tensor)
+                mask_tensor = model(image_tensor)
             
             # Generate XAI attribution with provenance
             xai_tensor, xai_provenance = generate_gradient_saliency(
                 image_tensor, 
-                GLOBAL_MODEL,
-                model_checkpoint=CHECKPOINT_IDENTIFIER,
+                model,
+                model_checkpoint=_get_checkpoint_identifier(),
                 model_version="armt-gan-2d-baseline",
             )
             
@@ -308,7 +412,7 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 db: Session = SessionLocal()
                 try:
                     model_version = _get_or_create_model_version(
-                        db, MODEL_VERSION_ID, WEIGHTS_PATH, MODEL_VERSION_CONFIG_HASH, PREPROCESSING_VERSION
+                        db, _get_model_version_id(), _get_weights_path(), _get_model_version_config_hash(), _get_preprocessing_version()
                     )
                     db.expunge(model_version)
                 finally:
@@ -332,7 +436,7 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 
                 # Get or create ModelVersion for this checkpoint
                 model_version = _get_or_create_model_version(
-                    db, MODEL_VERSION_ID, WEIGHTS_PATH, MODEL_VERSION_CONFIG_HASH, PREPROCESSING_VERSION
+                    db, _get_model_version_id(), _get_weights_path(), _get_model_version_config_hash(), _get_preprocessing_version()
                 )
                 
                 # Create Prediction with model version linkage and nullable metrics

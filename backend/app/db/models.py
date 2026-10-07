@@ -1,4 +1,5 @@
-from sqlalchemy import Column, String, Boolean, Float, DateTime, Integer, ForeignKey
+from sqlalchemy import Column, String, Boolean, Float, DateTime, Integer, ForeignKey, CheckConstraint
+import sqlalchemy as sa
 from datetime import datetime
 
 # Import Base from base.py (declarative base without DB connection)
@@ -15,6 +16,8 @@ class Scan(Base):
     report_path = Column(String, nullable=True)
     xai_raw_path = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Track when background processing actually started to detect stale/abandoned attempts
+    processing_started_at = Column(DateTime, nullable=True)
 
 class ModalityFile(Base):
     __tablename__ = "modality_files"
@@ -52,4 +55,13 @@ class Artifact(Base):
     prediction_id = Column(Integer, ForeignKey("predictions.id"), index=True, nullable=False)
     type = Column(String, index=True, nullable=False)  # mask, xai, xai_raw, report, etc.
     object_path = Column(String, nullable=False)
+    # Artifact lifecycle state: PENDING (created, upload not yet complete), COMPLETE (uploaded), FAILED (upload failed)
+    status = Column(String, nullable=False, default="PENDING")
     created_at = Column(DateTime, default=datetime.utcnow)
+    
+    __table_args__ = (
+        sa.CheckConstraint(
+            "status IN ('PENDING', 'COMPLETE', 'FAILED')",
+            name='ck_artifact_status_valid'
+        ),
+    )

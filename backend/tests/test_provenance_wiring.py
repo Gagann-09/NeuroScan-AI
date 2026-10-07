@@ -8,6 +8,7 @@ These tests focus on model definitions and constants that don't
 require a live database connection.
 """
 import os
+from pathlib import Path
 # Set required environment variables BEFORE importing app modules
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost:5432/test")
 os.environ.setdefault("MINIO_ACCESS_KEY", "testaccess")
@@ -15,6 +16,9 @@ os.environ.setdefault("MINIO_SECRET_KEY", "testsecret")
 
 import pytest
 from app.db.models import Scan, Prediction, ModelVersion, Artifact
+
+# Path to ai_tasks.py relative to this test file
+AI_TASKS_PATH = Path(__file__).parent.parent / "app" / "services" / "ai_tasks.py"
 
 
 class TestModelDefinitions:
@@ -176,7 +180,7 @@ class TestConstants:
     def test_constants_defined_in_module(self):
         """Key constants are defined in ai_tasks module source."""
         # Read the source file directly without importing the module
-        with open("backend/app/services/ai_tasks.py", "r") as f:
+        with open(AI_TASKS_PATH, "r") as f:
             source = f.read()
         
         assert "WEIGHTS_PATH" in source

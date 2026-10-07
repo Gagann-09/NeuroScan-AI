@@ -192,7 +192,7 @@ Align backend with the four-modality model.
 -   [ ] Store each source modality.
 -   [ ] Create study-level identity.
 -   [x] Store model version. (Batch 3A: ModelVersion table + Prediction FK; Batch 3B: wired)
--   [ ] Store preprocessing version.
+-   [x] Store preprocessing version. (Batch 5B: added preprocessing_version column to ModelVersion; separated from config_hash; deterministic hash from PreprocessingConfig)
 -   [x] Store result provenance. (Batch 3A: Artifact table + Prediction dice/iou + Scan xai_raw_path; Batch 3B: wired)
 -   [x] Remove `drop_all()` startup behavior. (Batch 1)
 -   [x] Add migration strategy. (Batch 1)

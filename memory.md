@@ -514,6 +514,76 @@ management.
 - Report uses actual ModelVersion.id from provenance
 - Migration 003 created for schema changes
 
+### D-033 --- Separate preprocessing provenance from model configuration (P6 Batch 5B)
+
+**Date:** 2026-10-06
+
+**Context:** The P6 audit identified that preprocessing provenance was conflated with model configuration in `ModelVersion.config_hash`. The string `"preprocessing:v1|image_size:224|modality_order:t1,t1ce,t2,flair|normalize:nonzero_zscore"` mixed two independent provenance concepts:
+- Model identity/configuration (what model/checkpoint produced the result)
+- Preprocessing identity (what preprocessing pipeline transformed the input)
+
+These must be independently auditable per PRD FR-04 ("preprocessing configuration are recorded") and design.md §8 ("Results must include: Preprocessing version").
+
+**Decision:** 
+1. Add `preprocessing_version` column to `ModelVersion` table via Alembic migration 004
+2. Compute deterministic preprocessing version from `PreprocessingConfig` using SHA256 of canonical config representation
+3. Separate `config_hash` to only contain model configuration (architecture, generator, discriminator, loss)
+4. Update `_get_or_create_model_version` to accept and persist `preprocessing_version`
+5. Use `DEFAULT_PREPROCESSING_CONFIG` and `PREPROCESSING_VERSION` constants for the inference pipeline
+
+**Reason:** 
+- PRD FR-04: "Seed and preprocessing configuration are recorded"
+- design.md §8: "Results must include: Model version... Preprocessing version"
+- rules.md #16: "Every artifact belongs to a study. Every derived artifact references its source study."
+- The preprocessing pipeline is a separate versioned component from the model checkpoint
+
+**Affected files:**
+- `backend/app/db/models.py` (added preprocessing_version column)
+- `backend/app/services/ai_tasks.py` (added _compute_preprocessing_version, PREPROCESSING_VERSION, updated config hash, updated ModelVersion creation)
+- `backend/alembic/versions/004_add_preprocessing_version_to_model_version.py` (new migration)
+- `backend/tests/test_db_models.py` (verify preprocessing_version column)
+- `backend/tests/test_provenance_wiring.py` (verify new field, old conflated string removed)
+
+**Status:** Complete.
+
+**Verification:** 
+- All 137 backend tests pass (135 original + 2 new)
+- `preprocessing_version` column exists in ModelVersion model
+- `config_hash` no longer contains preprocessing metadata
+- Preprocessing version is deterministic (same config → same hash)
+- Migration 004 created for schema changes
+
+### D-034 --- P6 Batch 5C: Test stability fixes for config isolation and provenance test path
+
+**Date:** 2026-10-07
+
+**Context:** Five backend tests were failing:
+1. Four config security tests failed because `database.py` and `storage.py` instantiated `get_settings()` at module import time, preventing `monkeypatch` from setting environment variables before validation.
+2. One provenance wiring test failed because it used a hardcoded path `backend/app/services/ai_tasks.py` relative to the working directory, but tests run from the repository root.
+
+**Decision:**
+1. Make database engine and session factory initialization lazy in `database.py` using module-level globals with accessor functions (`_get_engine`, `_get_session_local`). Keep `SessionLocal` as a callable proxy for backward compatibility.
+2. Make MinIO client initialization lazy in `storage.py` using a module-level global with accessor function (`_get_minio_client`). Keep `minio_client` as a proxy object for backward compatibility.
+3. Fix provenance test to locate `ai_tasks.py` relative to the test file using `Path(__file__).parent.parent / "app" / "services" / "ai_tasks.py"`.
+
+**Reason:**
+- Rules.md #18: "A failing test blocks the phase."
+- Tests must be able to monkeypatch environment variables before Settings instantiation.
+- Test paths must be resilient to working directory changes.
+- No production behavior changes; credential validation unchanged; no defaults introduced.
+
+**Affected files:**
+- `backend/app/db/database.py` (lazy engine/SessionLocal)
+- `backend/app/core/storage.py` (lazy minio_client)
+- `backend/tests/test_provenance_wiring.py` (fixed AI_TASKS_PATH)
+
+**Status:** Complete.
+
+**Verification:**
+- All 137 backend tests pass (10/10 config security, 1/1 provenance path, 126 other tests).
+- No new failures.
+- No reduction in coverage or behavior.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

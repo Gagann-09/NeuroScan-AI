@@ -174,6 +174,139 @@ def claim_scan_for_processing(db: Session, scan_id: str) -> ScanClaimResult:
     return ScanClaimResult(success=True, reason="CLAIMED", scan_id=scan_id)
 
 
+class ArtifactStateTransition:
+    """Result of attempting to transition an artifact's lifecycle state."""
+    
+    def __init__(
+        self,
+        success: bool,
+        reason: Literal[
+            "TRANSITIONED",
+            "ALREADY_COMPLETE",
+            "ALREADY_FAILED",
+            "INVALID_TRANSITION",
+            "NOT_FOUND",
+            "INVALID_STATE"
+        ] | None = None,
+        artifact_id: int | None = None,
+        from_state: str | None = None,
+        to_state: str | None = None,
+    ):
+        self.success = success
+        self.reason = reason
+        self.artifact_id = artifact_id
+        self.from_state = from_state
+        self.to_state = to_state
+    
+    def __bool__(self) -> bool:
+        return self.success
+    
+    def __repr__(self) -> str:
+        if self.success:
+            return f"ArtifactStateTransition(success=True, artifact_id={self.artifact_id}, {self.from_state} -> {self.to_state})"
+        return f"ArtifactStateTransition(success=False, reason={self.reason}, artifact_id={self.artifact_id})"
+
+
+# Valid lifecycle transitions
+VALID_ARTIFACT_TRANSITIONS = {
+    "PENDING": {"COMPLETE", "FAILED"},
+    "COMPLETE": set(),  # Terminal state - no transitions allowed
+    "FAILED": set(),    # Terminal state - no transitions allowed
+}
+
+
+def transition_artifact_state(
+    db: Session,
+    artifact_id: int,
+    target_state: Literal["PENDING", "COMPLETE", "FAILED"],
+) -> ArtifactStateTransition:
+    """
+    Atomically transition an artifact's lifecycle state using PostgreSQL row-level locking.
+    
+    Uses SELECT FOR UPDATE NOWAIT to acquire an exclusive lock on the Artifact row.
+    If another transaction holds the lock, raises an exception.
+    
+    Valid transitions (per migration 005 CHECK constraint and design):
+    - PENDING -> COMPLETE (successful upload/completion)
+    - PENDING -> FAILED (failed upload/operation)
+    
+    Invalid transitions (rejected explicitly):
+    - COMPLETE -> any state (terminal)
+    - FAILED -> any state (terminal)
+    - Any -> PENDING (no backward transitions)
+    - Any -> unknown state
+    
+    Args:
+        db: Database session
+        artifact_id: Artifact identifier to transition
+        target_state: Target lifecycle state
+        
+    Returns:
+        ArtifactStateTransition with success status, reason, and state info
+    """
+    # Validate target state is a known lifecycle state
+    if target_state not in VALID_ARTIFACT_TRANSITIONS:
+        return ArtifactStateTransition(
+            success=False,
+            reason="INVALID_STATE",
+            artifact_id=artifact_id,
+            to_state=target_state,
+        )
+    
+    # Attempt to acquire row lock with NOWAIT - fails immediately if locked
+    try:
+        row = db.execute(
+            text("SELECT id, status FROM artifacts WHERE id = :artifact_id FOR UPDATE NOWAIT"),
+            {"artifact_id": artifact_id}
+        ).fetchone()
+    except Exception as e:
+        # Lock not available - another transaction holds it
+        if "could not obtain lock" in str(e).lower() or "lock_not_available" in str(e).lower():
+            return ArtifactStateTransition(
+                success=False,
+                reason="INVALID_TRANSITION",
+                artifact_id=artifact_id,
+                to_state=target_state,
+            )
+        raise
+    
+    if not row:
+        return ArtifactStateTransition(
+            success=False,
+            reason="NOT_FOUND",
+            artifact_id=artifact_id,
+            to_state=target_state,
+        )
+    
+    current_state = row.status
+    
+    # Check if transition is valid
+    allowed_targets = VALID_ARTIFACT_TRANSITIONS.get(current_state, set())
+    if target_state not in allowed_targets:
+        return ArtifactStateTransition(
+            success=False,
+            reason="INVALID_TRANSITION",
+            artifact_id=artifact_id,
+            from_state=current_state,
+            to_state=target_state,
+        )
+    
+    # Perform the valid transition
+    db.execute(
+        text("UPDATE artifacts SET status = :target_state WHERE id = :artifact_id"),
+        {"artifact_id": artifact_id, "target_state": target_state}
+    )
+    db.flush()
+    
+    return ArtifactStateTransition(
+        success=True,
+        reason="TRANSITIONED",
+        artifact_id=artifact_id,
+        from_state=current_state,
+        to_state=target_state,
+    )
+
+
 def _get_or_create_model_version(db: Session, version_id: str, checkpoint_path: str, config_hash: str, preprocessing_version: str) -> ModelVersion:
     """
     Get existing ModelVersion or create new one.

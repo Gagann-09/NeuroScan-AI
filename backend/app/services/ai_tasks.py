@@ -586,6 +586,7 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 
                 generate_segmentation_report("PT-ANONYMIZED", scan_id, model_version.id, source_img_path, mask_path, xai_path, report_path)
                 
+                # Upload derived artifacts to MinIO
                 upload_file_to_minio(mask_path, mask_obj_name)
                 upload_file_to_minio(xai_path, xai_obj_name)
                 upload_file_to_minio(report_path, report_obj_name)
@@ -614,8 +615,7 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 db.add(prediction)
                 db.flush()  # Get prediction.id for Artifact FK
                 
-                # Create Artifact records for all derived artifacts
-                # Using permanent object paths (not presigned URLs) for provenance
+                # Create Artifact records as PENDING in the same transaction
                 artifacts_to_create = [
                     Artifact(prediction_id=prediction.id, type="mask", object_path=mask_obj_name),
                     Artifact(prediction_id=prediction.id, type="xai", object_path=xai_obj_name),
@@ -624,17 +624,36 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 ]
                 for artifact in artifacts_to_create:
                     db.add(artifact)
+                db.flush()  # Get artifact IDs for transition
+                
+                # Transition each artifact from PENDING to COMPLETE after successful upload
+                artifact_type_map = {
+                    artifacts_to_create[0]: ("mask", mask_obj_name),
+                    artifacts_to_create[1]: ("xai", xai_obj_name),
+                    artifacts_to_create[2]: ("xai_raw", xai_raw_obj_name),
+                    artifacts_to_create[3]: ("report", report_obj_name),
+                }
+                for artifact, (artifact_type, obj_name) in artifact_type_map.items():
+                    result = transition_artifact_state(db, artifact.id, "COMPLETE")
+                    if not result.success:
+                        raise RuntimeError(f"Failed to transition {artifact_type} artifact {artifact.id} to COMPLETE: {result.reason}")
                 
                 db.commit()
             
             logger.info(f"Successfully processed 4-modality inference for ID: {scan_id}")
     
     except Exception as e:
+        # Roll back the failed transaction first
         db.rollback()
         logger.error(f"Pipeline failed for Scan ID {scan_id}: {str(e)}")
-        scan_record = db.query(Scan).filter(Scan.id == scan_id).first()
-        if scan_record:
-            scan_record.status = "FAILED"
-            db.commit()
+        # Use a fresh, valid transaction to mark the Scan FAILED
+        fresh_db: Session = SessionLocal()
+        try:
+            scan_record = fresh_db.query(Scan).filter(Scan.id == scan_id).first()
+            if scan_record:
+                scan_record.status = "FAILED"
+                fresh_db.commit()
+        finally:
+            fresh_db.close()
     finally:
         db.close()

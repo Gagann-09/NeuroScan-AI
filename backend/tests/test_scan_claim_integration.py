@@ -367,6 +367,99 @@ class TestScanClaimIntegration:
         pred_count = _get_prediction_count(db_session, scan_id)
         assert pred_count == 1, f"Expected 1 prediction, got {pred_count}"
 
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    @patch("app.services.ai_tasks.generate_gradient_saliency")
+    @patch("app.services.ai_tasks.generate_clinical_overlays")
+    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks.upload_file_to_minio")
+    def test_commit_failure_after_upload_rolls_back_artifacts(
+        self,
+        mock_upload_file_to_minio,
+        mock_generate_segmentation_report,
+        mock_generate_clinical_overlays,
+        mock_generate_gradient_saliency,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """If DB commit fails after MinIO uploads, no Prediction or Artifact rows persist; Scan is marked FAILED."""
+        scan_id = "test-integration-claim-006"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = _create_modality_files(db_session, scan_id)
+        
+        # Setup mocks for successful processing up to commit
+        import torch
+        mock_model = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)
+        mock_get_global_model.return_value = mock_model
+        
+        import torch
+        import numpy as np
+        
+        mock_image_tensor = torch.randn(1, 4, 224, 224)
+        mock_mask_tensor = torch.randn(1, 1, 224, 224)
+        mock_metadata = {"slice_index": 50}
+        mock_preprocess_brats_study.return_value = (mock_image_tensor, mock_mask_tensor, mock_metadata)
+        
+        mock_xai_tensor = np.random.rand(1, 1, 224, 224).astype(np.float32)
+        from app.services.xai import XAIProvenance
+        mock_provenance = XAIProvenance(model_checkpoint="test.pth", model_version="test-v1")
+        mock_generate_gradient_saliency.return_value = (mock_xai_tensor, mock_provenance)
+        
+        from PIL import Image
+        mock_seg_pil = Image.new("RGB", (224, 224))
+        mock_xai_pil = Image.new("RGB", (224, 224))
+        mock_generate_clinical_overlays.return_value = (mock_seg_pil, mock_xai_pil, True, np.random.rand(224, 224))
+        
+        mock_minio_client.fget_object.side_effect = _mock_fget_object_creates_file
+        mock_upload_file_to_minio.return_value = None  # Uploads succeed
+        
+        # Inject commit failure on the primary session only.
+        # The production code calls SessionLocal() twice:
+        # 1. At the start (primary session)
+        # 2. In the exception handler (fresh session for FAILED marking)
+        # We make the first call return a session that fails on commit,
+        # and the second call return a normal session.
+        from app.db.database import SessionLocal
+        call_count = [0]
+        
+        def failing_session_local():
+            call_count[0] += 1
+            session = SessionLocal()
+            if call_count[0] == 1:
+                # First call: primary session - make commit fail
+                original_commit = session.commit
+                def fail_commit():
+                    raise Exception("Simulated commit failure")
+                session.commit = fail_commit
+            return session
+        
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=failing_session_local):
+            process_scan_task(scan_id, modality_objects)
+        
+        # Verify the failed transaction leaves no persisted Prediction or Artifact rows
+        pred_count = _get_prediction_count(db_session, scan_id)
+        assert pred_count == 0, f"Expected 0 predictions after rollback, got {pred_count}"
+        
+        artifact_count = _get_artifact_count(db_session, scan_id)
+        assert artifact_count == 0, f"Expected 0 artifacts after rollback, got {artifact_count}"
+        
+        # Verify Scan is marked FAILED using the existing failure-handling pattern
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED", f"Expected FAILED, got {scan_status}"
+        
+        # Verify no COMPLETE artifacts leaked (redundant but explicit)
+        pred = db_session.query(Prediction).filter(Prediction.scan_id == scan_id).first()
+        if pred:
+            complete_artifacts = db_session.query(Artifact).filter(
+                Artifact.prediction_id == pred.id,
+                Artifact.status == "COMPLETE"
+            ).count()
+            assert complete_artifacts == 0, f"Expected 0 COMPLETE artifacts, got {complete_artifacts}"
+
 
 # Pytest fixture for database session
 @pytest.fixture

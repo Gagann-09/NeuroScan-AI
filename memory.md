@@ -611,8 +611,14 @@ These must be independently auditable per PRD FR-04 ("preprocessing configuratio
 **Status:** Complete.
 
 **Verification:**
-- All 50 non-database backend tests pass (provenance_wiring, db_models, preprocessing_parity).
-- Integration tests created (require live PostgreSQL to execute).
+- test_scan_claim.py: 7/7 passed (scan claim/locking mechanism).
+- test_artifact_lifecycle.py: 9/9 passed (artifact state transitions).
+- test_scan_claim_integration.py: 5/5 passed (claim integration with process_scan_task).
+- test_provenance_wiring.py: 14/14 passed (model definitions, provenance constants, artifact types).
+- test_db_models.py: 27/27 passed (database schema and relationships).
+- Production `model_version` ordering defect fixed in commit `3cb451f` (UnboundLocalError resolved by creating model_version before first use).
+- All 21 database-dependent tests pass against live PostgreSQL.
+- All 41 non-database provenance tests pass.
 - No changes to inference, preprocessing, XAI, reports, database schema, or API contracts.
 
 ## 4. Research Direction

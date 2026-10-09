@@ -94,6 +94,38 @@ def _get_model_version_config_hash():
     return _MODEL_VERSION_CONFIG_HASH
 
 
+def _compute_model_version_id(weights_path: str) -> str:
+    """
+    Compute a deterministic model version ID from the model weights file.
+    Uses SHA256 hash of the weights file content.
+    """
+    import hashlib
+    try:
+        with open(weights_path, "rb") as f:
+            file_hash = hashlib.sha256(f.read()).hexdigest()
+        return f"model-{file_hash[:16]}"
+    except Exception:
+        # Fallback if file doesn't exist or can't be read
+        return "model-unknown"
+
+
+def _compute_preprocessing_version(config: "PreprocessingConfig") -> str:
+    """
+    Compute a deterministic preprocessing version from the configuration.
+    Uses SHA256 hash of the canonical config representation.
+    """
+    import hashlib
+    import json
+
+    # Create a canonical representation of the config
+    config_dict = {
+        "image_size": config.image_size,
+        # Add other config fields as needed
+    }
+    config_str = json.dumps(config_dict, sort_keys=True)
+    return f"preproc-{hashlib.sha256(config_str.encode()).hexdigest()[:16]}"
+
+
 class ScanClaimResult:
     """Result of attempting to claim a scan for processing."""
     
@@ -525,6 +557,11 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
             # Compute max tumor probability from model output (raw sigmoid probability)
             max_tumor_probability = round(float(torch.sigmoid(mask_tensor).max().item()), 4)
             
+            # Get or create ModelVersion for this checkpoint (needed for report and provenance)
+            model_version = _get_or_create_model_version(
+                db, _get_model_version_id(), _get_weights_path(), _get_model_version_config_hash(), _get_preprocessing_version()
+            )
+
             # Save artifacts
             with tempfile.TemporaryDirectory() as tmpdirname:
                 source_img_path = os.path.join(tmpdirname, f"{scan_id}_source.jpg")
@@ -547,16 +584,6 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 report_obj_name = f"{scan_id}/report.pdf"
                 xai_raw_obj_name = f"{scan_id}/xai_raw.npy"
                 
-                # Get or create ModelVersion for this checkpoint (needed for report)
-                db: Session = SessionLocal()
-                try:
-                    model_version = _get_or_create_model_version(
-                        db, _get_model_version_id(), _get_weights_path(), _get_model_version_config_hash(), _get_preprocessing_version()
-                    )
-                    db.expunge(model_version)
-                finally:
-                    db.close()
-                
                 generate_segmentation_report("PT-ANONYMIZED", scan_id, model_version.id, source_img_path, mask_path, xai_path, report_path)
                 
                 upload_file_to_minio(mask_path, mask_obj_name)
@@ -572,11 +599,6 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 scan_record.xai_path = xai_obj_name
                 scan_record.report_path = report_obj_name
                 scan_record.xai_raw_path = xai_raw_obj_name  # Persist raw XAI object path
-                
-                # Get or create ModelVersion for this checkpoint
-                model_version = _get_or_create_model_version(
-                    db, _get_model_version_id(), _get_weights_path(), _get_model_version_config_hash(), _get_preprocessing_version()
-                )
                 
                 # Create Prediction with model version linkage and nullable metrics
                 # Note: dice/iou are nullable here since inference doesn't compute ground-truth metrics

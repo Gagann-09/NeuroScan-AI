@@ -5,6 +5,7 @@ Tests verify that claim_scan_for_processing is correctly integrated
 into process_scan_task to prevent duplicate processing.
 """
 import os
+import torch
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -19,6 +20,24 @@ from sqlalchemy.orm import Session
 from app.db.database import SessionLocal
 from app.db.models import Scan, ModalityFile, Prediction, ModelVersion, Artifact
 from app.services.ai_tasks import claim_scan_for_processing, process_scan_task, ScanClaimResult
+
+
+def _mock_fget_object_creates_file(bucket: str, object_name: str, local_path: str):
+    """Side effect for minio_client.fget_object that creates a minimal valid NIfTI file."""
+    import nibabel as nib
+    import numpy as np
+
+    Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Create a minimal valid NIfTI file with BraTS-like dimensions (240x240x155)
+    # The reference image code loads slice 50, so we need at least 51 slices
+    data = np.zeros((240, 240, 155), dtype=np.float32)
+    # Add some non-zero data so it's not completely empty
+    data[100:140, 100:140, 50] = 1.0
+
+    affine = np.eye(4)
+    img = nib.Nifti1Image(data, affine)
+    nib.save(img, local_path)
 
 
 def _create_scan(db: Session, scan_id: str, status: str = "PENDING") -> Scan:
@@ -74,10 +93,8 @@ class TestScanClaimIntegration:
     @patch("app.services.ai_tasks.generate_clinical_overlays")
     @patch("app.services.ai_tasks.generate_segmentation_report")
     @patch("app.services.ai_tasks.upload_file_to_minio")
-    @patch("app.services.ai_tasks._get_or_create_model_version")
     def test_successful_processing_claims_pending_scan(
         self,
-        mock_get_or_create_model_version,
         mock_upload_file_to_minio,
         mock_generate_segmentation_report,
         mock_generate_clinical_overlays,
@@ -94,10 +111,9 @@ class TestScanClaimIntegration:
         
         # Setup mocks
         mock_model = MagicMock()
-        mock_model.return_value = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)  # Model output tensor [B, 1, H, W]
         mock_get_global_model.return_value = mock_model
         
-        import torch
         import numpy as np
         from ai_pipeline.preprocessing import PreprocessingConfig
         
@@ -119,13 +135,8 @@ class TestScanClaimIntegration:
         mock_xai_pil = Image.new("RGB", (224, 224))
         mock_generate_clinical_overlays.return_value = (mock_seg_pil, mock_xai_pil, True, np.random.rand(224, 224))
         
-        # Mock model version
-        mock_model_version = MagicMock(spec=ModelVersion)
-        mock_model_version.id = "model-v1"
-        mock_get_or_create_model_version.return_value = mock_model_version
-        
         # Mock MinIO
-        mock_minio_client.fget_object = MagicMock()
+        mock_minio_client.fget_object.side_effect = _mock_fget_object_creates_file
         
         # Run the task
         process_scan_task(scan_id, modality_objects)
@@ -183,10 +194,8 @@ class TestScanClaimIntegration:
     @patch("app.services.ai_tasks.generate_clinical_overlays")
     @patch("app.services.ai_tasks.generate_segmentation_report")
     @patch("app.services.ai_tasks.upload_file_to_minio")
-    @patch("app.services.ai_tasks._get_or_create_model_version")
     def test_duplicate_dispatch_no_duplicate_predictions(
         self,
-        mock_get_or_create_model_version,
         mock_upload_file_to_minio,
         mock_generate_segmentation_report,
         mock_generate_clinical_overlays,
@@ -203,10 +212,9 @@ class TestScanClaimIntegration:
         
         # Setup mocks
         mock_model = MagicMock()
-        mock_model.return_value = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)  # Model output tensor [B, 1, H, W]
         mock_get_global_model.return_value = mock_model
         
-        import torch
         import numpy as np
         
         mock_image_tensor = torch.randn(1, 4, 224, 224)
@@ -224,15 +232,12 @@ class TestScanClaimIntegration:
         mock_xai_pil = Image.new("RGB", (224, 224))
         mock_generate_clinical_overlays.return_value = (mock_seg_pil, mock_xai_pil, True, np.random.rand(224, 224))
         
-        mock_model_version = MagicMock(spec=ModelVersion)
-        mock_model_version.id = "model-v1"
-        mock_get_or_create_model_version.return_value = mock_model_version
-        
-        mock_minio_client.fget_object = MagicMock()
+        mock_minio_client.fget_object.side_effect = _mock_fget_object_creates_file
         
         # Simulate concurrent dispatch with two threads
         results = []
         barrier = threading.Barrier(2)
+        thread_exceptions = []
         
         def run_task():
             local_db = SessionLocal()
@@ -241,6 +246,7 @@ class TestScanClaimIntegration:
                 process_scan_task(scan_id, modality_objects)
                 results.append("completed")
             except Exception as e:
+                thread_exceptions.append(e)
                 results.append(f"error: {e}")
             finally:
                 local_db.close()
@@ -252,7 +258,10 @@ class TestScanClaimIntegration:
         t2.start()
         t1.join()
         t2.join()
-        
+
+        # No thread should have crashed with unhandled exceptions
+        assert len(thread_exceptions) == 0, f"Thread exceptions occurred: {thread_exceptions}"
+
         # Verify exactly one prediction and one set of artifacts
         pred_count = _get_prediction_count(db_session, scan_id)
         assert pred_count == 1, f"Expected 1 prediction, got {pred_count}"
@@ -306,10 +315,8 @@ class TestScanClaimIntegration:
     @patch("app.services.ai_tasks.generate_clinical_overlays")
     @patch("app.services.ai_tasks.generate_segmentation_report")
     @patch("app.services.ai_tasks.upload_file_to_minio")
-    @patch("app.services.ai_tasks._get_or_create_model_version")
     def test_failed_scan_can_be_claimed_again(
         self,
-        mock_get_or_create_model_version,
         mock_upload_file_to_minio,
         mock_generate_segmentation_report,
         mock_generate_clinical_overlays,
@@ -325,8 +332,9 @@ class TestScanClaimIntegration:
         modality_objects = _create_modality_files(db_session, scan_id)
         
         # Setup mocks for successful processing
+        import torch
         mock_model = MagicMock()
-        mock_model.return_value = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)  # Model output tensor [B, 1, H, W]
         mock_get_global_model.return_value = mock_model
         
         import torch
@@ -347,23 +355,9 @@ class TestScanClaimIntegration:
         mock_xai_pil = Image.new("RGB", (224, 224))
         mock_generate_clinical_overlays.return_value = (mock_seg_pil, mock_xai_pil, True, np.random.rand(224, 224))
         
-        mock_model_version = MagicMock(spec=ModelVersion)
-        mock_model_version.id = "model-v1"
-        mock_get_or_create_model_version.return_value = mock_model_version
+        mock_minio_client.fget_object.side_effect = _mock_fget_object_creates_file
         
-        mock_minio_client.fget_object = MagicMock()
-        
-        # First, verify claim works on FAILED scan
-        local_db = SessionLocal()
-        try:
-            result = claim_scan_for_processing(local_db, scan_id)
-            assert result.success is True
-            assert result.reason == "CLAIMED"
-            local_db.commit()
-        finally:
-            local_db.close()
-        
-        # Now run the full task - should succeed
+        # Run the task directly - claim happens internally (FAILED -> PROCESSING)
         process_scan_task(scan_id, modality_objects)
         
         # Verify scan completed successfully

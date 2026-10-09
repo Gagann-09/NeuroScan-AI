@@ -6,6 +6,8 @@ All endpoint logic that was previously in main.py is consolidated here.
 import os
 import uuid
 import shutil
+import logging
+from typing import List
 
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks, Form
 from sqlalchemy.orm import Session
@@ -18,6 +20,26 @@ from app.schemas.scan_schema import UploadRequest, UploadResponse, StatusRespons
 
 router = APIRouter(prefix="/api/v1/scans", tags=["scans"])
 
+logger = logging.getLogger(__name__)
+
+
+def _cleanup_source_objects(bucket_name: str, object_names: List[str]) -> None:
+    """
+    Best-effort cleanup of source objects from MinIO.
+    Cleanup failures are logged but do not raise; original errors must propagate.
+    Already-missing objects are treated as successfully cleaned up.
+    """
+    for obj_name in object_names:
+        try:
+            minio_client.remove_object(bucket_name, obj_name)
+        except Exception as e:
+            # Check if object already doesn't exist (S3 error code NoSuchKey)
+            error_code = getattr(e, "code", None)
+            if error_code == "NoSuchKey":
+                logger.debug(f"Object {obj_name} already absent during cleanup")
+            else:
+                logger.warning(f"Failed to cleanup source object {obj_name}: {e}")
+
 
 @router.post("/upload", response_model=UploadResponse)
 async def upload_scan(
@@ -28,22 +50,25 @@ async def upload_scan(
     flair: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
+    scan_id = str(uuid.uuid4())
+    bucket_name = "neuroscan-bucket"
+
+    modality_files = {
+        "t1": t1,
+        "t1ce": t1ce,
+        "t2": t2,
+        "flair": flair,
+    }
+
+    # Track successfully uploaded objects for compensation
+    uploaded_objects: List[str] = []
+
     try:
-        scan_id = str(uuid.uuid4())
-        bucket_name = "neuroscan-bucket"
-        
-        modality_files = {
-            "t1": t1,
-            "t1ce": t1ce,
-            "t2": t2,
-            "flair": flair,
-        }
-        
         if not minio_client.bucket_exists(bucket_name):
             minio_client.make_bucket(bucket_name)
-        
+
         os.makedirs("temp_uploads", exist_ok=True)
-        
+
         modality_objects = {}
         for modality, file in modality_files.items():
             filename_lower = file.filename.lower()
@@ -56,17 +81,19 @@ async def upload_scan(
                     status_code=400,
                     detail=f"Modality {modality} must be .nii or .nii.gz format"
                 )
-            
+
             temp_path = os.path.join("temp_uploads", f"{scan_id}_{modality}{file_type}")
             with open(temp_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
-            
+
             object_name = f"{scan_id}/source_{modality}{file_type}"
             minio_client.fput_object(bucket_name, object_name, temp_path)
             os.remove(temp_path)
-            
+
+            # Track only after successful upload
+            uploaded_objects.append(object_name)
             modality_objects[modality] = object_name
-        
+
         # Create scan record
         scan_record = Scan(
             id=scan_id,
@@ -74,7 +101,8 @@ async def upload_scan(
             status="PENDING",
         )
         db.add(scan_record)
-        
+        db.flush()  # Ensure Scan is persisted before ModalityFile FK references it
+
         # Create modality file records
         for modality, object_name in modality_objects.items():
             modality_record = ModalityFile(
@@ -83,21 +111,28 @@ async def upload_scan(
                 object_path=object_name,
             )
             db.add(modality_record)
-        
+
         db.commit()
-        
+
         # Pass modality object names to background task
         background_tasks.add_task(process_scan_task, scan_id, modality_objects)
-        
+
         return UploadResponse(
             message="Four-modality study uploaded and dispatched successfully",
             scan_id=scan_id,
             status="PROCESSING",
         )
-    
+
     except HTTPException:
+        # Validation errors - clean up any uploaded objects
+        if uploaded_objects:
+            _cleanup_source_objects(bucket_name, uploaded_objects)
         raise
     except Exception as e:
+        # Upload or database error - rollback DB first, then cleanup
+        db.rollback()
+        if uploaded_objects:
+            _cleanup_source_objects(bucket_name, uploaded_objects)
         raise HTTPException(status_code=500, detail=str(e))
 
 

@@ -71,7 +71,7 @@ async def upload_scan(
         scan_record = Scan(
             id=scan_id,
             filename=f"{scan_id}/source_study",  # Reference to study folder
-            status="PROCESSING",
+            status="PENDING",
         )
         db.add(scan_record)
         

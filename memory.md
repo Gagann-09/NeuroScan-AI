@@ -584,6 +584,37 @@ These must be independently auditable per PRD FR-04 ("preprocessing configuratio
 - No new failures.
 - No reduction in coverage or behavior.
 
+### D-035 --- Integrate claim_scan_for_processing into processing entrypoint (P6 Batch 5D-3)
+
+**Date:** 2026-10-09
+
+**Context:** The `claim_scan_for_processing()` function existed with comprehensive tests but was not wired into the actual processing flow. The upload endpoint created Scan records with status `PROCESSING` immediately, bypassing the atomic claim mechanism that prevents duplicate processing.
+
+**Decision:**
+1. Change upload endpoint to create Scan records with status `PENDING` instead of `PROCESSING`.
+2. Call `claim_scan_for_processing(db, scan_id)` at the start of `process_scan_task()`, before any expensive work (downloads, preprocessing, inference).
+3. If claim fails (ALREADY_PROCESSING, ALREADY_COMPLETE, NOT_FOUND), log the reason and return early without processing.
+4. If claim succeeds, continue with existing processing flow.
+5. Preserve existing error handling: on processing failure, rollback and set scan status to `FAILED` (enabling retry via FAILED→PROCESSING claim).
+
+**Reason:**
+- Prevents duplicate processing via PostgreSQL row-level locking (SELECT FOR UPDATE NOWAIT).
+- Enables safe retry of failed scans (FAILED→PROCESSING transition).
+- Sets `processing_started_at` timestamp for observability.
+- Minimal change: 2 files, ~5 lines changed; no schema, API contract, or frontend changes.
+
+**Affected files:**
+- `backend/app/api/routers/scans.py` (scan initial status: PROCESSING → PENDING)
+- `backend/app/services/ai_tasks.py` (claim call at start of process_scan_task)
+- `backend/tests/test_scan_claim_integration.py` (new: 5 integration tests with mocks)
+
+**Status:** Complete.
+
+**Verification:**
+- All 50 non-database backend tests pass (provenance_wiring, db_models, preprocessing_parity).
+- Integration tests created (require live PostgreSQL to execute).
+- No changes to inference, preprocessing, XAI, reports, database schema, or API contracts.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

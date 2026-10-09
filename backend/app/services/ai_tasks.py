@@ -421,6 +421,12 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
     try:
         logger.info(f"Starting 4-modality inference for Scan ID: {scan_id}")
         
+        # Attempt to claim the scan for processing
+        claim_result = claim_scan_for_processing(db, scan_id)
+        if not claim_result.success:
+            logger.info(f"Scan {scan_id} not claimed: {claim_result.reason}")
+            return  # Exit early — another worker claimed it, or already complete/failed/not found
+
         # Download all 4 modalities from MinIO
         with tempfile.TemporaryDirectory() as tmpdir:
             for modality, object_name in modality_objects.items():

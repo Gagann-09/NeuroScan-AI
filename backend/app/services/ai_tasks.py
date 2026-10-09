@@ -23,6 +23,24 @@ from ai_pipeline.preprocessing import preprocess_brats_study, PreprocessingConfi
 logger = logging.getLogger(__name__)
 
 
+def _cleanup_derived_objects(bucket_name: str, object_names: list[str]) -> None:
+    """
+    Best-effort cleanup of derived artifacts from MinIO.
+    Cleanup failures are logged but do not raise; original errors must propagate.
+    Already-missing objects are treated as successfully cleaned up.
+    """
+    for obj_name in object_names:
+        try:
+            minio_client.remove_object(bucket_name, obj_name)
+        except Exception as e:
+            # Check if object already doesn't exist (S3 error code NoSuchKey)
+            error_code = getattr(e, "code", None)
+            if error_code == "NoSuchKey":
+                logger.debug(f"Derived object {obj_name} already absent during cleanup")
+            else:
+                logger.warning(f"Failed to cleanup derived object {obj_name}: {e}")
+
+
 # ── LAZY MODEL LOADING ──
 _DEVICE = None
 _GLOBAL_MODEL = None
@@ -450,6 +468,7 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
     """
     db: Session = SessionLocal()
     local_paths = {}
+    uploaded_derived: list[str] = []
     try:
         logger.info(f"Starting 4-modality inference for Scan ID: {scan_id}")
         
@@ -586,11 +605,21 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 
                 generate_segmentation_report("PT-ANONYMIZED", scan_id, model_version.id, source_img_path, mask_path, xai_path, report_path)
                 
-                # Upload derived artifacts to MinIO
+                # Upload derived artifacts to MinIO, tracking successful uploads for compensation
+                uploaded_derived: list[str] = []
+                bucket_name = "neuroscan-bucket"
+                
                 upload_file_to_minio(mask_path, mask_obj_name)
+                uploaded_derived.append(mask_obj_name)
+                
                 upload_file_to_minio(xai_path, xai_obj_name)
+                uploaded_derived.append(xai_obj_name)
+                
                 upload_file_to_minio(report_path, report_obj_name)
+                uploaded_derived.append(report_obj_name)
+                
                 upload_file_to_minio(xai_raw_path, xai_raw_obj_name)
+                uploaded_derived.append(xai_raw_obj_name)
             
             # Update database with full provenance
             scan_record = db.query(Scan).filter(Scan.id == scan_id).first()
@@ -646,6 +675,9 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
         # Roll back the failed transaction first
         db.rollback()
         logger.error(f"Pipeline failed for Scan ID {scan_id}: {str(e)}")
+        # Best-effort cleanup of derived objects uploaded during this attempt
+        if uploaded_derived:
+            _cleanup_derived_objects("neuroscan-bucket", uploaded_derived)
         # Use a fresh, valid transaction to mark the Scan FAILED
         fresh_db: Session = SessionLocal()
         try:

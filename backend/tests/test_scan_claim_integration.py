@@ -814,5 +814,330 @@ class TestUploadCompensation:
             app.dependency_overrides.clear()
 
 
+# =============================================================================
+# DERIVED ARTIFACT COMPENSATION TESTS
+# =============================================================================
+
+class TestDerivedArtifactCompensation:
+    """Test derived artifact failure compensation in process_scan_task."""
+
+    def _create_modality_objects(self, db: Session, scan_id: str) -> dict:
+        """Helper to create modality file records."""
+        modality_objects = {}
+        for modality in ["t1", "t1ce", "t2", "flair"]:
+            object_name = f"{scan_id}/source_{modality}.nii.gz"
+            modality_record = ModalityFile(
+                scan_id=scan_id,
+                modality=modality,
+                object_path=object_name,
+            )
+            db.add(modality_record)
+            modality_objects[modality] = object_name
+        db.commit()
+        return modality_objects
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    @patch("app.services.ai_tasks.generate_gradient_saliency")
+    @patch("app.services.ai_tasks.generate_clinical_overlays")
+    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks.upload_file_to_minio")
+    def test_later_derived_upload_failure_cleans_up_previous(
+        self,
+        mock_upload_file_to_minio,
+        mock_generate_segmentation_report,
+        mock_generate_clinical_overlays,
+        mock_generate_gradient_saliency,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """If a later derived upload fails, previously uploaded objects are cleaned up."""
+        import torch
+        import numpy as np
+        from PIL import Image
+        from app.services.xai import XAIProvenance
+        
+        scan_id = "test-derived-comp-001"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = self._create_modality_objects(db_session, scan_id)
+        
+        # Setup mocks
+        mock_model = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)
+        mock_get_global_model.return_value = mock_model
+        
+        mock_image_tensor = torch.randn(1, 4, 224, 224)
+        mock_mask_tensor = torch.randn(1, 1, 224, 224)
+        mock_metadata = {"slice_index": 50}
+        mock_preprocess_brats_study.return_value = (mock_image_tensor, mock_mask_tensor, mock_metadata)
+        
+        mock_xai_tensor = np.random.rand(1, 1, 224, 224).astype(np.float32)
+        mock_provenance = XAIProvenance(model_checkpoint="test.pth", model_version="test-v1")
+        mock_generate_gradient_saliency.return_value = (mock_xai_tensor, mock_provenance)
+        
+        mock_seg_pil = Image.new("RGB", (224, 224))
+        mock_xai_pil = Image.new("RGB", (224, 224))
+        mock_generate_clinical_overlays.return_value = (mock_seg_pil, mock_xai_pil, True, np.random.rand(224, 224))
+        
+        mock_minio_client.fget_object.side_effect = _mock_fget_object_creates_file
+        
+        # Fail on 3rd upload (report)
+        call_count = [0]
+        def failing_upload(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 3:
+                raise Exception("MinIO upload failed for report")
+        
+        mock_upload_file_to_minio.side_effect = failing_upload
+        mock_upload_file_to_minio.remove_object = MagicMock()  # Mock remove_object for cleanup
+        
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=lambda: db_session):
+            process_scan_task(scan_id, modality_objects)
+        
+        # Verify 3 uploads attempted (mask, xai, report)
+        assert mock_upload_file_to_minio.call_count == 3
+        
+        # Verify cleanup called for first 2 objects (mask, xai)
+        assert mock_minio_client.remove_object.call_count == 2
+        
+        # Verify no DB records persisted
+        pred_count = _get_prediction_count(db_session, scan_id)
+        assert pred_count == 0
+        
+        artifact_count = _get_artifact_count(db_session, scan_id)
+        assert artifact_count == 0
+        
+        # Verify scan marked FAILED
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    @patch("app.services.ai_tasks.generate_gradient_saliency")
+    @patch("app.services.ai_tasks.generate_clinical_overlays")
+    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks.upload_file_to_minio")
+    def test_all_derived_uploads_succeed_commit_fails_cleans_up_all(
+        self,
+        mock_upload_file_to_minio,
+        mock_generate_segmentation_report,
+        mock_generate_clinical_overlays,
+        mock_generate_gradient_saliency,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """If all uploads succeed but DB commit fails, all four objects are cleaned up."""
+        import torch
+        import numpy as np
+        from PIL import Image
+        from app.services.xai import XAIProvenance
+        
+        scan_id = "test-derived-comp-002"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = self._create_modality_objects(db_session, scan_id)
+        
+        # Setup mocks for successful processing up to commit
+        mock_model = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)
+        mock_get_global_model.return_value = mock_model
+        
+        mock_image_tensor = torch.randn(1, 4, 224, 224)
+        mock_mask_tensor = torch.randn(1, 1, 224, 224)
+        mock_metadata = {"slice_index": 50}
+        mock_preprocess_brats_study.return_value = (mock_image_tensor, mock_mask_tensor, mock_metadata)
+        
+        mock_xai_tensor = np.random.rand(1, 1, 224, 224).astype(np.float32)
+        mock_provenance = XAIProvenance(model_checkpoint="test.pth", model_version="test-v1")
+        mock_generate_gradient_saliency.return_value = (mock_xai_tensor, mock_provenance)
+        
+        mock_seg_pil = Image.new("RGB", (224, 224))
+        mock_xai_pil = Image.new("RGB", (224, 224))
+        mock_generate_clinical_overlays.return_value = (mock_seg_pil, mock_xai_pil, True, np.random.rand(224, 224))
+        
+        mock_minio_client.fget_object.side_effect = _mock_fget_object_creates_file
+        mock_upload_file_to_minio.return_value = None
+        mock_minio_client.remove_object = MagicMock()
+        
+        # Inject commit failure on the primary session
+        from app.db.database import SessionLocal
+        call_count = [0]
+        def failing_session_local():
+            call_count[0] += 1
+            session = SessionLocal()
+            if call_count[0] == 1:
+                original_commit = session.commit
+                def fail_commit():
+                    raise Exception("Simulated commit failure")
+                session.commit = fail_commit
+            return session
+        
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=failing_session_local):
+            process_scan_task(scan_id, modality_objects)
+        
+        # Verify all 4 uploads succeeded
+        assert mock_upload_file_to_minio.call_count == 4
+        
+        # Verify cleanup attempted for all 4 objects
+        assert mock_minio_client.remove_object.call_count == 4
+        
+        # Verify no DB records persisted
+        pred_count = _get_prediction_count(db_session, scan_id)
+        assert pred_count == 0
+        
+        artifact_count = _get_artifact_count(db_session, scan_id)
+        assert artifact_count == 0
+        
+        # Verify scan marked FAILED
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    @patch("app.services.ai_tasks.generate_gradient_saliency")
+    @patch("app.services.ai_tasks.generate_clinical_overlays")
+    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks.upload_file_to_minio")
+    def test_cleanup_failure_does_not_mask_original_error(
+        self,
+        mock_upload_file_to_minio,
+        mock_generate_segmentation_report,
+        mock_generate_clinical_overlays,
+        mock_generate_gradient_saliency,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """Cleanup failure does not mask the original processing exception."""
+        import torch
+        import numpy as np
+        from PIL import Image
+        from app.services.xai import XAIProvenance
+        
+        scan_id = "test-derived-comp-003"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = self._create_modality_objects(db_session, scan_id)
+        
+        # Setup mocks
+        mock_model = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)
+        mock_get_global_model.return_value = mock_model
+        
+        mock_image_tensor = torch.randn(1, 4, 224, 224)
+        mock_mask_tensor = torch.randn(1, 1, 224, 224)
+        mock_metadata = {"slice_index": 50}
+        mock_preprocess_brats_study.return_value = (mock_image_tensor, mock_mask_tensor, mock_metadata)
+        
+        mock_xai_tensor = np.random.rand(1, 1, 224, 224).astype(np.float32)
+        mock_provenance = XAIProvenance(model_checkpoint="test.pth", model_version="test-v1")
+        mock_generate_gradient_saliency.return_value = (mock_xai_tensor, mock_provenance)
+        
+        mock_seg_pil = Image.new("RGB", (224, 224))
+        mock_xai_pil = Image.new("RGB", (224, 224))
+        mock_generate_clinical_overlays.return_value = (mock_seg_pil, mock_xai_pil, True, np.random.rand(224, 224))
+        
+        mock_minio_client.fget_object.side_effect = _mock_fget_object_creates_file
+        
+        # Fail on 2nd upload (xai), and cleanup also fails
+        call_count = [0]
+        def failing_upload(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 2:
+                raise Exception("Original upload error for xai")
+        
+        mock_upload_file_to_minio.side_effect = failing_upload
+        
+        # Make cleanup fail
+        class CleanupError(Exception):
+            pass
+        
+        mock_minio_client.remove_object.side_effect = CleanupError("Cleanup failed")
+        
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=lambda: db_session):
+            process_scan_task(scan_id, modality_objects)
+        
+        # Verify the original error is propagated (not the cleanup error)
+        # The function should complete without raising (it logs and marks FAILED)
+        # Check that scan is marked FAILED
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    @patch("app.services.ai_tasks.generate_gradient_saliency")
+    @patch("app.services.ai_tasks.generate_clinical_overlays")
+    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks.upload_file_to_minio")
+    def test_first_upload_failure_no_cleanup_of_unrelated(
+        self,
+        mock_upload_file_to_minio,
+        mock_generate_segmentation_report,
+        mock_generate_clinical_overlays,
+        mock_generate_gradient_saliency,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """If the first upload fails, no unrelated object is deleted."""
+        import torch
+        import numpy as np
+        from PIL import Image
+        from app.services.xai import XAIProvenance
+        
+        scan_id = "test-derived-comp-004"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = self._create_modality_objects(db_session, scan_id)
+        
+        # Setup mocks
+        mock_model = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)
+        mock_get_global_model.return_value = mock_model
+        
+        mock_image_tensor = torch.randn(1, 4, 224, 224)
+        mock_mask_tensor = torch.randn(1, 1, 224, 224)
+        mock_metadata = {"slice_index": 50}
+        mock_preprocess_brats_study.return_value = (mock_image_tensor, mock_mask_tensor, mock_metadata)
+        
+        mock_xai_tensor = np.random.rand(1, 1, 224, 224).astype(np.float32)
+        mock_provenance = XAIProvenance(model_checkpoint="test.pth", model_version="test-v1")
+        mock_generate_gradient_saliency.return_value = (mock_xai_tensor, mock_provenance)
+        
+        mock_seg_pil = Image.new("RGB", (224, 224))
+        mock_xai_pil = Image.new("RGB", (224, 224))
+        mock_generate_clinical_overlays.return_value = (mock_seg_pil, mock_xai_pil, True, np.random.rand(224, 224))
+        
+        mock_minio_client.fget_object.side_effect = _mock_fget_object_creates_file
+        
+        # Fail on 1st upload (mask)
+        mock_upload_file_to_minio.side_effect = Exception("MinIO upload failed for mask")
+        mock_minio_client.remove_object = MagicMock()
+        
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=lambda: db_session):
+            process_scan_task(scan_id, modality_objects)
+        
+        # Verify 1 upload attempted
+        assert mock_upload_file_to_minio.call_count == 1
+        
+        # Verify NO cleanup called (no objects uploaded yet)
+        assert mock_minio_client.remove_object.call_count == 0
+        
+        # Verify no DB records persisted
+        pred_count = _get_prediction_count(db_session, scan_id)
+        assert pred_count == 0
+        
+        # Verify scan marked FAILED
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

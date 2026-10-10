@@ -12,7 +12,7 @@ from typing import List
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks, Form
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_db
+from app.api.dependencies import get_db, verify_id_token
 from app.db.models import Scan, ModalityFile, Prediction
 from app.core.storage import minio_client, get_presigned_url
 from app.services.ai_tasks import process_scan_task
@@ -137,7 +137,11 @@ async def upload_scan(
 
 
 @router.get("/status/{scan_id}", response_model=StatusResponse)
-def get_scan_status(scan_id: str, db: Session = Depends(get_db)):
+def get_scan_status(
+    scan_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(verify_id_token),
+):
     scan = db.query(Scan).filter(Scan.id == scan_id).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")

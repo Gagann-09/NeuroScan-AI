@@ -24,3 +24,6 @@ opencv-python-headless==5.0.0.93
 minio==7.2.4
 fpdf2==2.7.7
 python-dotenv==1.0.1
+
+# Authentication
+firebase-admin==6.5.0

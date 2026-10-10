@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     # ── Redis / Celery ──
     REDIS_URL: str = "redis://localhost:6379/0"
 
+    # ── Firebase Authentication ──
+    # No default - must be provided via environment variable
+    FIREBASE_PROJECT_ID: str
+
     # ── Application ──
     APP_TITLE: str = "NeuroScan AI API"
     APP_VERSION: str = "1.0.0"
@@ -68,6 +72,17 @@ class Settings(BaseSettings):
             )
         return v
 
+    @field_validator("FIREBASE_PROJECT_ID")
+    @classmethod
+    def validate_firebase_project_id(cls, v: str) -> str:
+        """Validate FIREBASE_PROJECT_ID is provided."""
+        if not v or not v.strip():
+            raise ValueError(
+                "FIREBASE_PROJECT_ID must be set via environment variable. "
+                "No default is provided for security."
+            )
+        return v
+
 
 @lru_cache()
 def get_settings() -> Settings:
@@ -80,7 +95,7 @@ def get_settings() -> Settings:
         missing_creds = []
         for err in errors:
             field = err.get("loc", ["unknown"])[0] if err.get("loc") else "unknown"
-            if field in ("DATABASE_URL", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY"):
+            if field in ("DATABASE_URL", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "FIREBASE_PROJECT_ID"):
                 missing_creds.append(field)
         if missing_creds:
             raise RuntimeError(

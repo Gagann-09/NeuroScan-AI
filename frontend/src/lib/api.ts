@@ -30,6 +30,35 @@ export type ScanResults = {
   who_grade: string | null
 }
 
+/**
+ * Authenticated fetch wrapper that attaches Firebase ID token
+ * and handles 401 responses by clearing auth state.
+ */
+async function authedFetch(
+  getIdToken: () => Promise<string | null>,
+  onUnauthorized: () => void,
+  url: string,
+  options: RequestInit = {}
+): Promise<Response> {
+  const token = await getIdToken()
+
+  const headers = new Headers(options.headers)
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`)
+  }
+
+  const response = await fetch(url, {
+    ...options,
+    headers,
+  })
+
+  if (response.status === 401) {
+    onUnauthorized()
+  }
+
+  return response
+}
+
 async function parseError(response: Response): Promise<string> {
   const data = await response.json().catch(() => null)
 
@@ -44,23 +73,95 @@ async function parseError(response: Response): Promise<string> {
   return `Request failed with HTTP ${response.status}.`
 }
 
-export async function uploadScan(
-  files: BraTSFiles,
-): Promise<UploadResponse> {
-  const formData = new FormData()
+/**
+ * Create API functions with authentication support.
+ * The getIdToken and onUnauthorized callbacks are provided by the caller
+ * via the useAuth hook in components.
+ */
+export function createApiClient(
+  getIdToken: () => Promise<string | null>,
+  onUnauthorized: () => void
+) {
+  return {
+    async uploadScan(files: BraTSFiles): Promise<UploadResponse> {
+      const formData = new FormData()
 
+      formData.append("t1", files.t1)
+      formData.append("t1ce", files.t1ce)
+      formData.append("t2", files.t2)
+      formData.append("flair", files.flair)
+
+      const response = await authedFetch(
+        getIdToken,
+        onUnauthorized,
+        `${API_BASE_URL}/api/v1/scans/upload`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      )
+
+      if (!response.ok) {
+        throw new Error(await parseError(response))
+      }
+
+      return response.json()
+    },
+
+    async getScanStatus(scanId: string): Promise<ScanStatus> {
+      const response = await authedFetch(
+        getIdToken,
+        onUnauthorized,
+        `${API_BASE_URL}/api/v1/scans/status/${scanId}`
+      )
+
+      if (!response.ok) {
+        throw new Error(await parseError(response))
+      }
+
+      return response.json()
+    },
+
+    async getScanResults(scanId: string): Promise<ScanResults> {
+      const response = await authedFetch(
+        getIdToken,
+        onUnauthorized,
+        `${API_BASE_URL}/api/v1/scans/results/${scanId}`
+      )
+
+      if (!response.ok) {
+        throw new Error(await parseError(response))
+      }
+
+      const data = await response.json()
+
+      return {
+        scan_id: data.scan_id,
+        mask_url: data.mask_url ?? null,
+        xai_url: data.xai_url ?? null,
+        report_url: data.report_url ?? null,
+        tumor_detected: Boolean(data.tumor_detected),
+        anomaly_area_cm2: data.anomaly_area_cm2 ?? null,
+        confidence_score: data.confidence_score ?? null,
+        who_grade: data.who_grade ?? null,
+      }
+    },
+  }
+}
+
+// Backward-compatible unauthenticated exports for components not yet migrated
+// These will be removed once all call sites use the authenticated client
+export async function uploadScan(files: BraTSFiles): Promise<UploadResponse> {
+  const formData = new FormData()
   formData.append("t1", files.t1)
   formData.append("t1ce", files.t1ce)
   formData.append("t2", files.t2)
   formData.append("flair", files.flair)
 
-  const response = await fetch(
-    `${API_BASE_URL}/api/v1/scans/upload`,
-    {
-      method: "POST",
-      body: formData,
-    },
-  )
+  const response = await fetch(`${API_BASE_URL}/api/v1/scans/upload`, {
+    method: "POST",
+    body: formData,
+  })
 
   if (!response.ok) {
     throw new Error(await parseError(response))
@@ -69,12 +170,8 @@ export async function uploadScan(
   return response.json()
 }
 
-export async function getScanStatus(
-  scanId: string,
-): Promise<ScanStatus> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/v1/scans/status/${scanId}`,
-  )
+export async function getScanStatus(scanId: string): Promise<ScanStatus> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/scans/status/${scanId}`)
 
   if (!response.ok) {
     throw new Error(await parseError(response))
@@ -83,12 +180,8 @@ export async function getScanStatus(
   return response.json()
 }
 
-export async function getScanResults(
-  scanId: string,
-): Promise<ScanResults> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/v1/scans/results/${scanId}`,
-  )
+export async function getScanResults(scanId: string): Promise<ScanResults> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/scans/results/${scanId}`)
 
   if (!response.ok) {
     throw new Error(await parseError(response))
@@ -102,11 +195,8 @@ export async function getScanResults(
     xai_url: data.xai_url ?? null,
     report_url: data.report_url ?? null,
     tumor_detected: Boolean(data.tumor_detected),
-    anomaly_area_cm2:
-      data.anomaly_area_cm2 ?? null,
-    confidence_score:
-      data.confidence_score ?? null,
-    who_grade:
-      data.who_grade ?? null,
+    anomaly_area_cm2: data.anomaly_area_cm2 ?? null,
+    confidence_score: data.confidence_score ?? null,
+    who_grade: data.who_grade ?? null,
   }
 }

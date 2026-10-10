@@ -1,5 +1,5 @@
 import { initializeApp } from "firebase/app";
-import { getAuth } from "firebase/auth";
+import { getAuth, setPersistence, browserSessionPersistence } from "firebase/auth";
 
 const firebaseConfig = {
   apiKey: "AIzaSyDfVTinwQuShIGsZVGZKww-zyAS0BmxKHs",
@@ -13,4 +13,9 @@ const firebaseConfig = {
 // Initialize the Bouncer
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
+
+// Enforce session-only persistence: fresh login required after browser restart
+setPersistence(auth, browserSessionPersistence).catch((err) => {
+  console.error("Failed to set session persistence:", err);
+});
 

@@ -7,7 +7,7 @@ import { UploadPill } from "@/components/upload-pill"
 import { ProcessingView } from "@/components/processing-view"
 import { ResultsDashboard } from "@/components/results-dashboard"
 import { MOCK_RESULTS, type ScanResults } from "@/lib/mock-data"
-import { uploadScan, getScanStatus, getScanResults } from "@/lib/api"
+import { createApiClient } from "@/lib/api"
 import { useAuth } from "@/lib/auth-context"
 import { auth } from "@/lib/firebase"
 import { signOut } from "firebase/auth"
@@ -19,7 +19,23 @@ export default function Dashboard() {
   const [results, setResults] = useState<ScanResults | null>(null)
   const [pipelineError, setPipelineError] = useState<string | null>(null)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const { user } = useAuth()
+  const { user, getIdToken, logout } = useAuth()
+
+  // Create authenticated API client
+  const api = createApiClient(
+    getIdToken,
+    () => {
+      // On 401: clear local state and logout
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current)
+        intervalRef.current = null
+      }
+      setResults(null)
+      setPipelineError("Session expired. Please log in again.")
+      setStatus("idle")
+      logout()
+    }
+  )
 
   // Cleanup polling interval on unmount
   useEffect(() => {
@@ -34,7 +50,7 @@ export default function Dashboard() {
    * 2. Poll GET /api/v1/scans/status/{scan_id}
    * 3. On SEGMENTED → GET /api/v1/scans/results/{scan_id} → hydrate results
    */
-  const handleAnalyze = async (file: File) => {
+  const handleAnalyze = async (file: Record<"t1" | "t1ce" | "t2" | "flair", File>) => {
     setPipelineError(null)
     setStatus("processing")
 
@@ -42,7 +58,7 @@ export default function Dashboard() {
 
     // ── Step 1: Upload Scan ──────────────────────────────────────────────────
     try {
-      const uploadResponse = await uploadScan(file)
+      const uploadResponse = await api.uploadScan(file)
       scan_id = uploadResponse.scan_id
     } catch (err: any) {
       setPipelineError(err.message || "Failed to upload scan. Ensure the backend server is running on port 8000.")
@@ -53,7 +69,7 @@ export default function Dashboard() {
     // ── Step 2: Poll Status ──────────────────────────────────────────────────
     intervalRef.current = setInterval(async () => {
       try {
-        const { status: backendStatus } = await getScanStatus(scan_id)
+        const { status: backendStatus } = await api.getScanStatus(scan_id)
 
         if (backendStatus === "SEGMENTED") {
           // Stop polling immediately
@@ -64,7 +80,7 @@ export default function Dashboard() {
 
           // ── Step 3: Retrieve Segmentation & XAI Results ────────────────────
           try {
-            const rawApiResults = await getScanResults(scan_id)
+            const rawApiResults = await api.getScanResults(scan_id)
             const apiResults = rawApiResults as any // Bypass strict TS check for backend telemetry fields
 
             setResults({
@@ -90,8 +106,11 @@ export default function Dashboard() {
           clearInterval(intervalRef.current)
           intervalRef.current = null
         }
-        setPipelineError("Lost connection to inference backend during processing.")
-        setStatus("idle")
+        // Check if error is auth-related (already handled by onUnauthorized)
+        if (!err.message?.includes("Session expired")) {
+          setPipelineError("Lost connection to inference backend during processing.")
+          setStatus("idle")
+        }
       }
     }, 2000)
   }
@@ -107,11 +126,7 @@ export default function Dashboard() {
   }
 
   const handleSignOut = async () => {
-    try {
-      await signOut(auth)
-    } catch (error) {
-      console.error("Sign out error", error)
-    }
+    await logout()
   }
 
   return (

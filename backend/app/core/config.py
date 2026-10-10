@@ -11,6 +11,7 @@ are retained. Docker Compose provides development credentials for local workflow
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 from pydantic import field_validator, ValidationError
+from typing import Union
 
 
 class Settings(BaseSettings):
@@ -38,7 +39,10 @@ class Settings(BaseSettings):
     # ── Application ──
     APP_TITLE: str = "NeuroScan AI API"
     APP_VERSION: str = "1.0.0"
-    CORS_ORIGINS: list[str] = ["*"]
+    # No default for CORS_ORIGINS - must be provided via environment variable
+    # when allow_credentials=True to avoid insecure wildcard with credentials.
+    # Provide as comma-separated string, e.g., "http://localhost:3000,https://app.example.com"
+    CORS_ORIGINS: str
 
     model_config = {
         "env_file": ".env",
@@ -82,6 +86,34 @@ class Settings(BaseSettings):
                 "No default is provided for security."
             )
         return v
+
+    @field_validator("CORS_ORIGINS")
+    @classmethod
+    def validate_cors_origins(cls, v: str) -> str:
+        """Validate CORS_ORIGINS is provided and not insecure wildcard with credentials."""
+        if not v or not v.strip():
+            raise ValueError(
+                "CORS_ORIGINS must be provided via environment variable. "
+                "No default is provided for security."
+            )
+        # Parse comma-separated origins
+        origins = [origin.strip() for origin in v.split(",") if origin.strip()]
+        if not origins:
+            raise ValueError(
+                "CORS_ORIGINS must contain at least one origin."
+            )
+        # Explicitly reject wildcard when credentials are used (allow_credentials=True in middleware)
+        if origins == ["*"]:
+            raise ValueError(
+                "CORS_ORIGINS cannot be ['*'] when allow_credentials=True. "
+                "Explicitly list trusted origins instead."
+            )
+        return v
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """Return CORS_ORIGINS as a parsed list."""
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
 
 
 @lru_cache()

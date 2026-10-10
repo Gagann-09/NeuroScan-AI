@@ -110,6 +110,7 @@ class TestConfigSecurity:
         monkeypatch.setenv("MINIO_ACCESS_KEY", "testaccess")
         monkeypatch.setenv("MINIO_SECRET_KEY", "testsecret")
         monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+        monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000")
         
         from app.core.config import Settings
         settings = Settings()
@@ -120,7 +121,7 @@ class TestConfigSecurity:
         assert settings.REDIS_URL == "redis://localhost:6379/0"
         assert settings.APP_TITLE == "NeuroScan AI API"
         assert settings.APP_VERSION == "1.0.0"
-        assert settings.CORS_ORIGINS == ["*"]
+        assert settings.cors_origins_list == ["http://localhost:3000"]
 
     def test_get_settings_cached(self, monkeypatch):
         """get_settings returns cached instance."""
@@ -173,6 +174,7 @@ class TestConfigDevelopmentWorkflow:
         monkeypatch.setenv("MINIO_SECURE", "False")
         monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
         monkeypatch.setenv("FIREBASE_PROJECT_ID", "neuroscan-medical-vault")
+        monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000")
         
         from app.core.config import Settings
         settings = Settings()
@@ -184,6 +186,7 @@ class TestConfigDevelopmentWorkflow:
         assert settings.MINIO_SECURE is False
         assert settings.REDIS_URL == "redis://redis:6379/0"
         assert settings.FIREBASE_PROJECT_ID == "neuroscan-medical-vault"
+        assert settings.cors_origins_list == ["http://localhost:3000"]
 
     def test_env_file_supported(self, monkeypatch, tmp_path):
         """Configuration can be loaded from .env file."""
@@ -195,6 +198,7 @@ MINIO_ACCESS_KEY=fromenv
 MINIO_SECRET_KEY=fromenvsecret
 MINIO_ENDPOINT=custom:9000
 FIREBASE_PROJECT_ID=fromenv-project
+CORS_ORIGINS=http://localhost:3000
 """)
         
         # Remove environment variables so .env file takes precedence
@@ -203,6 +207,7 @@ FIREBASE_PROJECT_ID=fromenv-project
         monkeypatch.delenv("MINIO_SECRET_KEY", raising=False)
         monkeypatch.delenv("MINIO_ENDPOINT", raising=False)
         monkeypatch.delenv("FIREBASE_PROJECT_ID", raising=False)
+        monkeypatch.delenv("CORS_ORIGINS", raising=False)
         
         # Change to temp directory and test
         old_cwd = os.getcwd()
@@ -221,8 +226,66 @@ FIREBASE_PROJECT_ID=fromenv-project
             assert settings.MINIO_SECRET_KEY == "fromenvsecret"
             assert settings.MINIO_ENDPOINT == "custom:9000"
             assert settings.FIREBASE_PROJECT_ID == "fromenv-project"
+            assert settings.cors_origins_list == ["http://localhost:3000"]
         finally:
             os.chdir(old_cwd)
+
+
+class TestCORSConfiguration:
+    """Test CORS-specific configuration security."""
+
+    def test_cors_origins_required(self, monkeypatch):
+        """CORS_ORIGINS must be provided when credentials are enabled."""
+        import importlib
+        import app.core.config
+        importlib.reload(app.core.config)
+        
+        monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
+        monkeypatch.setenv("MINIO_ACCESS_KEY", "testaccess")
+        monkeypatch.setenv("MINIO_SECRET_KEY", "testsecret")
+        monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+        monkeypatch.delenv("CORS_ORIGINS", raising=False)
+        
+        from app.core.config import Settings
+        with pytest.raises(ValidationError) as exc_info:
+            Settings()
+        
+        errors = exc_info.value.errors()
+        assert any(err["loc"][0] == "CORS_ORIGINS" for err in errors)
+
+    def test_cors_origins_rejects_wildcard_with_credentials(self, monkeypatch):
+        """CORS_ORIGINS cannot be ['*'] when allow_credentials=True."""
+        import importlib
+        import app.core.config
+        importlib.reload(app.core.config)
+        
+        monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
+        monkeypatch.setenv("MINIO_ACCESS_KEY", "testaccess")
+        monkeypatch.setenv("MINIO_SECRET_KEY", "testsecret")
+        monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+        monkeypatch.setenv("CORS_ORIGINS", "*")
+        
+        from app.core.config import Settings
+        with pytest.raises(ValidationError) as exc_info:
+            Settings()
+        
+        errors = exc_info.value.errors()
+        assert any(err["loc"][0] == "CORS_ORIGINS" for err in errors)
+        error_msg = str(exc_info.value)
+        assert "cannot be ['*']" in error_msg or "wildcard" in error_msg.lower()
+
+    def test_cors_origins_accepts_explicit_origins(self, monkeypatch):
+        """CORS_ORIGINS accepts explicit list of trusted origins."""
+        monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
+        monkeypatch.setenv("MINIO_ACCESS_KEY", "testaccess")
+        monkeypatch.setenv("MINIO_SECRET_KEY", "testsecret")
+        monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+        monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000,https://app.example.com")
+        
+        from app.core.config import Settings
+        settings = Settings()
+        
+        assert settings.cors_origins_list == ["http://localhost:3000", "https://app.example.com"]
 
 
 if __name__ == "__main__":

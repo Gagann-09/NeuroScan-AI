@@ -6,12 +6,17 @@ Both training and inference MUST use this module.
 
 Contract:
 - Input: 4 MRI modalities (T1, T1ce, T2, FLAIR) as NIfTI files
-- Output: Tensor [1, 4, 224, 224] ready for ARMT-GAN generator
+- Output: Tensor [1, 4, H, W] ready for ARMT-GAN generator
 - Normalization: Z-score per modality on non-zero tissue
 - Resizing: Bilinear interpolation to 224x224
 - Slice selection: Same axial slice index across all modalities
-"""
 
+Resource bounds (derived from BraTS dataset specifications and model constraints):
+- BraTS volumes are typically 240x240x155 voxels (~9M voxels per modality)
+- Max supported volume: 512x512x512 voxels (~134M voxels) to prevent OOM
+- Max decompressed size per modality: 200MB (allows for compressed BraTS + margin)
+- Supported data types: float32, int16, int32, uint8, uint16
+"""
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -20,6 +25,14 @@ import numpy as np
 import torch
 from PIL import Image
 
+
+# Resource bounds (derived from BraTS dataset specifications and model constraints)
+# Standard BraTS volumes: 240x240x155 voxels (~9M voxels/modality)
+# Max supported volume: 512x512x512 voxels (~134M voxels) to prevent OOM
+MAX_VOLUME_DIMENSION = 512
+MAX_VOXEL_COUNT = 134_217_728  # 512^3
+MAX_DECOMPRESSED_SIZE_MB = 200  # Max decompressed size per modality in MB
+SUPPORTED_DTYPES = {np.float32, np.int16, np.int32, np.uint8, np.uint16, np.float64}
 
 # BraTS modality ordering is FIXED and MUST match training
 MODALITY_ORDER = ("t1", "t1ce", "t2", "flair")
@@ -41,7 +54,7 @@ class PreprocessingConfig:
     modality_order: Tuple[str, ...] = MODALITY_ORDER
     normalize_nonzero: bool = True
     interpolation: str = "bilinear"  # bilinear for MRI, nearest for masks
-    
+
     def to_dict(self) -> dict:
         return {
             "image_size": self.image_size,
@@ -54,14 +67,14 @@ class PreprocessingConfig:
 class BraTSPreprocessor:
     """
     BraTS preprocessing pipeline.
-    
+
     This class encapsulates all preprocessing steps to ensure
     identical behavior between training and inference.
     """
-    
+
     def __init__(self, config: Optional[PreprocessingConfig] = None):
         self.config = config or PreprocessingConfig()
-    
+
     def find_modality_file(self, patient_dir: Path, modality: str) -> Optional[Path]:
         """Find a single modality file in a patient directory."""
         suffixes = MODALITY_SUFFIXES.get(modality, ())
@@ -70,7 +83,7 @@ class BraTSPreprocessor:
             if matches:
                 return matches[0]
         return None
-    
+
     def find_segmentation_file(self, patient_dir: Path) -> Optional[Path]:
         """Find the segmentation file in a patient directory."""
         for suffix in SEGMENTATION_SUFFIXES:
@@ -78,12 +91,158 @@ class BraTSPreprocessor:
             if matches:
                 return matches[0]
         return None
-    
+
     def load_nifti(self, path: Path) -> np.ndarray:
-        """Load a NIfTI file as float32."""
+        """Load a NIfTI file as float32 with validation."""
         image = nib.load(str(path))
+        
+        # Validate NIfTI header and data before loading full volume
+        self._validate_nifti_image(image)
+        
         return image.get_fdata(dtype=np.float32)
-    
+
+    def _validate_nifti_image(self, image: nib.Nifti1Image) -> None:
+        """
+        Validate NIfTI image header and data before loading full volume.
+        Checks dimensions, data type, and estimated memory requirements.
+        """
+        # Check header magic and type
+        if not isinstance(image, (nib.Nifti1Image, nib.Nifti2Image)):
+            raise ValueError(f"Unsupported image type: {type(image).__name__}. Only NIfTI-1 and NIfTI-2 supported.")
+        
+        # Validate header magic
+        magic = image.header.get('magic', b'')
+        if magic not in (b'ni1', b'n+1'):
+            raise ValueError(f"Invalid NIfTI magic: {magic!r}")
+        
+        # Check data type
+        dtype = image.get_data_dtype()
+        if dtype not in SUPPORTED_DTYPES:
+            raise ValueError(
+                f"Unsupported data type: {dtype}. "
+                f"Supported types: {', '.join(str(dt) for dt in SUPPORTED_DTYPES)}"
+            )
+        
+        # Check dimensions
+        shape = image.shape
+        if len(shape) < 3:
+            raise ValueError(f"Expected 3D or 4D volume, got shape {shape}")
+        
+        # Check dimension bounds
+        for i, dim in enumerate(shape[:3]):
+            if dim <= 0:
+                raise ValueError(f"Invalid dimension {i}: {dim} (must be > 0)")
+            if dim > MAX_VOLUME_DIMENSION:
+                raise ValueError(
+                    f"Dimension {i} ({dim}) exceeds maximum allowed ({MAX_VOLUME_DIMENSION})"
+                )
+        
+        # Check total voxel count
+        voxel_count = np.prod(shape[:3])
+        if voxel_count > MAX_VOXEL_COUNT:
+            raise ValueError(
+                f"Volume voxel count ({voxel_count:,}) exceeds maximum allowed ({MAX_VOXEL_COUNT:,})"
+            )
+        
+        # Estimate decompressed size and check against limit
+        dtype_size = np.dtype(image.get_data_dtype()).itemsize
+        estimated_size_mb = (voxel_count * dtype_size) / (1024 * 1024)
+        if estimated_size_mb > MAX_DECOMPRESSED_SIZE_MB:
+            raise ValueError(
+                f"Estimated decompressed size ({estimated_size_mb:.1f} MB) "
+                f"exceeds maximum allowed ({MAX_DECOMPRESSED_SIZE_MB} MB)"
+            )
+
+
+class BraTSPreprocessor:
+    """
+    BraTS preprocessing pipeline.
+
+    This class encapsulates all preprocessing steps to ensure
+    identical behavior between training and inference.
+    """
+
+    def __init__(self, config: Optional[PreprocessingConfig] = None):
+        self.config = config or PreprocessingConfig()
+
+    def find_modality_file(self, patient_dir: Path, modality: str) -> Optional[Path]:
+        """Find a single modality file in a patient directory."""
+        suffixes = MODALITY_SUFFIXES.get(modality, ())
+        for suffix in suffixes:
+            matches = sorted(patient_dir.glob(f"*{suffix}"))
+            if matches:
+                return matches[0]
+        return None
+
+    def find_segmentation_file(self, patient_dir: Path) -> Optional[Path]:
+        """Find the segmentation file in a patient directory."""
+        for suffix in SEGMENTATION_SUFFIXES:
+            matches = sorted(patient_dir.glob(f"*{suffix}"))
+            if matches:
+                return matches[0]
+        return None
+
+    def load_nifti(self, path: Path) -> np.ndarray:
+        """Load a NIfTI file as float32 with validation."""
+        image = nib.load(str(path))
+        
+        # Validate NIfTI header and data before loading full volume
+        self._validate_nifti_image(image)
+        
+        return image.get_fdata(dtype=np.float32)
+
+    def _validate_nifti_image(self, image: nib.Nifti1Image) -> None:
+        """
+        Validate NIfTI image header and data before loading full volume.
+        Checks dimensions, data type, and estimated memory requirements.
+        """
+        # Check header magic and type
+        if not isinstance(image, (nib.Nifti1Image, nib.Nifti2Image)):
+            raise ValueError(f"Unsupported image type: {type(image).__name__}. Only NIfTI-1 and NIfTI-2 supported.")
+        
+        # Validate header magic
+        magic = image.header.get('magic', b'')
+        if magic not in (b'ni1', b'n+1'):
+            raise ValueError(f"Invalid NIfTI magic: {magic!r}")
+        
+        # Check data type
+        dtype = image.get_data_dtype()
+        if dtype not in SUPPORTED_DTYPES:
+            raise ValueError(
+                f"Unsupported data type: {dtype}. "
+                f"Supported types: {', '.join(str(dt) for dt in SUPPORTED_DTYPES)}"
+            )
+        
+        # Check dimensions
+        shape = image.shape
+        if len(shape) < 3:
+            raise ValueError(f"Expected 3D or 4D volume, got shape {shape}")
+        
+        # Check dimension bounds
+        for i, dim in enumerate(shape[:3]):
+            if dim <= 0:
+                raise ValueError(f"Invalid dimension {i}: {dim} (must be > 0)")
+            if dim > MAX_VOLUME_DIMENSION:
+                raise ValueError(
+                    f"Dimension {i} ({dim}) exceeds maximum allowed ({MAX_VOLUME_DIMENSION})"
+                )
+        
+        # Check total voxel count
+        voxel_count = np.prod(shape[:3])
+        if voxel_count > MAX_VOXEL_COUNT:
+            raise ValueError(
+                f"Volume voxel count ({voxel_count:,}) exceeds maximum allowed ({MAX_VOXEL_COUNT:,})"
+            )
+        
+        # Estimate decompressed size and check against limit
+        dtype_size = np.dtype(image.get_data_dtype()).itemsize
+        estimated_size_mb = (voxel_count * dtype_size) / (1024 * 1024)
+        if estimated_size_mb > MAX_DECOMPRESSED_SIZE_MB:
+            raise ValueError(
+                f"Estimated decompressed size ({estimated_size_mb:.1f} MB) "
+                f"exceeds maximum allowed ({MAX_DECOMPRESSED_SIZE_MB} MB)"
+            )
+
     def normalize_nonzero(self, volume: np.ndarray) -> np.ndarray:
         """
         Z-score normalize non-zero tissue.
@@ -105,7 +264,7 @@ class BraTSPreprocessor:
             volume[tissue] = values - mean
         
         return volume
-    
+
     def resize_slice(self, image: np.ndarray, target_size: int, is_mask: bool = False) -> np.ndarray:
         """
         Resize a single 2D slice.
@@ -131,7 +290,7 @@ class BraTSPreprocessor:
             resample=resample,
         )
         return np.asarray(pil_image, dtype=np.float32)
-    
+
     def preprocess_modalities(
         self,
         modality_paths: dict[str, Path],
@@ -171,7 +330,7 @@ class BraTSPreprocessor:
         # Stack as [4, H, W]
         stacked = np.stack(modality_slices, axis=0)
         return torch.from_numpy(stacked).float()
-    
+
     def preprocess_segmentation(
         self,
         segmentation_path: Path,

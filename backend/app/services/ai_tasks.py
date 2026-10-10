@@ -495,6 +495,10 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 os.rename(local_path, expected_path)
                 local_paths[modality] = expected_path
             
+            # Validate downloaded NIfTI files before processing
+            for modality, path in local_paths.items():
+                _validate_nifti_file(path)
+            
             # Use shared preprocessing pipeline (matches training exactly)
             config = PreprocessingConfig(image_size=224)
             image_tensor, mask_tensor, metadata = preprocess_brats_study(

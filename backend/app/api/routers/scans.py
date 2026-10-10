@@ -7,6 +7,10 @@ import os
 import uuid
 import shutil
 import logging
+import tempfile
+import gzip
+import zlib
+from io import BytesIO
 from typing import List, BinaryIO
 
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks, Form
@@ -32,17 +36,23 @@ NIFTI1_MAGIC = b"ni1"
 NIFTI2_MAGIC = b"n+1"
 GZIP_MAGIC = b"\x1f\x8b"
 
+# Maximum decompressed size to validate header (prevent decompression bombs)
+# NIfTI header is at most 352 bytes (348 bytes header + 4 bytes magic)
+# But we read a bit more to be safe for nibabel parsing
+MAX_DECOMPRESSED_HEADER_BYTES = 4096  # 4KB - enough for full header + some data
 
-def _validate_nifti_header(file_obj: BinaryIO) -> bool:
+
+def _validate_nifti_header(file_obj: BinaryIO, file_ext: str) -> bool:
     """
-    Validate NIfTI file format by checking magic bytes.
+    Validate NIfTI file format by checking magic bytes and header structure.
     Handles both uncompressed (.nii) and gzipped (.nii.gz) formats.
     Reads minimal bytes without loading entire file.
+    Performs proper gzip decompression and NIfTI header validation.
     """
     # Save current position
     original_pos = file_obj.tell()
     try:
-        # Read first 4 bytes for NIfTI-1/2 magic, or first 2 for gzip
+        # Read first 4 bytes for initial magic check
         header = file_obj.read(4)
         file_obj.seek(0)
         
@@ -51,19 +61,122 @@ def _validate_nifti_header(file_obj: BinaryIO) -> bool:
         
         # Check for gzip magic (gzipped NIfTI)
         if header[:2] == GZIP_MAGIC:
-            # For gzip, we'd need to decompress to check NIfTI magic
-            # For now, accept gzip files with .nii.gz extension
-            return True
+            # For gzip files, we need to decompress and validate the NIfTI content
+            return _validate_gzipped_nifti(file_obj)
         
         # Check NIfTI-1 magic (ni1) or NIfTI-2 magic (n+1)
         if header[:3] == NIFTI1_MAGIC or header[:3] == NIFTI2_MAGIC:
-            return True
+            return _validate_uncompressed_nifti(file_obj, header)
         
         return False
     except Exception:
         return False
     finally:
         file_obj.seek(original_pos)
+
+
+def _validate_uncompressed_nifti(file_obj: BinaryIO, initial_header: bytes) -> bool:
+    """
+    Validate uncompressed NIfTI-1 or NIfTI-2 file by checking header structure.
+    Uses nibabel for proper validation.
+    """
+    file_obj.seek(0)
+    try:
+        # Read enough bytes for nibabel to validate the header
+        # NIfTI header is 352 bytes (348 header + 4 magic)
+        header_data = file_obj.read(352)
+        if len(header_data) < 352:
+            return False
+        
+        # Write to temporary file for nibabel validation
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as tmp:
+            tmp.write(header_data)
+            tmp_path = tmp.name
+        
+        try:
+            # Try to load with nibabel - this validates header structure
+            import nibabel as nib
+            img = nib.load(tmp_path)
+            # Check it's a valid NIfTI image
+            if img.header is None:
+                return False
+            # Validate it's a NIfTI-1 or NIfTI-2 image
+            if not isinstance(img, (nib.Nifti1Image, nib.Nifti2Image)):
+                return False
+            # Basic sanity check on dimensions
+            shape = img.shape
+            if len(shape) < 3 or any(d <= 0 for d in shape[:3]):
+                return False
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+    except Exception:
+        return False
+
+
+def _validate_gzipped_nifti(file_obj: BinaryIO) -> bool:
+    """
+    Validate gzipped NIfTI file by decompressing and checking NIfTI content.
+    Bounded decompression to prevent decompression bombs.
+    """
+    file_obj.seek(0)
+    try:
+        # Read gzip data with size limit
+        # We'll decompress in a bounded way to check the NIfTI header
+        import gzip
+        import tempfile
+        
+        # Read gzip data with size limit (bounded by MAX_MODALITY_FILE_SIZE)
+        gzipped_data = file_obj.read(MAX_MODALITY_FILE_SIZE + 1)
+        if len(gzipped_data) > MAX_MODALITY_FILE_SIZE:
+            return False
+        
+        # Check if it's actually a valid gzip file by trying to decompress
+        # We'll decompress just enough to validate the NIfTI header (max 4KB decompressed)
+        try:
+            with gzip.GzipFile(fileobj=BytesIO(gzipped_data), mode='rb') as gz:
+                # Read bounded amount of decompressed data for header validation
+                decompressed_header = gz.read(MAX_DECOMPRESSED_HEADER_BYTES)
+                if len(decompressed_header) < 352:
+                    return False
+        except (gzip.BadGzipFile, OSError, EOFError, zlib.error):
+            return False
+        
+        # Now validate the decompressed header as NIfTI
+        import nibabel as nib
+        import tempfile
+        
+        with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as tmp:
+            tmp.write(decompressed_header)
+            tmp_path = tmp.name
+        
+        try:
+            img = nib.load(tmp_path)
+            if img.header is None:
+                return False
+            if not isinstance(img, (nib.Nifti1Image, nib.Nifti2Image)):
+                return False
+            shape = img.shape
+            if len(shape) < 3 or any(d <= 0 for d in shape[:3]):
+                return False
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+    except Exception:
+        return False
+    finally:
+        file_obj.seek(0)
 
 
 def _copyfileobj_with_limit(src: BinaryIO, dst: BinaryIO, limit: int) -> int:
@@ -149,7 +262,7 @@ async def upload_scan(
                 )
 
             # Validate NIfTI header before writing to disk
-            if not _validate_nifti_header(file.file):
+            if not _validate_nifti_header(file.file, file_type):
                 raise HTTPException(
                     status_code=400,
                     detail=f"Modality {modality} is not a valid NIfTI file"

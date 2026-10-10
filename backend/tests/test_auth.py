@@ -495,18 +495,37 @@ class TestCrossUserOwnership:
         from unittest.mock import AsyncMock, MagicMock, patch
         import asyncio
         from io import BytesIO
+        import gzip
+        import nibabel as nib
+        import numpy as np
+        import tempfile
+        import os
         
-        # Mock file uploads with valid NIfTI headers (ni1 magic bytes)
-        # Need enough data to exceed 1KB minimum size check
-        nifti_header = b"ni1\x00" + b"\x00" * 340  # Minimal NIfTI-1 header
-        # Create content > 1KB to pass minimum size check
-        file_content = b"\x1f\x8b" + nifti_header + b"x" * 2000  # gzip + nifti header + padding
+        # Create a valid NIfTI file content for testing
+        # Use larger dimensions to exceed 1KB minimum size check
+        data = np.zeros((64, 64, 64), dtype=np.float32)  # ~1MB uncompressed
+        affine = np.eye(4)
+        img = nib.Nifti1Image(data, affine)
         
+        with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        nib.save(img, tmp_path)
+        
+        with open(tmp_path, 'rb') as f:
+            nifti_bytes = f.read()
+        
+        # Gzip it using gzip.compress (more reliable than GzipFile with BytesIO)
+        gzipped_content = gzip.compress(nifti_bytes)
+        
+        os.unlink(tmp_path)
+        
+        # Create mock files with valid NIfTI gzipped content
         mock_files = {}
         for modality in ["t1", "t1ce", "t2", "flair"]:
             mock_file = MagicMock()
             mock_file.filename = f"{modality}.nii.gz"
-            mock_file.file = BytesIO(file_content)
+            mock_file.file = BytesIO(gzipped_content)
             mock_files[modality] = mock_file
         
         mock_db = MagicMock()

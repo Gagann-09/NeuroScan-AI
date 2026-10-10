@@ -8,9 +8,10 @@ Tests verify that the Firebase ID token verification dependency:
 - Rejects invalid tokens
 - Rejects revoked tokens
 - Protects the scan status endpoint
+- Enforces cross-user ownership on scan endpoints
 """
 import os
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -213,6 +214,324 @@ class TestProtectedEndpoint:
 
         assert response.status_code == 401
         assert response.json()["detail"] == "Invalid or expired authentication token"
+
+
+class TestCrossUserOwnership:
+    """Test cross-user ownership enforcement on scan endpoints.
+    
+    These tests mock the database and Firebase verification to test
+    ownership enforcement without requiring real credentials or database.
+    """
+
+    @pytest.fixture
+    def mock_user_a(self):
+        """Create a mock User A."""
+        from app.db.models import User
+        user = User(firebase_uid="user-a-uid", email="usera@example.com")
+        return user
+
+    @pytest.fixture
+    def mock_user_b(self):
+        """Create a mock User B."""
+        from app.db.models import User
+        user = User(firebase_uid="user-b-uid", email="userb@example.com")
+        return user
+
+    @pytest.fixture
+    def mock_scan_owned_by_a(self, mock_user_a):
+        """Create a mock Scan owned by User A."""
+        from app.db.models import Scan
+        from datetime import datetime, timezone
+        scan = Scan(
+            id="test-scan-owned-by-a",
+            filename="test-scan-owned-by-a/source_study",
+            status="SEGMENTED",
+            user_id=mock_user_a.firebase_uid,
+            mask_path="test-scan-owned-by-a/mask.png",
+            xai_path="test-scan-owned-by-a/xai.png",
+            report_path="test-scan-owned-by-a/report.pdf",
+        )
+        return scan
+
+    @pytest.fixture
+    def mock_legacy_scan(self):
+        """Create a mock legacy scan with no owner."""
+        from app.db.models import Scan
+        scan = Scan(
+            id="test-legacy-scan",
+            filename="test-legacy-scan/source_study",
+            status="SEGMENTED",
+            user_id=None,  # Legacy scan - no owner
+            mask_path="test-legacy-scan/mask.png",
+            xai_path="test-legacy-scan/xai.png",
+            report_path="test-legacy-scan/report.pdf",
+        )
+        return scan
+
+    @pytest.fixture
+    def mock_prediction_for_scan(self):
+        """Create a mock Prediction for test scans."""
+        from app.db.models import Prediction
+        pred = Prediction(
+            id=1,
+            scan_id="test-scan-owned-by-a",
+            model_version_id="model-test",
+            tumor_detected=True,
+            max_tumor_probability=0.95,
+        )
+        return pred
+
+    def _setup_db_mock(self, monkeypatch, current_user, scan, prediction=None):
+        """Helper to mock database queries for a given user and scan."""
+        import app.api.routers.scans as scans_module
+        
+        # Mock the database session
+        mock_db = MagicMock()
+        
+        # Mock Scan query
+        mock_scan_query = MagicMock()
+        mock_scan_query.filter.return_value.first.return_value = scan
+        mock_db.query.return_value = mock_scan_query
+        
+        # Mock Prediction query if needed
+        if prediction:
+            mock_pred_query = MagicMock()
+            mock_pred_query.filter.return_value.first.return_value = prediction
+            # Need to handle multiple query calls - Scan then Prediction
+            call_count = [0]
+            def query_side_effect(model):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    return mock_scan_query
+                else:
+                    return mock_pred_query
+            mock_db.query.side_effect = query_side_effect
+        
+        return mock_db
+
+    def test_user_a_can_access_own_scan_status(self, mock_user_a, mock_scan_owned_by_a, monkeypatch):
+        """User A can access status of their own scan (200 OK)."""
+        from app.api.routers.scans import get_scan_status
+        from unittest.mock import MagicMock
+        
+        mock_db = MagicMock()
+        mock_scan_query = MagicMock()
+        mock_scan_query.filter.return_value.first.return_value = mock_scan_owned_by_a
+        mock_db.query.return_value = mock_scan_query
+        
+        # Test the endpoint function directly (sync function)
+        result = get_scan_status(
+            scan_id="test-scan-owned-by-a",
+            db=mock_db,
+            current_user=mock_user_a,
+        )
+        
+        assert result.scan_id == "test-scan-owned-by-a"
+        assert result.status == "SEGMENTED"
+        mock_db.query.assert_called_once()
+
+    def test_user_b_cannot_access_user_a_scan_status(self, mock_user_b, mock_scan_owned_by_a, monkeypatch):
+        """User B receives 403 when requesting User A's scan status."""
+        from app.api.routers.scans import get_scan_status
+        from fastapi import HTTPException
+        from unittest.mock import MagicMock
+        import asyncio
+        
+        mock_db = MagicMock()
+        mock_scan_query = MagicMock()
+        mock_scan_query.filter.return_value.first.return_value = mock_scan_owned_by_a
+        mock_db.query.return_value = mock_scan_query
+        
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(get_scan_status(
+                scan_id="test-scan-owned-by-a",
+                db=mock_db,
+                current_user=mock_user_b,
+            ))
+        
+        assert exc_info.value.status_code == 403
+        assert "Access denied" in exc_info.value.detail
+        assert "another user" in exc_info.value.detail
+
+    def test_user_a_can_access_own_scan_results(self, mock_user_a, mock_scan_owned_by_a, monkeypatch):
+        """User A can access results of their own scan (200 OK)."""
+        from app.api.routers.scans import get_scan_results
+        from app.db.models import Prediction
+        from unittest.mock import MagicMock, patch
+        
+        mock_prediction = Prediction(
+            id=1,
+            scan_id="test-scan-owned-by-a",
+            model_version_id="model-test",
+            tumor_detected=True,
+            max_tumor_probability=0.95,
+        )
+        
+        mock_db = MagicMock()
+        call_count = [0]
+        def query_side_effect(model):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                mock_scan_query = MagicMock()
+                mock_scan_query.filter.return_value.first.return_value = mock_scan_owned_by_a
+                return mock_scan_query
+            else:
+                mock_pred_query = MagicMock()
+                mock_pred_query.filter.return_value.first.return_value = mock_prediction
+                return mock_pred_query
+        mock_db.query.side_effect = query_side_effect
+        
+        # Mock get_presigned_url
+        with patch("app.api.routers.scans.get_presigned_url", side_effect=lambda x: f"https://presigned/{x}"):
+            result = get_scan_results(
+                scan_id="test-scan-owned-by-a",
+                db=mock_db,
+                current_user=mock_user_a,
+            )
+        
+        assert result.scan_id == "test-scan-owned-by-a"
+        assert result.tumor_detected is True
+        assert result.max_tumor_probability == 0.95
+        assert result.mask_url == "https://presigned/test-scan-owned-by-a/mask.png"
+        assert result.xai_url == "https://presigned/test-scan-owned-by-a/xai.png"
+        assert result.report_url == "https://presigned/test-scan-owned-by-a/report.pdf"
+
+    def test_user_b_cannot_access_user_a_scan_results(self, mock_user_b, mock_scan_owned_by_a, mock_prediction_for_scan, monkeypatch):
+        """User B receives 403 when requesting User A's results."""
+        from app.api.routers.scans import get_scan_results
+        from fastapi import HTTPException
+        from unittest.mock import MagicMock
+        import asyncio
+        
+        mock_db = MagicMock()
+        call_count = [0]
+        def query_side_effect(model):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                mock_scan_query = MagicMock()
+                mock_scan_query.filter.return_value.first.return_value = mock_scan_owned_by_a
+                return mock_scan_query
+            else:
+                mock_pred_query = MagicMock()
+                mock_pred_query.filter.return_value.first.return_value = mock_prediction_for_scan
+                return mock_pred_query
+        mock_db.query.side_effect = query_side_effect
+        
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(get_scan_results(
+                scan_id="test-scan-owned-by-a",
+                db=mock_db,
+                current_user=mock_user_b,
+            ))
+        
+        assert exc_info.value.status_code == 403
+        assert "Access denied" in exc_info.value.detail
+        
+        # Verify presigned URLs were NOT generated (no call to get_presigned_url)
+        # The 403 is raised before get_presigned_url is called
+
+    def test_user_b_receives_403_for_legacy_scan(self, mock_user_b, mock_legacy_scan, monkeypatch):
+        """An authenticated user receives 403 for an ownerless legacy scan."""
+        from app.api.routers.scans import get_scan_status
+        from fastapi import HTTPException
+        from unittest.mock import MagicMock
+        import asyncio
+        
+        mock_db = MagicMock()
+        mock_scan_query = MagicMock()
+        mock_scan_query.filter.return_value.first.return_value = mock_legacy_scan
+        mock_db.query.return_value = mock_scan_query
+        
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(get_scan_status(
+                scan_id="test-legacy-scan",
+                db=mock_db,
+                current_user=mock_user_b,
+            ))
+        
+        assert exc_info.value.status_code == 403
+        assert "Access denied" in exc_info.value.detail
+
+    def test_unauthorized_results_does_not_generate_presigned_urls(self, mock_user_b, mock_scan_owned_by_a, mock_prediction_for_scan, monkeypatch):
+        """Unauthorized results requests do not generate presigned URLs or expose metadata."""
+        from app.api.routers.scans import get_scan_results
+        from fastapi import HTTPException
+        from unittest.mock import MagicMock, patch
+        import asyncio
+        
+        mock_db = MagicMock()
+        call_count = [0]
+        def query_side_effect(model):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                mock_scan_query = MagicMock()
+                mock_scan_query.filter.return_value.first.return_value = mock_scan_owned_by_a
+                return mock_scan_query
+            else:
+                mock_pred_query = MagicMock()
+                mock_pred_query.filter.return_value.first.return_value = mock_prediction_for_scan
+                return mock_pred_query
+        mock_db.query.side_effect = query_side_effect
+        
+        # Mock get_presigned_url to track calls
+        with patch("app.api.routers.scans.get_presigned_url") as mock_presigned:
+            mock_presigned.side_effect = lambda x: f"https://presigned/{x}"
+            
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(get_scan_results(
+                    scan_id="test-scan-owned-by-a",
+                    db=mock_db,
+                    current_user=mock_user_b,
+                ))
+            
+            assert exc_info.value.status_code == 403
+            # Verify get_presigned_url was never called
+            mock_presigned.assert_not_called()
+
+    def test_upload_ownership_derived_from_authenticated_identity(self, mock_user_a, monkeypatch):
+        """Upload ownership is derived from authenticated identity, not client data."""
+        from app.api.routers.scans import upload_scan
+        from app.schemas.scan_schema import UploadResponse
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import asyncio
+        from io import BytesIO
+        
+        # Mock file uploads
+        mock_files = {}
+        for modality in ["t1", "t1ce", "t2", "flair"]:
+            mock_file = AsyncMock()
+            mock_file.filename = f"{modality}.nii.gz"
+            mock_file.file = BytesIO(b"dummy content")
+            mock_files[modality] = mock_file
+        
+        mock_db = MagicMock()
+        mock_bg = MagicMock()
+        
+        # Mock minio
+        with patch("app.api.routers.scans.minio_client") as mock_minio:
+            mock_minio.bucket_exists.return_value = True
+            mock_minio.fput_object = AsyncMock()
+            
+            result = asyncio.run(upload_scan(
+                t1=mock_files["t1"],
+                t1ce=mock_files["t1ce"],
+                t2=mock_files["t2"],
+                flair=mock_files["flair"],
+                db=mock_db,
+                background_tasks=mock_bg,
+                current_user=mock_user_a,
+            ))
+        
+        # Verify scan was created with correct ownership from authenticated user
+        # Capture the Scan object that was added to the session
+        added_scans = [call.args[0] for call in mock_db.add.call_args_list if call.args[0].__class__.__name__ == "Scan"]
+        assert len(added_scans) == 1
+        scan = added_scans[0]
+        assert scan.user_id == mock_user_a.firebase_uid
+        assert scan.user_id == "user-a-uid"
+        assert scan.status == "PENDING"
+        assert result.scan_id == scan.id
+        assert result.status == "PROCESSING"
 
 
 if __name__ == "__main__":

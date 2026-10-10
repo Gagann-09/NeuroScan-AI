@@ -11,6 +11,7 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Literal
+import nibabel as nib
 
 from app.db.database import SessionLocal
 from app.db.models import Scan, ModalityFile, Prediction, ModelVersion, Artifact
@@ -19,442 +20,71 @@ from app.services.reporting import generate_segmentation_report
 from ai_pipeline.models.armt_gan import ARMTGenerator2D
 from app.services.xai import generate_gradient_saliency, compute_segmentation_alignment, XAIProvenance
 from ai_pipeline.preprocessing import preprocess_brats_study, PreprocessingConfig
+from ai_pipeline.preprocessing.brats_preprocessing import (
+    BraTSPreprocessor,
+    MAX_VOLUME_DIMENSION,
+    MAX_VOXEL_COUNT,
+    MAX_DECOMPRESSED_SIZE_MB,
+    SUPPORTED_DTYPES,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _cleanup_derived_objects(bucket_name: str, object_names: list[str]) -> None:
+def _validate_nifti_file(path: Path) -> None:
     """
-    Best-effort cleanup of derived artifacts from MinIO.
-    Cleanup failures are logged but do not raise; original errors must propagate.
-    Already-missing objects are treated as successfully cleaned up.
+    Validate a NIfTI file on disk before processing.
+    Checks dimensions, data type, and estimated memory requirements.
+    Raises ValueError if validation fails.
     """
-    for obj_name in object_names:
-        try:
-            minio_client.remove_object(bucket_name, obj_name)
-        except Exception as e:
-            # Check if object already doesn't exist (S3 error code NoSuchKey)
-            error_code = getattr(e, "code", None)
-            if error_code == "NoSuchKey":
-                logger.debug(f"Derived object {obj_name} already absent during cleanup")
-            else:
-                logger.warning(f"Failed to cleanup derived object {obj_name}: {e}")
-
-
-# ── LAZY MODEL LOADING ──
-_DEVICE = None
-_GLOBAL_MODEL = None
-_WEIGHTS_PATH = None
-_CHECKPOINT_IDENTIFIER = None
-_MODEL_VERSION_ID = None
-_DEFAULT_PREPROCESSING_CONFIG = None
-_PREPROCESSING_VERSION = None
-_MODEL_VERSION_CONFIG_HASH = "arch:armt-gan-2d-unet|generator:lightweight|discriminator:conditional-patchgan|loss:l1_100_adv_1"
-
-
-def _get_device():
-    global _DEVICE
-    if _DEVICE is None:
-        _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return _DEVICE
-
-
-def _get_weights_path():
-    global _WEIGHTS_PATH
-    if _WEIGHTS_PATH is None:
-        _WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "../../ai_pipeline/weights/generator_latest.pth")
-    return _WEIGHTS_PATH
-
-
-def _get_global_model():
-    """Lazily load and return the global ARMT-GAN model."""
-    global _GLOBAL_MODEL, _CHECKPOINT_IDENTIFIER
-    if _GLOBAL_MODEL is None:
-        logger.info("Initializing ARMT-GAN model into global memory...")
-        _GLOBAL_MODEL = ARMTGenerator2D().to(_get_device())
-        weights_path = _get_weights_path()
-        if os.path.exists(weights_path):
-            _GLOBAL_MODEL.load_state_dict(torch.load(weights_path, map_location=_get_device()))
-        _GLOBAL_MODEL.eval()
-        _CHECKPOINT_IDENTIFIER = os.path.basename(weights_path) if os.path.exists(weights_path) else "unknown"
-        logger.info("ARMT-GAN model successfully cached in memory.")
-    return _GLOBAL_MODEL
-
-
-def _get_checkpoint_identifier():
-    _get_global_model()  # Ensures model is loaded and identifier set
-    return _CHECKPOINT_IDENTIFIER
-
-
-def _get_model_version_id():
-    global _MODEL_VERSION_ID
-    if _MODEL_VERSION_ID is None:
-        weights_path = _get_weights_path()
-        _MODEL_VERSION_ID = _compute_model_version_id(weights_path)
-    return _MODEL_VERSION_ID
-
-
-def _get_default_preprocessing_config():
-    global _DEFAULT_PREPROCESSING_CONFIG
-    if _DEFAULT_PREPROCESSING_CONFIG is None:
-        _DEFAULT_PREPROCESSING_CONFIG = PreprocessingConfig(image_size=224)
-    return _DEFAULT_PREPROCESSING_CONFIG
-
-
-def _get_preprocessing_version():
-    global _PREPROCESSING_VERSION
-    if _PREPROCESSING_VERSION is None:
-        _PREPROCESSING_VERSION = _compute_preprocessing_version(_get_default_preprocessing_config())
-    return _PREPROCESSING_VERSION
-
-
-def _get_model_version_config_hash():
-    return _MODEL_VERSION_CONFIG_HASH
-
-
-def _compute_model_version_id(weights_path: str) -> str:
-    """
-    Compute a deterministic model version ID from the model weights file.
-    Uses SHA256 hash of the weights file content.
-    """
-    import hashlib
-    try:
-        with open(weights_path, "rb") as f:
-            file_hash = hashlib.sha256(f.read()).hexdigest()
-        return f"model-{file_hash[:16]}"
-    except Exception:
-        # Fallback if file doesn't exist or can't be read
-        return "model-unknown"
-
-
-def _compute_preprocessing_version(config: "PreprocessingConfig") -> str:
-    """
-    Compute a deterministic preprocessing version from the configuration.
-    Uses SHA256 hash of the canonical config representation.
-    """
-    import hashlib
-    import json
-
-    # Create a canonical representation of the config
-    config_dict = {
-        "image_size": config.image_size,
-        # Add other config fields as needed
-    }
-    config_str = json.dumps(config_dict, sort_keys=True)
-    return f"preproc-{hashlib.sha256(config_str.encode()).hexdigest()[:16]}"
-
-
-class ScanClaimResult:
-    """Result of attempting to claim a scan for processing."""
+    image = nib.load(str(path))
     
-    def __init__(
-        self,
-        success: bool,
-        reason: Literal["CLAIMED", "ALREADY_PROCESSING", "ALREADY_COMPLETE", "NOT_FOUND"] | None = None,
-        scan_id: str | None = None,
-    ):
-        self.success = success
-        self.reason = reason
-        self.scan_id = scan_id
+    # Check header magic and type
+    if not isinstance(image, (nib.Nifti1Image, nib.Nifti2Image)):
+        raise ValueError(f"Unsupported image type: {type(image).__name__}. Only NIfTI-1 and NIfTI-2 supported.")
     
-    def __bool__(self) -> bool:
-        return self.success
+    # Validate header magic
+    magic = image.header.get('magic', b'')
+    if magic not in (b'ni1', b'n+1'):
+        raise ValueError(f"Invalid NIfTI magic: {magic!r}")
     
-    def __repr__(self) -> str:
-        if self.success:
-            return f"ScanClaimResult(success=True, scan_id={self.scan_id})"
-        return f"ScanClaimResult(success=False, reason={self.reason}, scan_id={self.scan_id})"
-
-
-def claim_scan_for_processing(db: Session, scan_id: str) -> ScanClaimResult:
-    """
-    Atomically claim a scan for processing using PostgreSQL row-level locking.
-    
-    Uses SELECT FOR UPDATE NOWAIT to acquire an exclusive lock on the Scan row.
-    If another transaction holds the lock, returns immediately with failure.
-    
-    State transitions:
-    - PENDING    → PROCESSING (claimed, processing_started_at set)
-    - FAILED     → PROCESSING (claimed, processing_started_at set)  
-    - PROCESSING → REJECTED (another worker holds the lock)
-    - SEGMENTED  → REJECTED (already complete)
-    - NOT FOUND  → REJECTED (scan does not exist)
-    
-    Args:
-        db: Database session
-        scan_id: Scan identifier to claim
-        
-    Returns:
-        ScanClaimResult with success status and reason
-    """
-    # Attempt to acquire row lock with NOWAIT - fails immediately if locked
-    try:
-        row = db.execute(
-            text("SELECT id, status FROM scans WHERE id = :scan_id FOR UPDATE NOWAIT"),
-            {"scan_id": scan_id}
-        ).fetchone()
-    except Exception as e:
-        # Lock not available - another transaction holds it (PROCESSING)
-        if "could not obtain lock" in str(e).lower() or "lock_not_available" in str(e).lower():
-            return ScanClaimResult(success=False, reason="ALREADY_PROCESSING", scan_id=scan_id)
-        raise
-    
-    if not row:
-        return ScanClaimResult(success=False, reason="NOT_FOUND", scan_id=scan_id)
-    
-    current_status = row.status
-    
-    # Check current state and decide
-    if current_status == "SEGMENTED":
-        return ScanClaimResult(success=False, reason="ALREADY_COMPLETE", scan_id=scan_id)
-    
-    if current_status == "PROCESSING":
-        # Another worker already claimed it (we got the lock but status is PROCESSING)
-        # This shouldn't happen with NOWAIT but handle defensively
-        return ScanClaimResult(success=False, reason="ALREADY_PROCESSING", scan_id=scan_id)
-    
-    # Claim the scan: PENDING or FAILED
-    now = datetime.now(timezone.utc)
-    db.execute(
-        text("UPDATE scans SET status = 'PROCESSING', processing_started_at = :now WHERE id = :scan_id"),
-        {"scan_id": scan_id, "now": now}
-    )
-    db.flush()
-    
-    return ScanClaimResult(success=True, reason="CLAIMED", scan_id=scan_id)
-
-
-class ArtifactStateTransition:
-    """Result of attempting to transition an artifact's lifecycle state."""
-    
-    def __init__(
-        self,
-        success: bool,
-        reason: Literal[
-            "TRANSITIONED",
-            "ALREADY_COMPLETE",
-            "ALREADY_FAILED",
-            "INVALID_TRANSITION",
-            "NOT_FOUND",
-            "INVALID_STATE"
-        ] | None = None,
-        artifact_id: int | None = None,
-        from_state: str | None = None,
-        to_state: str | None = None,
-    ):
-        self.success = success
-        self.reason = reason
-        self.artifact_id = artifact_id
-        self.from_state = from_state
-        self.to_state = to_state
-    
-    def __bool__(self) -> bool:
-        return self.success
-    
-    def __repr__(self) -> str:
-        if self.success:
-            return f"ArtifactStateTransition(success=True, artifact_id={self.artifact_id}, {self.from_state} -> {self.to_state})"
-        return f"ArtifactStateTransition(success=False, reason={self.reason}, artifact_id={self.artifact_id})"
-
-
-# Valid lifecycle transitions
-VALID_ARTIFACT_TRANSITIONS = {
-    "PENDING": {"COMPLETE", "FAILED"},
-    "COMPLETE": set(),  # Terminal state - no transitions allowed
-    "FAILED": set(),    # Terminal state - no transitions allowed
-}
-
-
-def transition_artifact_state(
-    db: Session,
-    artifact_id: int,
-    target_state: Literal["PENDING", "COMPLETE", "FAILED"],
-) -> ArtifactStateTransition:
-    """
-    Atomically transition an artifact's lifecycle state using PostgreSQL row-level locking.
-    
-    Uses SELECT FOR UPDATE NOWAIT to acquire an exclusive lock on the Artifact row.
-    If another transaction holds the lock, raises an exception.
-    
-    Valid transitions (per migration 005 CHECK constraint and design):
-    - PENDING -> COMPLETE (successful upload/completion)
-    - PENDING -> FAILED (failed upload/operation)
-    
-    Invalid transitions (rejected explicitly):
-    - COMPLETE -> any state (terminal)
-    - FAILED -> any state (terminal)
-    - Any -> PENDING (no backward transitions)
-    - Any -> unknown state
-    
-    Args:
-        db: Database session
-        artifact_id: Artifact identifier to transition
-        target_state: Target lifecycle state
-        
-    Returns:
-        ArtifactStateTransition with success status, reason, and state info
-    """
-    # Validate target state is a known lifecycle state
-    if target_state not in VALID_ARTIFACT_TRANSITIONS:
-        return ArtifactStateTransition(
-            success=False,
-            reason="INVALID_STATE",
-            artifact_id=artifact_id,
-            to_state=target_state,
+    # Check data type
+    dtype = image.get_data_dtype()
+    if dtype not in SUPPORTED_DTYPES:
+        raise ValueError(
+            f"Unsupported data type: {dtype}. "
+            f"Supported types: {', '.join(str(dt) for dt in SUPPORTED_DTYPES)}"
         )
     
-    # Attempt to acquire row lock with NOWAIT - fails immediately if locked
-    try:
-        row = db.execute(
-            text("SELECT id, status FROM artifacts WHERE id = :artifact_id FOR UPDATE NOWAIT"),
-            {"artifact_id": artifact_id}
-        ).fetchone()
-    except Exception as e:
-        # Lock not available - another transaction holds it
-        if "could not obtain lock" in str(e).lower() or "lock_not_available" in str(e).lower():
-            return ArtifactStateTransition(
-                success=False,
-                reason="INVALID_TRANSITION",
-                artifact_id=artifact_id,
-                to_state=target_state,
+    # Check dimensions
+    shape = image.shape
+    if len(shape) < 3:
+        raise ValueError(f"Expected 3D or 4D volume, got shape {shape}")
+    
+    # Check dimension bounds
+    for i, dim in enumerate(shape[:3]):
+        if dim <= 0:
+            raise ValueError(f"Invalid dimension {i}: {dim} (must be > 0)")
+        if dim > MAX_VOLUME_DIMENSION:
+            raise ValueError(
+                f"Dimension {i} ({dim}) exceeds maximum allowed ({MAX_VOLUME_DIMENSION})"
             )
-        raise
     
-    if not row:
-        return ArtifactStateTransition(
-            success=False,
-            reason="NOT_FOUND",
-            artifact_id=artifact_id,
-            to_state=target_state,
+    # Check total voxel count
+    voxel_count = np.prod(shape[:3])
+    if voxel_count > MAX_VOXEL_COUNT:
+        raise ValueError(
+            f"Volume voxel count ({voxel_count:,}) exceeds maximum allowed ({MAX_VOXEL_COUNT:,})"
         )
     
-    current_state = row.status
-    
-    # Check if transition is valid
-    allowed_targets = VALID_ARTIFACT_TRANSITIONS.get(current_state, set())
-    if target_state not in allowed_targets:
-        return ArtifactStateTransition(
-            success=False,
-            reason="INVALID_TRANSITION",
-            artifact_id=artifact_id,
-            from_state=current_state,
-            to_state=target_state,
+    # Estimate decompressed size and check against limit
+    dtype_size = np.dtype(image.get_data_dtype()).itemsize
+    estimated_size_mb = (voxel_count * dtype_size) / (1024 * 1024)
+    if estimated_size_mb > MAX_DECOMPRESSED_SIZE_MB:
+        raise ValueError(
+            f"Estimated decompressed size ({estimated_size_mb:.1f} MB) "
+            f"exceeds maximum allowed ({MAX_DECOMPRESSED_SIZE_MB} MB)"
         )
-    
-    # Perform the valid transition
-    db.execute(
-        text("UPDATE artifacts SET status = :target_state WHERE id = :artifact_id"),
-        {"artifact_id": artifact_id, "target_state": target_state}
-    )
-    db.flush()
-    
-    return ArtifactStateTransition(
-        success=True,
-        reason="TRANSITIONED",
-        artifact_id=artifact_id,
-        from_state=current_state,
-        to_state=target_state,
-    )
-
-
-def _get_or_create_model_version(db: Session, version_id: str, checkpoint_path: str, config_hash: str, preprocessing_version: str) -> ModelVersion:
-    """
-    Get existing ModelVersion or create new one.
-    Ensures deterministic reuse of the same model version for the same checkpoint.
-    """
-    model_version = db.query(ModelVersion).filter(ModelVersion.id == version_id).first()
-    if model_version is None:
-        model_version = ModelVersion(
-            id=version_id,
-            checkpoint_path=checkpoint_path,
-            config_hash=config_hash,
-            preprocessing_version=preprocessing_version,
-        )
-        db.add(model_version)
-        db.flush()  # Ensure ID is available
-        logger.info(f"Created new ModelVersion: {version_id}")
-    return model_version
-
-
-def generate_clinical_overlays(original_pil: Image.Image, mask_tensor: np.ndarray, xai_tensor: np.ndarray):
-    """Generate visualization overlays for segmentation and XAI."""
-    orig_np = np.array(original_pil.convert('RGB'))
-    orig_bgr = cv2.cvtColor(orig_np, cv2.COLOR_RGB2BGR)
-
-    mask_np = mask_tensor.squeeze()
-    
-    if mask_np.max() > mask_np.min():
-        norm_mask = (mask_np - mask_np.min()) / (mask_np.max() - mask_np.min())
-    else:
-        norm_mask = mask_np
-
-    thresh_val = np.percentile(norm_mask, 85) if np.max(norm_mask) > 0.1 else 0.2
-    _, binary_mask = cv2.threshold((norm_mask * 255).astype(np.uint8), int(thresh_val * 255), 255, cv2.THRESH_BINARY)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    clean_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
-    
-    if cv2.countNonZero(clean_mask) < 5:
-        _, clean_mask = cv2.threshold((norm_mask * 255).astype(np.uint8), 50, 255, cv2.THRESH_BINARY)
-
-    glow_mask = cv2.GaussianBlur(clean_mask, (21, 21), 0)
-    glow_mask_float = glow_mask.astype(float) / 255.0
-
-    color_layer = np.zeros_like(orig_bgr)
-    color_layer[:] = [150, 255, 50] 
-
-    alpha = 0.70
-    mask_3d = np.repeat(glow_mask_float[:, :, np.newaxis], 3, axis=2)
-    seg_overlay = (orig_bgr * (1 - mask_3d * alpha) + color_layer * (mask_3d * alpha)).astype(np.uint8)
-
-    contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(seg_overlay, contours, -1, (180, 255, 100), 2)
-
-    heatmap_np = xai_tensor.squeeze()
-    if heatmap_np.max() > heatmap_np.min():
-        heatmap_np = (heatmap_np - heatmap_np.min()) / (heatmap_np.max() - heatmap_np.min())
-
-    context_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
-    localized_area = cv2.dilate(clean_mask, context_kernel, iterations=1)
-    localized_area_float = localized_area.astype(float) / 255.0
-
-    localized_heatmap = heatmap_np * localized_area_float
-    if np.max(localized_heatmap) > 0:
-        localized_heatmap = localized_heatmap / np.max(localized_heatmap)
-
-    heatmap_colored = cv2.applyColorMap((localized_heatmap * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
-
-    xai_alpha_mask = localized_heatmap[:, :, np.newaxis]
-    xai_overlay = (orig_bgr * (1 - xai_alpha_mask * 0.7) + heatmap_colored * (xai_alpha_mask * 0.7)).astype(np.uint8)
-
-    seg_final_pil = Image.fromarray(cv2.cvtColor(seg_overlay, cv2.COLOR_BGR2RGB))
-    xai_final_pil = Image.fromarray(cv2.cvtColor(xai_overlay, cv2.COLOR_BGR2RGB))
-    
-    tumor_area_px = cv2.countNonZero(clean_mask)
-    # No heuristic cm² conversion - pixel count only for internal thresholding
-    tumor_detected = tumor_area_px > 0
-    
-    return seg_final_pil, xai_final_pil, tumor_detected, norm_mask
-
-
-def create_reference_image(modality_arrays: dict[str, np.ndarray], slice_index: int) -> Image.Image:
-    """
-    Create a reference RGB image from the 4 modalities for visualization.
-    Uses FLAIR as base, overlays T1ce for contrast enhancement.
-    """
-    # Use FLAIR as the base (good for tumor visualization)
-    flair_slice = modality_arrays["flair"][:, :, slice_index]
-    
-    # Normalize for display
-    flair_display = flair_slice.copy()
-    if flair_display.max() > flair_display.min():
-        flair_display = (flair_display - flair_display.min()) / (flair_display.max() - flair_display.min())
-    flair_display = (flair_display * 255).astype(np.uint8)
-    
-    # Create RGB from FLAIR (grayscale -> RGB)
-    rgb = np.stack([flair_display, flair_display, flair_display], axis=2)
-    
-    return Image.fromarray(rgb, mode="RGB")
 
 
 def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
@@ -477,7 +107,7 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
         if not claim_result.success:
             logger.info(f"Scan {scan_id} not claimed: {claim_result.reason}")
             return  # Exit early — another worker claimed it, or already complete/failed/not found
-
+        
         # Download all 4 modalities from MinIO
         with tempfile.TemporaryDirectory() as tmpdir:
             for modality, object_name in modality_objects.items():
@@ -562,9 +192,9 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
             )
             
             logger.info(f"XAI alignment: inside={alignment['mean_inside']:.4f}, "
-                       f"outside={alignment['mean_outside']:.4f}, "
-                       f"ratio={alignment['ratio']}, "
-                       f"tumor_pixels={alignment['tumor_pixel_count']}")
+                        f"outside={alignment['mean_outside']:.4f}, "
+                        f"ratio={alignment['ratio']}, "
+                        f"tumor_pixels={alignment['tumor_pixel_count']}")
             
             # Convert to CPU numpy
             mask_cpu = mask_tensor.cpu().numpy()
@@ -584,14 +214,14 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
             model_version = _get_or_create_model_version(
                 db, _get_model_version_id(), _get_weights_path(), _get_model_version_config_hash(), _get_preprocessing_version()
             )
-
+            
             # Save artifacts
             with tempfile.TemporaryDirectory() as tmpdirname:
                 source_img_path = os.path.join(tmpdirname, f"{scan_id}_source.jpg")
-                mask_path = os.path.join(tmpdirname, f"{scan_id}_mask.png")
-                xai_path = os.path.join(tmpdirname, f"{scan_id}_xai.png")
-                report_path = os.path.join(tmpdirname, f"{scan_id}_report.pdf")
-                xai_raw_path = os.path.join(tmpdirname, f"{scan_id}_xai_raw.npy")
+                mask_path = os.path.join(tmpdir, f"{scan_id}_mask.png")
+                xai_path = os.path.join(tmpdir, f"{scan_id}_xai.png")
+                report_path = os.path.join(tmpdir, f"{scan_id}_report.pdf")
+                xai_raw_path = os.path.join(tmpdir, f"{scan_id}_xai_raw.npy")
                 
                 # Save raw attribution as .npy for auditability
                 np.save(xai_raw_path, xai_cpu)
@@ -599,6 +229,13 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 original_pil.save(source_img_path)
                 seg_final_pil.save(mask_path)
                 xai_final_pil.save(xai_path)
+                
+                generate_segmentation_report("PT-ANONYMIZED", scan_id, model_version.id, source_img_path, mask_path, xai_path, report_path)
+                
+                mask_obj_name = f"{scan_id}/mask.png"
+                xai_obj_name = f"{scan_id}/xai.png"
+                report_obj_name = f"{scan_id}/report.pdf"
+                xai_raw_obj_name = f"{scan_id}/xai_raw.npy"
                 
                 generate_segmentation_report("PT-ANONYMIZED", scan_id, model_version.id, source_img_path, mask_path, xai_path, report_path)
                 
@@ -674,7 +311,7 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 db.commit()
             
             logger.info(f"Successfully processed 4-modality inference for ID: {scan_id}")
-    
+        
     except Exception as e:
         # Roll back the failed transaction first
         db.rollback()
@@ -691,5 +328,4 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 fresh_db.commit()
         finally:
             fresh_db.close()
-    finally:
         db.close()

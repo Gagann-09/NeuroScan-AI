@@ -7,11 +7,14 @@ with revocation checking for FastAPI dependency injection.
 from functools import lru_cache
 from typing import Optional
 
-from fastapi import Header, HTTPException, status
+from fastapi import Header, HTTPException, status, Depends
 from firebase_admin import auth, initialize_app, credentials, _apps
 from firebase_admin.exceptions import FirebaseError
+from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.db.database import get_db
+from app.db.models import User
 
 
 @lru_cache(maxsize=1)
@@ -78,5 +81,43 @@ async def verify_id_token(authorization: Optional[str] = Header(None)) -> dict:
         )
 
 
+async def get_current_user(
+    token_claims: dict = Depends(verify_id_token),
+    db: Session = Depends(get_db),
+) -> User:
+    """
+    Get or create the User record for the authenticated Firebase user.
+    
+    This dependency should be used by all protected endpoints to get the
+    current user's database record, ensuring ownership enforcement.
+    """
+    firebase_uid = token_claims.get("uid")
+    email = token_claims.get("email")
+    
+    if not firebase_uid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired authentication token",
+        )
+    
+    # Get or create user record
+    user = db.query(User).filter(User.firebase_uid == firebase_uid).first()
+    if not user:
+        user = User(
+            firebase_uid=firebase_uid,
+            email=email,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    else:
+        # Update last_seen_at
+        from datetime import datetime, timezone
+        user.last_seen_at = datetime.now(timezone.utc)
+        db.commit()
+    
+    return user
+
+
 # Backward-compatible alias for dependency injection
-get_current_user = verify_id_token
+get_current_user_claims = verify_id_token

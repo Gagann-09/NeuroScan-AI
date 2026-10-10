@@ -192,6 +192,28 @@ class TestProtectedEndpoint:
         assert response.status_code == 401
         assert response.json()["detail"] == "Invalid or expired authentication token"
 
+    def test_upload_endpoint_requires_auth(self):
+        """POST /api/v1/scans/upload without auth returns 401."""
+        from io import BytesIO
+        
+        files = {
+            "t1": ("t1.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+            "t1ce": ("t1ce.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+            "t2": ("t2.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+            "flair": ("flair.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+        }
+        response = client.post("/api/v1/scans/upload", files=files)
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid or expired authentication token"
+
+    def test_results_endpoint_requires_auth(self):
+        """GET /api/v1/scans/results/{scan_id} without auth returns 401."""
+        response = client.get("/api/v1/scans/results/test-scan-id")
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid or expired authentication token"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

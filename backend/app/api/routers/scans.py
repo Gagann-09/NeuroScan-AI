@@ -12,8 +12,8 @@ from typing import List
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks, Form
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_db, verify_id_token
-from app.db.models import Scan, ModalityFile, Prediction
+from app.api.dependencies import get_db, get_current_user
+from app.db.models import Scan, ModalityFile, Prediction, User
 from app.core.storage import minio_client, get_presigned_url
 from app.services.ai_tasks import process_scan_task
 from app.schemas.scan_schema import UploadRequest, UploadResponse, StatusResponse, ResultsResponse
@@ -49,6 +49,7 @@ async def upload_scan(
     t2: UploadFile = File(...),
     flair: UploadFile = File(...),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     scan_id = str(uuid.uuid4())
     bucket_name = "neuroscan-bucket"
@@ -94,11 +95,12 @@ async def upload_scan(
             uploaded_objects.append(object_name)
             modality_objects[modality] = object_name
 
-        # Create scan record
+        # Create scan record with ownership
         scan_record = Scan(
             id=scan_id,
             filename=f"{scan_id}/source_study",  # Reference to study folder
             status="PENDING",
+            user_id=current_user.firebase_uid,
         )
         db.add(scan_record)
         db.flush()  # Ensure Scan is persisted before ModalityFile FK references it
@@ -140,11 +142,16 @@ async def upload_scan(
 def get_scan_status(
     scan_id: str,
     db: Session = Depends(get_db),
-    current_user: dict = Depends(verify_id_token),
+    current_user: User = Depends(get_current_user),
 ):
     scan = db.query(Scan).filter(Scan.id == scan_id).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
+    
+    # Enforce ownership
+    if scan.user_id != current_user.firebase_uid:
+        raise HTTPException(status_code=403, detail="Access denied: scan belongs to another user")
+    
     return StatusResponse(
         scan_id=scan.id,
         status=scan.status,
@@ -152,10 +159,18 @@ def get_scan_status(
 
 
 @router.get("/results/{scan_id}", response_model=ResultsResponse)
-def get_scan_results(scan_id: str, db: Session = Depends(get_db)):
+def get_scan_results(
+    scan_id: str, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     scan = db.query(Scan).filter(Scan.id == scan_id).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
+
+    # Enforce ownership
+    if scan.user_id != current_user.firebase_uid:
+        raise HTTPException(status_code=403, detail="Access denied: scan belongs to another user")
 
     prediction = db.query(Prediction).filter(Prediction.scan_id == scan_id).first()
 

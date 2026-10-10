@@ -5,6 +5,20 @@ from datetime import datetime
 # Import Base from base.py (declarative base without DB connection)
 from app.db.base import Base
 
+
+class User(Base):
+    """User identity keyed by Firebase UID.
+    
+    Created lazily on first authenticated request. No password or auth credentials stored.
+    """
+    __tablename__ = "users"
+    
+    firebase_uid = Column(String, primary_key=True, index=True)
+    email = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, nullable=True)
+
+
 class Scan(Base):
     __tablename__ = "scans"
     
@@ -18,6 +32,9 @@ class Scan(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     # Track when background processing actually started to detect stale/abandoned attempts
     processing_started_at = Column(DateTime, nullable=True)
+    # Owner of this scan (Firebase UID)
+    user_id = Column(String, ForeignKey("users.firebase_uid"), index=True, nullable=True)
+
 
 class ModalityFile(Base):
     __tablename__ = "modality_files"

@@ -10,6 +10,7 @@ Tests verify that application configuration:
 import os
 import pytest
 from pydantic import ValidationError
+from datetime import timedelta
 
 
 class TestConfigSecurity:
@@ -286,6 +287,114 @@ class TestCORSConfiguration:
         settings = Settings()
         
         assert settings.cors_origins_list == ["http://localhost:3000", "https://app.example.com"]
+
+
+class TestPresignedURLTTLConfiguration:
+    """Test presigned URL TTL configuration."""
+
+    def test_presigned_url_ttl_default(self, monkeypatch):
+        """PRESIGNED_URL_TTL_MINUTES defaults to 15 minutes."""
+        monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
+        monkeypatch.setenv("MINIO_ACCESS_KEY", "testaccess")
+        monkeypatch.setenv("MINIO_SECRET_KEY", "testsecret")
+        monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+        monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000")
+        
+        from app.core.config import Settings
+        settings = Settings()
+        
+        assert settings.PRESIGNED_URL_TTL_MINUTES == 15
+        assert settings.presigned_url_ttl == timedelta(minutes=15)
+
+    def test_presigned_url_ttl_custom(self, monkeypatch):
+        """PRESIGNED_URL_TTL_MINUTES accepts custom values."""
+        monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")
+        monkeypatch.setenv("MINIO_ACCESS_KEY", "testaccess")
+        monkeypatch.setenv("MINIO_SECRET_KEY", "testsecret")
+        monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+        monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000")
+        monkeypatch.setenv("PRESIGNED_URL_TTL_MINUTES", "30")
+        
+        from app.core.config import Settings
+        settings = Settings()
+        
+        assert settings.PRESIGNED_URL_TTL_MINUTES == 30
+        assert settings.presigned_url_ttl == timedelta(minutes=30)
+
+    def test_presigned_url_ttl_rejects_zero(self, monkeypatch):
+        """PRESIGNED_URL_TTL_MINUTES rejects zero."""
+        import importlib
+        import app.core.config
+        importlib.reload(app.core.config)
+        
+        monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
+        monkeypatch.setenv("MINIO_ACCESS_KEY", "testaccess")
+        monkeypatch.setenv("MINIO_SECRET_KEY", "testsecret")
+        monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+        monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000")
+        monkeypatch.setenv("PRESIGNED_URL_TTL_MINUTES", "0")
+        
+        from app.core.config import Settings
+        with pytest.raises(ValidationError) as exc_info:
+            Settings()
+        
+        errors = exc_info.value.errors()
+        assert any(err["loc"][0] == "PRESIGNED_URL_TTL_MINUTES" for err in errors)
+
+    def test_presigned_url_ttl_rejects_negative(self, monkeypatch):
+        """PRESIGNED_URL_TTL_MINUTES rejects negative values."""
+        import importlib
+        import app.core.config
+        importlib.reload(app.core.config)
+        
+        monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
+        monkeypatch.setenv("MINIO_ACCESS_KEY", "testaccess")
+        monkeypatch.setenv("MINIO_SECRET_KEY", "testsecret")
+        monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+        monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000")
+        monkeypatch.setenv("PRESIGNED_URL_TTL_MINUTES", "-5")
+        
+        from app.core.config import Settings
+        with pytest.raises(ValidationError) as exc_info:
+            Settings()
+        
+        errors = exc_info.value.errors()
+        assert any(err["loc"][0] == "PRESIGNED_URL_TTL_MINUTES" for err in errors)
+
+    def test_presigned_url_ttl_rejects_excessive(self, monkeypatch):
+        """PRESIGNED_URL_TTL_MINUTES rejects values > 1440 minutes."""
+        import importlib
+        import app.core.config
+        importlib.reload(app.core.config)
+        
+        monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
+        monkeypatch.setenv("MINIO_ACCESS_KEY", "testaccess")
+        monkeypatch.setenv("MINIO_SECRET_KEY", "testsecret")
+        monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+        monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000")
+        monkeypatch.setenv("PRESIGNED_URL_TTL_MINUTES", "1441")
+        
+        from app.core.config import Settings
+        with pytest.raises(ValidationError) as exc_info:
+            Settings()
+        
+        errors = exc_info.value.errors()
+        assert any(err["loc"][0] == "PRESIGNED_URL_TTL_MINUTES" for err in errors)
+
+    def test_presigned_url_ttl_max_allowed(self, monkeypatch):
+        """PRESIGNED_URL_TTL_MINUTES accepts max allowed value (1440)."""
+        monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
+        monkeypatch.setenv("MINIO_ACCESS_KEY", "testaccess")
+        monkeypatch.setenv("MINIO_SECRET_KEY", "testsecret")
+        monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+        monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000")
+        monkeypatch.setenv("PRESIGNED_URL_TTL_MINUTES", "1440")
+        
+        from app.core.config import Settings
+        settings = Settings()
+        
+        assert settings.PRESIGNED_URL_TTL_MINUTES == 1440
+        assert settings.presigned_url_ttl == timedelta(minutes=1440)
 
 
 if __name__ == "__main__":

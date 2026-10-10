@@ -11,6 +11,7 @@ are retained. Docker Compose provides development credentials for local workflow
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 from pydantic import field_validator, ValidationError
+from datetime import timedelta
 from typing import Union
 
 
@@ -43,6 +44,11 @@ class Settings(BaseSettings):
     # when allow_credentials=True to avoid insecure wildcard with credentials.
     # Provide as comma-separated string, e.g., "http://localhost:3000,https://app.example.com"
     CORS_ORIGINS: str
+
+    # ── Presigned URL ──
+    # TTL for presigned MinIO URLs in minutes.
+    # Default 15 minutes to limit exposure window for leaked URLs.
+    PRESIGNED_URL_TTL_MINUTES: int = 15
 
     model_config = {
         "env_file": ".env",
@@ -110,10 +116,30 @@ class Settings(BaseSettings):
             )
         return v
 
+    @field_validator("PRESIGNED_URL_TTL_MINUTES")
+    @classmethod
+    def validate_presigned_url_ttl(cls, v: int) -> int:
+        """Validate PRESIGNED_URL_TTL_MINUTES is positive and reasonable."""
+        if v <= 0:
+            raise ValueError(
+                "PRESIGNED_URL_TTL_MINUTES must be a positive integer."
+            )
+        # Reasonable upper bound: 24 hours = 1440 minutes
+        if v > 1440:
+            raise ValueError(
+                "PRESIGNED_URL_TTL_MINUTES must not exceed 1440 minutes (24 hours)."
+            )
+        return v
+
     @property
     def cors_origins_list(self) -> list[str]:
         """Return CORS_ORIGINS as a parsed list."""
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+
+    @property
+    def presigned_url_ttl(self) -> timedelta:
+        """Return PRESIGNED_URL_TTL_MINUTES as a timedelta for MinIO."""
+        return timedelta(minutes=self.PRESIGNED_URL_TTL_MINUTES)
 
 
 @lru_cache()

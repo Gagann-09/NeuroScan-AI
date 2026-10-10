@@ -52,6 +52,7 @@ def upload_file_to_minio(file_path: str, object_name: str, bucket_name: str = "n
 
 def get_presigned_url(object_name: str, bucket_name: str = "neuroscan-bucket"):
     try:
-        return _get_minio_client().presigned_get_object(bucket_name, object_name, expires=timedelta(hours=2))
+        settings = get_settings()
+        return _get_minio_client().presigned_get_object(bucket_name, object_name, expires=settings.presigned_url_ttl)
     except Exception:
         return None

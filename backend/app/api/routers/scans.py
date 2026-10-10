@@ -7,7 +7,7 @@ import os
 import uuid
 import shutil
 import logging
-from typing import List
+from typing import List, BinaryIO
 
 from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks, Form
 from sqlalchemy.orm import Session
@@ -21,6 +21,71 @@ from app.schemas.scan_schema import UploadRequest, UploadResponse, StatusRespons
 router = APIRouter(prefix="/api/v1/scans", tags=["scans"])
 
 logger = logging.getLogger(__name__)
+
+# Maximum file size per modality (bytes). BraTS volumes are ~36MB uncompressed,
+# ~5-15MB compressed. Set generous limit to prevent abuse while allowing valid scans.
+MAX_MODALITY_FILE_SIZE = 100 * 1024 * 1024  # 100 MB per modality
+ALLOWED_EXTENSIONS = (".nii", ".nii.gz")
+
+# NIfTI magic numbers for format validation
+NIFTI1_MAGIC = b"ni1"
+NIFTI2_MAGIC = b"n+1"
+GZIP_MAGIC = b"\x1f\x8b"
+
+
+def _validate_nifti_header(file_obj: BinaryIO) -> bool:
+    """
+    Validate NIfTI file format by checking magic bytes.
+    Handles both uncompressed (.nii) and gzipped (.nii.gz) formats.
+    Reads minimal bytes without loading entire file.
+    """
+    # Save current position
+    original_pos = file_obj.tell()
+    try:
+        # Read first 4 bytes for NIfTI-1/2 magic, or first 2 for gzip
+        header = file_obj.read(4)
+        file_obj.seek(0)
+        
+        if len(header) < 4:
+            return False
+        
+        # Check for gzip magic (gzipped NIfTI)
+        if header[:2] == GZIP_MAGIC:
+            # For gzip, we'd need to decompress to check NIfTI magic
+            # For now, accept gzip files with .nii.gz extension
+            return True
+        
+        # Check NIfTI-1 magic (ni1) or NIfTI-2 magic (n+1)
+        if header[:3] == NIFTI1_MAGIC or header[:3] == NIFTI2_MAGIC:
+            return True
+        
+        return False
+    except Exception:
+        return False
+    finally:
+        file_obj.seek(original_pos)
+
+
+def _copyfileobj_with_limit(src: BinaryIO, dst: BinaryIO, limit: int) -> int:
+    """
+    Copy data from src to dst while enforcing a byte limit.
+    Raises HTTPException if limit exceeded.
+    Returns total bytes copied.
+    """
+    total = 0
+    chunk_size = 8192  # 8KB chunks
+    while True:
+        chunk = src.read(chunk_size)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File exceeds maximum allowed size of {limit // (1024*1024)} MB"
+            )
+        dst.write(chunk)
+    return total
 
 
 def _cleanup_source_objects(bucket_name: str, object_names: List[str]) -> None:
@@ -83,9 +148,33 @@ async def upload_scan(
                     detail=f"Modality {modality} must be .nii or .nii.gz format"
                 )
 
+            # Validate NIfTI header before writing to disk
+            if not _validate_nifti_header(file.file):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Modality {modality} is not a valid NIfTI file"
+                )
+
             temp_path = os.path.join("temp_uploads", f"{scan_id}_{modality}{file_type}")
-            with open(temp_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
+
+            # Write file with size limit enforcement
+            total_bytes = 0
+            try:
+                with open(temp_path, "wb") as buffer:
+                    total_bytes = _copyfileobj_with_limit(file.file, buffer, MAX_MODALITY_FILE_SIZE)
+            except HTTPException:
+                # Clean up partial file on size limit exceeded
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise
+
+            # Validate minimum file size (sanity check - empty or tiny files are invalid)
+            if total_bytes < 1024:  # Less than 1KB is suspicious for NIfTI
+                os.remove(temp_path)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Modality {modality} file is too small to be a valid NIfTI volume"
+                )
 
             object_name = f"{scan_id}/source_{modality}{file_type}"
             minio_client.fput_object(bucket_name, object_name, temp_path)

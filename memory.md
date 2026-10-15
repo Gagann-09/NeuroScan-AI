@@ -621,6 +621,55 @@ These must be independently auditable per PRD FR-04 ("preprocessing configuratio
 - All 41 non-database provenance tests pass.
 - No changes to inference, preprocessing, XAI, reports, database schema, or API contracts.
 
+### D-036 --- SG3-F3-G: NIfTI validation verification, regression tests, and restoration of accidentally deleted worker helpers
+
+**Date:** 2026-10-15
+
+**Context:** Verification batch for the SG3-F3 series (MRI upload validation, NIfTI integrity validation, resource bounds, worker-side safety). The previous implementation attempt timed out, leaving five modified files uncommitted. Investigation found that HEAD commit `9aa22c7` (SG3-F3-E, "NIfTI Processing Safety Fix") had accidentally deleted ~434 lines of helper functions from `backend/app/services/ai_tasks.py`. As a result `process_scan_task` referenced undefined names (`claim_scan_for_processing`, `transition_artifact_state`, `create_reference_image`, `generate_clinical_overlays`, `_get_global_model`, `_get_weights_path`, `_get_or_create_model_version`, `_cleanup_derived_objects`, ...) and three test modules (`test_scan_claim.py`, `test_scan_claim_integration.py`, `test_artifact_lifecycle.py`) failed at collection.
+
+**Decision:**
+1. Restore the deleted helper functions verbatim from `HEAD~1` (the last known-good revision), preserving the working-tree NIfTI-validation changes. No ARMT-GAN architecture, weights, modality order, labels, normalization, resizing, or evaluation behavior was changed.
+2. Keep the working-tree fix that changed `SUPPORTED_DTYPES` from scalar types (`{np.float32, ...}`) to `np.dtype` instances. The old set never matched `image.get_data_dtype()` because `np.dtype(np.float32) == np.float32` is `True` but their hashes differ, so set membership returned `False` and every valid file was rejected.
+3. Keep the consolidation of NIfTI validation into the module-level `_validate_nifti_image`, reused by the training, evaluation, volumetric-3D, and worker paths.
+4. Add `backend/tests/test_nifti_safety_regression.py` (Tiny synthetic fixtures and mocks only; 22 tests).
+5. Fix genuinely-stale test setup in `backend/tests/test_auth.py` by supplying the now-required `CORS_ORIGINS` (SG3-F1). `TestConstants` was NOT stale: it failed only because of the deleted helpers and passes again after restoration.
+6. Align the NIfTI-2 contract with the project's actual requirement: NIfTI-2 is not required (BraTS is NIfTI-1). Document `_validate_nifti_image` as NIfTI-1-only (docstring and error message) and replace the strict `xfail` with a test asserting that a valid NIfTI-2 image is rejected.
+7. Record two facts found during the final diff audit: (a) the working tree drops a shadowed duplicate `class BraTSPreprocessor` that `HEAD~1` (SG3-F3-C) introduced and never fixed -- the first definition was fully shadowed by the second, so removal is behavior-preserving; (b) `ai_tasks.py` builds the derived-artifact paths from the outer `tmpdir` while `source_img_path` uses the inner `tmpdirname`.
+
+**Reason:** rules.md #18 ("A failing test blocks the phase") and #20; PRD G7 ("fail closed when required inputs are invalid"); design.md §7 (validate modality completeness/file types before inference). The restoration recovers committed work that was lost by accident; it is not a new feature.
+
+**Verified protections:**
+- Header validation rejects unsupported datatypes, malformed dimensions (fewer than 3 dims; dims over the volume cap), invalid magic, and non-NIfTI objects.
+- Validation uses header metadata only: `get_fdata()` is never called by validation ("validate before full allocation").
+- Training and evaluation segmentation are validated before the payload is materialised.
+- Invalid and truncated reference modalities are rejected before `_get_global_model()` (inference) is invoked.
+- A valid NIfTI-1 file still loads correctly through the training and evaluation helpers.
+
+**Known gaps (unresolved, deliberately not changed in this batch):**
+- Header-only validation does not detect truncated payloads; truncation surfaces only when the data is read (`.get_fdata()` raises). There is no true decompressed-byte limit, only header-based size estimation.
+- The module docstring lists supported dtypes without `float64`, which `SUPPORTED_DTYPES` includes.
+- Reference modalities are loaded again (and re-validated) after `preprocess_brats_study` already loaded them: redundant IO, not a correctness bug.
+- `ai_tasks.py` retains defects carried in from commit `9aa22c7` (not introduced or fixed by this batch): a triplicated `generate_segmentation_report` call with a doubled object-name block, a `db.close()` that runs only on the exception path (session leak on success), and derived-artifact paths built from the outer `tmpdir` while `source_img_path` uses the inner `tmpdirname` (inconsistent, cosmetic).
+- `backend/app/api/routers/scans.py` (the separate upload-header validator) still names `NIFTI2_MAGIC = b"n+1"` (actually the NIfTI-1 single-file magic) and its docstrings say "NIfTI-1 or NIfTI-2", even though it rejects NIfTI-2 in practice. Left unchanged to keep this batch minimal.
+
+**Affected files:**
+- `backend/app/services/ai_tasks.py` (restored helpers; worker-side validation reuse)
+- `backend/ai_pipeline/preprocessing/brats_preprocessing.py` (dtype set; standalone `_validate_nifti_image`)
+- `backend/ai_pipeline/preprocessing/__init__.py` (exports)
+- `backend/ai_pipeline/preprocessing/volumetric_3d/brats_prep.py` (validation before load)
+- `backend/ai_pipeline/training/train_armt_gan.py` (validation before load)
+- `backend/tests/test_nifti_safety_regression.py` (new: 22 tests)
+- `backend/tests/test_auth.py` (required `CORS_ORIGINS` env)
+
+**Status:** Complete (verification). NIfTI-1-only support is now explicit; true decompressed-byte limits and early truncated-payload rejection remain open risks.
+
+**Verification:**
+- Non-database suite: 196 passed, 0 xfailed.
+- `test_nifti_safety_regression.py`: 22 passed, 0 xfailed.
+- `test_provenance_wiring.py`: 14/14 passed (including `TestConstants`).
+- `test_auth.py`, `test_config_security.py`, `test_db_models.py`: 74 passed.
+- The three database-backed modules (`test_scan_claim.py`, `test_artifact_lifecycle.py`, `test_scan_claim_integration.py`; 31 tests) now collect (227 tests collected in `tests/` overall) but require a live PostgreSQL, which is unavailable in this environment; they were excluded from the non-database run. A separate root-level `backend/test_pipeline_direct.py` still fails to import (`MRIScan`/`process_mri_scan` no longer exist) and is outside `tests/`.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

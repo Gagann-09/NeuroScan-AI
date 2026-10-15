@@ -357,11 +357,13 @@ def discover_patients(
 # NIfTI utilities
 # ---------------------------------------------------------------------------
 
+from ai_pipeline.preprocessing import _validate_nifti_image
+
 
 def load_nifti(path: Path) -> np.ndarray:
-    """Load a NIfTI file as float32."""
-
+    """Load a NIfTI file as float32 with validation."""
     image = nib.load(str(path))
+    _validate_nifti_image(image)
     return image.get_fdata(dtype=np.float32)
 
 

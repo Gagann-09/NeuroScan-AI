@@ -17,6 +17,11 @@ from .brats_preprocessing import (
     PreprocessingConfig,
     preprocess_brats_study,
     preprocess_brats_slice_tensor,
+    _validate_nifti_image,
+    MAX_VOLUME_DIMENSION,
+    MAX_VOXEL_COUNT,
+    MAX_DECOMPRESSED_SIZE_MB,
+    SUPPORTED_DTYPES,
 )
 
 __all__ = [
@@ -24,4 +29,9 @@ __all__ = [
     "PreprocessingConfig",
     "preprocess_brats_study",
     "preprocess_brats_slice_tensor",
+    "_validate_nifti_image",
+    "MAX_VOLUME_DIMENSION",
+    "MAX_VOXEL_COUNT",
+    "MAX_DECOMPRESSED_SIZE_MB",
+    "SUPPORTED_DTYPES",
 ]

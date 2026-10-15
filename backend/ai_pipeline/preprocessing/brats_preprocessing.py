@@ -32,7 +32,11 @@ from PIL import Image
 MAX_VOLUME_DIMENSION = 512
 MAX_VOXEL_COUNT = 134_217_728  # 512^3
 MAX_DECOMPRESSED_SIZE_MB = 200  # Max decompressed size per modality in MB
-SUPPORTED_DTYPES = {np.float32, np.int16, np.int32, np.uint8, np.uint16, np.float64}
+# Use dtype instances for proper comparison with nibabel's get_data_dtype()
+SUPPORTED_DTYPES = {
+    np.dtype(np.float32), np.dtype(np.int16), np.dtype(np.int32),
+    np.dtype(np.uint8), np.dtype(np.uint16), np.dtype(np.float64)
+}
 
 # BraTS modality ordering is FIXED and MUST match training
 MODALITY_ORDER = ("t1", "t1ce", "t2", "flair")
@@ -64,6 +68,67 @@ class PreprocessingConfig:
         }
 
 
+def _validate_nifti_image(image: nib.Nifti1Image) -> None:
+    """
+    Validate NIfTI image header and data before loading full volume.
+    Checks dimensions, data type, and estimated memory requirements.
+    This is a standalone function for use outside the BraTSPreprocessor class.
+
+    Only NIfTI-1 volumes are supported. NIfTI-2 (magic ``b'ni2'`` / ``b'n+2'``)
+    is not required by this project and is rejected.
+    """
+    # Check image type (NIfTI-1 only; NIfTI-2 is not supported)
+    if not isinstance(image, nib.Nifti1Image):
+        raise ValueError(f"Unsupported image type: {type(image).__name__}. Only NIfTI-1 supported.")
+    
+    # Validate header magic (NIfTI-1 only: b'ni1' pair, b'n+1' single-file).
+    # NIfTI-2 (b'ni2' / b'n+2') is intentionally rejected.
+    magic = image.header.get('magic', b'')
+    if magic not in (b'ni1', b'n+1'):
+        raise ValueError(
+            f"Invalid NIfTI magic: {magic!r}; only NIfTI-1 (b'ni1'/b'n+1') is "
+            f"supported and NIfTI-2 is not supported."
+        )
+    
+    # Check data type
+    dtype = image.get_data_dtype()
+    if dtype not in SUPPORTED_DTYPES:
+        raise ValueError(
+            f"Unsupported data type: {dtype}. "
+            f"Supported types: {', '.join(str(dt) for dt in SUPPORTED_DTYPES)}"
+        )
+    
+    # Check dimensions
+    shape = image.shape
+    if len(shape) < 3:
+        raise ValueError(f"Expected 3D or 4D volume, got shape {shape}")
+    
+    # Check dimension bounds
+    for i, dim in enumerate(shape[:3]):
+        if dim <= 0:
+            raise ValueError(f"Invalid dimension {i}: {dim} (must be > 0)")
+        if dim > MAX_VOLUME_DIMENSION:
+            raise ValueError(
+                f"Dimension {i} ({dim}) exceeds maximum allowed ({MAX_VOLUME_DIMENSION})"
+            )
+    
+    # Check total voxel count
+    voxel_count = np.prod(shape[:3])
+    if voxel_count > MAX_VOXEL_COUNT:
+        raise ValueError(
+            f"Volume voxel count ({voxel_count:,}) exceeds maximum allowed ({MAX_VOXEL_COUNT:,})"
+        )
+    
+    # Estimate decompressed size and check against limit
+    dtype_size = np.dtype(image.get_data_dtype()).itemsize
+    estimated_size_mb = (voxel_count * dtype_size) / (1024 * 1024)
+    if estimated_size_mb > MAX_DECOMPRESSED_SIZE_MB:
+        raise ValueError(
+            f"Estimated decompressed size ({estimated_size_mb:.1f} MB) "
+            f"exceeds maximum allowed ({MAX_DECOMPRESSED_SIZE_MB} MB)"
+        )
+
+
 class BraTSPreprocessor:
     """
     BraTS preprocessing pipeline.
@@ -106,142 +171,7 @@ class BraTSPreprocessor:
         Validate NIfTI image header and data before loading full volume.
         Checks dimensions, data type, and estimated memory requirements.
         """
-        # Check header magic and type
-        if not isinstance(image, (nib.Nifti1Image, nib.Nifti2Image)):
-            raise ValueError(f"Unsupported image type: {type(image).__name__}. Only NIfTI-1 and NIfTI-2 supported.")
-        
-        # Validate header magic
-        magic = image.header.get('magic', b'')
-        if magic not in (b'ni1', b'n+1'):
-            raise ValueError(f"Invalid NIfTI magic: {magic!r}")
-        
-        # Check data type
-        dtype = image.get_data_dtype()
-        if dtype not in SUPPORTED_DTYPES:
-            raise ValueError(
-                f"Unsupported data type: {dtype}. "
-                f"Supported types: {', '.join(str(dt) for dt in SUPPORTED_DTYPES)}"
-            )
-        
-        # Check dimensions
-        shape = image.shape
-        if len(shape) < 3:
-            raise ValueError(f"Expected 3D or 4D volume, got shape {shape}")
-        
-        # Check dimension bounds
-        for i, dim in enumerate(shape[:3]):
-            if dim <= 0:
-                raise ValueError(f"Invalid dimension {i}: {dim} (must be > 0)")
-            if dim > MAX_VOLUME_DIMENSION:
-                raise ValueError(
-                    f"Dimension {i} ({dim}) exceeds maximum allowed ({MAX_VOLUME_DIMENSION})"
-                )
-        
-        # Check total voxel count
-        voxel_count = np.prod(shape[:3])
-        if voxel_count > MAX_VOXEL_COUNT:
-            raise ValueError(
-                f"Volume voxel count ({voxel_count:,}) exceeds maximum allowed ({MAX_VOXEL_COUNT:,})"
-            )
-        
-        # Estimate decompressed size and check against limit
-        dtype_size = np.dtype(image.get_data_dtype()).itemsize
-        estimated_size_mb = (voxel_count * dtype_size) / (1024 * 1024)
-        if estimated_size_mb > MAX_DECOMPRESSED_SIZE_MB:
-            raise ValueError(
-                f"Estimated decompressed size ({estimated_size_mb:.1f} MB) "
-                f"exceeds maximum allowed ({MAX_DECOMPRESSED_SIZE_MB} MB)"
-            )
-
-
-class BraTSPreprocessor:
-    """
-    BraTS preprocessing pipeline.
-
-    This class encapsulates all preprocessing steps to ensure
-    identical behavior between training and inference.
-    """
-
-    def __init__(self, config: Optional[PreprocessingConfig] = None):
-        self.config = config or PreprocessingConfig()
-
-    def find_modality_file(self, patient_dir: Path, modality: str) -> Optional[Path]:
-        """Find a single modality file in a patient directory."""
-        suffixes = MODALITY_SUFFIXES.get(modality, ())
-        for suffix in suffixes:
-            matches = sorted(patient_dir.glob(f"*{suffix}"))
-            if matches:
-                return matches[0]
-        return None
-
-    def find_segmentation_file(self, patient_dir: Path) -> Optional[Path]:
-        """Find the segmentation file in a patient directory."""
-        for suffix in SEGMENTATION_SUFFIXES:
-            matches = sorted(patient_dir.glob(f"*{suffix}"))
-            if matches:
-                return matches[0]
-        return None
-
-    def load_nifti(self, path: Path) -> np.ndarray:
-        """Load a NIfTI file as float32 with validation."""
-        image = nib.load(str(path))
-        
-        # Validate NIfTI header and data before loading full volume
-        self._validate_nifti_image(image)
-        
-        return image.get_fdata(dtype=np.float32)
-
-    def _validate_nifti_image(self, image: nib.Nifti1Image) -> None:
-        """
-        Validate NIfTI image header and data before loading full volume.
-        Checks dimensions, data type, and estimated memory requirements.
-        """
-        # Check header magic and type
-        if not isinstance(image, (nib.Nifti1Image, nib.Nifti2Image)):
-            raise ValueError(f"Unsupported image type: {type(image).__name__}. Only NIfTI-1 and NIfTI-2 supported.")
-        
-        # Validate header magic
-        magic = image.header.get('magic', b'')
-        if magic not in (b'ni1', b'n+1'):
-            raise ValueError(f"Invalid NIfTI magic: {magic!r}")
-        
-        # Check data type
-        dtype = image.get_data_dtype()
-        if dtype not in SUPPORTED_DTYPES:
-            raise ValueError(
-                f"Unsupported data type: {dtype}. "
-                f"Supported types: {', '.join(str(dt) for dt in SUPPORTED_DTYPES)}"
-            )
-        
-        # Check dimensions
-        shape = image.shape
-        if len(shape) < 3:
-            raise ValueError(f"Expected 3D or 4D volume, got shape {shape}")
-        
-        # Check dimension bounds
-        for i, dim in enumerate(shape[:3]):
-            if dim <= 0:
-                raise ValueError(f"Invalid dimension {i}: {dim} (must be > 0)")
-            if dim > MAX_VOLUME_DIMENSION:
-                raise ValueError(
-                    f"Dimension {i} ({dim}) exceeds maximum allowed ({MAX_VOLUME_DIMENSION})"
-                )
-        
-        # Check total voxel count
-        voxel_count = np.prod(shape[:3])
-        if voxel_count > MAX_VOXEL_COUNT:
-            raise ValueError(
-                f"Volume voxel count ({voxel_count:,}) exceeds maximum allowed ({MAX_VOXEL_COUNT:,})"
-            )
-        
-        # Estimate decompressed size and check against limit
-        dtype_size = np.dtype(image.get_data_dtype()).itemsize
-        estimated_size_mb = (voxel_count * dtype_size) / (1024 * 1024)
-        if estimated_size_mb > MAX_DECOMPRESSED_SIZE_MB:
-            raise ValueError(
-                f"Estimated decompressed size ({estimated_size_mb:.1f} MB) "
-                f"exceeds maximum allowed ({MAX_DECOMPRESSED_SIZE_MB} MB)"
-            )
+        _validate_nifti_image(image)
 
     def normalize_nonzero(self, volume: np.ndarray) -> np.ndarray:
         """

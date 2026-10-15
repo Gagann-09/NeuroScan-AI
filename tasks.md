@@ -254,6 +254,19 @@ Make the prototype safe for controlled demonstration.
 
 No critical security or destructive-data defects remain.
 
+> **SG3-F3 verification note (2026-10-15):** NIfTI upload validation (extension,
+> magic, size), integrity validation, resource bounds, and worker-side
+> validation before inference are implemented and covered by focused regression
+> tests (`backend/tests/test_nifti_safety_regression.py`, plus
+> `tests/test_auth.py::TestUploadValidation`). A pre-existing regression was
+> found and repaired: commit `9aa22c7` had deleted ~434 lines of worker helper
+> functions from `backend/app/services/ai_tasks.py`. Known gaps: truncated
+> payloads are only detected at read time (no true decompressed-byte limit, only
+> header-based estimation). NIfTI-2 is intentionally not supported: validation is
+> documented and tested as NIfTI-1-only (BraTS is NIfTI-1). Database-backed
+> security tests could not be executed because no PostgreSQL instance is
+> available. See `memory.md` D-036.
+
 ------------------------------------------------------------------------
 
 ## P9 --- End-to-End Validation

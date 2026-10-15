@@ -2,13 +2,17 @@
 import nibabel as nib
 import numpy as np
 import torch
+from ai_pipeline.preprocessing import _validate_nifti_image
+
 
 def preprocess_nifti(local_file_path: str) -> torch.Tensor:
     """
     Loads a 3D NIfTI file (.nii), extracts voxel data, applies Z-score 
     normalization to non-background tissue, and converts to a PyTorch tensor.
+    Includes NIfTI validation before loading full volume.
     """
     img = nib.load(local_file_path)
+    _validate_nifti_image(img)
     data = img.get_fdata(dtype=np.float32)
 
     # Z-score normalization strictly on brain tissue (> 0)

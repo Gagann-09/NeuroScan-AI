@@ -22,6 +22,9 @@ os.environ.setdefault("DATABASE_URL", "postgresql+psycopg2://neuroscan_admin:sec
 os.environ.setdefault("MINIO_ACCESS_KEY", "testaccess")
 os.environ.setdefault("MINIO_SECRET_KEY", "testsecret")
 os.environ.setdefault("FIREBASE_PROJECT_ID", "neuroscan-medical-vault")
+# CORS_ORIGINS became a required setting in the SG3-F1 CORS hardening; the app
+# cannot be imported without it. Provide a test origin (not a wildcard).
+os.environ.setdefault("CORS_ORIGINS", "http://localhost:3000")
 
 from app.core.security import verify_id_token
 from app.main import app

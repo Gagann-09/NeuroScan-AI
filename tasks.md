@@ -266,6 +266,21 @@ No critical security or destructive-data defects remain.
 > documented and tested as NIfTI-1-only (BraTS is NIfTI-1). Database-backed
 > security tests could not be executed because no PostgreSQL instance is
 > available. See `memory.md` D-036.
+>
+> **SG3-F3-I implementation note (2026-10-15):** The SG3-F3-H audit findings were
+> implemented. Upload validation now streams gzip in bounded chunks through EOF
+> (verifying the CRC32/ISIZE trailer) under a true 200 MiB decompressed-byte cap,
+> rejects malformed/truncated/concatenated/trailing data, reads the NIfTI-1 magic
+> at its real header offset (344), and checks dims/datatype/voxel-count/
+> `vox_offset`/payload-size consistency using `vox_offset` (so real BraTS
+> `vox_offset != 352` files and uncompressed `.nii` are accepted). The
+> preprocessing validator now bounds every declared dimension and enforces a
+> float32-aware allocation estimate before `get_fdata`, sharing bounds via
+> `_validate_nifti_shape_and_dtype`. The worker preserves the uploaded container
+> so `.nii` and `.nii.gz` both load. Regression tests grew from 22 to 47, incl. a
+> dataset-gated real-BraTS check. Remaining limitation: no real compressed BraTS
+> `.nii.gz` sample or live MinIO here to prove compressed real-data compatibility.
+> See `memory.md` D-037.
 
 ------------------------------------------------------------------------
 

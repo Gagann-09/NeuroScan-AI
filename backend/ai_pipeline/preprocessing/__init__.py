@@ -18,10 +18,12 @@ from .brats_preprocessing import (
     preprocess_brats_study,
     preprocess_brats_slice_tensor,
     _validate_nifti_image,
+    _validate_nifti_shape_and_dtype,
     MAX_VOLUME_DIMENSION,
     MAX_VOXEL_COUNT,
     MAX_DECOMPRESSED_SIZE_MB,
     SUPPORTED_DTYPES,
+    NIFTI1_DTYPE_CODES,
 )
 
 __all__ = [
@@ -30,8 +32,10 @@ __all__ = [
     "preprocess_brats_study",
     "preprocess_brats_slice_tensor",
     "_validate_nifti_image",
+    "_validate_nifti_shape_and_dtype",
     "MAX_VOLUME_DIMENSION",
     "MAX_VOXEL_COUNT",
     "MAX_DECOMPRESSED_SIZE_MB",
     "SUPPORTED_DTYPES",
+    "NIFTI1_DTYPE_CODES",
 ]

@@ -670,6 +670,47 @@ These must be independently auditable per PRD FR-04 ("preprocessing configuratio
 - `test_auth.py`, `test_config_security.py`, `test_db_models.py`: 74 passed.
 - The three database-backed modules (`test_scan_claim.py`, `test_artifact_lifecycle.py`, `test_scan_claim_integration.py`; 31 tests) now collect (227 tests collected in `tests/` overall) but require a live PostgreSQL, which is unavailable in this environment; they were excluded from the non-database run. A separate root-level `backend/test_pipeline_direct.py` still fails to import (`MRIScan`/`process_mri_scan` no longer exist) and is outside `tests/`.
 
+### D-037 --- SG3-F3-I: Bounded NIfTI-1 upload and preprocessing validation
+
+**Date:** 2026-10-15
+
+**Context:** Implementation batch for the SG3-F3-H audit findings. The upload validator buffered the whole gzip payload, checked the header magic at the wrong offset (bytes 0-2 instead of 344), relied on a shallow nibabel load, and had no true decompressed-byte limit. The preprocessing validator bounded only `shape[:3]` and estimated allocation from the stored itemsize. This allowed decompression bombs, truncated/CRC-corrupt/concatenated/trailing-garbage streams, extra-axis inflation, and it rejected valid uncompressed BraTS `.nii` (BraTS2020 ships uncompressed single-file NIfTI-1 with `vox_offset` != 352).
+
+**Decision:**
+1. `backend/app/api/routers/scans.py`: replace whole-payload buffering with bounded streaming gzip validation (`zlib.decompressobj(31)`), reading through EOF so the CRC32/ISIZE trailer is verified, under a true decompressed-byte cap `MAX_DECOMPRESSED_BYTES = MAX_DECOMPRESSED_SIZE_MB * 1024 * 1024` (200 MiB, documented). Malformed, truncated, concatenated, and trailing data are rejected explicitly via `eof`/`unused_data`. No temporary files are written.
+2. Parse the NIfTI-1 header with `struct` (endianness detected from `sizeof_hdr`), read the magic at its real offset (344), require the single-file magic `n+1`, and validate dims, datatype code, bitpix, `vox_offset`, voxel count, and declared-vs-actual payload size using `vox_offset` (not a hard-coded 352). The container (gzip vs raw) must match the declared extension.
+3. `backend/ai_pipeline/preprocessing/brats_preprocessing.py`: extract `_validate_nifti_shape_and_dtype(shape, dtype)` shared by the on-disk and upload validators; bound **every** declared dimension, use `prod(shape)` for the voxel count, and enforce a **float32** allocation estimate (`voxels * 4 bytes`) before `get_fdata(dtype=np.float32)`. Derive `SUPPORTED_DTYPES` from the new `NIFTI1_DTYPE_CODES` map (single source of truth).
+4. `backend/app/services/ai_tasks.py`: the worker preserves the uploaded container (`.nii` or `.nii.gz`) when naming study files, so uncompressed BraTS inputs are loadable end to end.
+5. Extend `backend/tests/test_nifti_safety_regression.py` (22 -> 47 tests) with upload-validator, resource-bound, worker, endpoint-cleanup, and uncompressed-modality tests. Real BraTS2020 `.nii` compatibility is guarded by a dataset-gated (skipped-if-absent), read-only test.
+
+**Reason:** rules.md #18/#20; PRD G7 ("fail closed when required inputs are invalid"); design.md §7 (validate modality completeness/file types before inference). The SG3-F3-H audit confirmed no true decompressed-byte bound and a valid-uncompressed-`.nii` rejection.
+
+**Verified protections / evidence:**
+- `_validate_nifti_header` returns `True` for real BraTS2020 `.nii` (t1 `vox_offset=2880`, seg `vox_offset=2976`) and for the gzipped form of the same volume; `False` for truncated payloads/streams, CRC failure, malformed gzip, trailing garbage, concatenated members, over-limit decompression (patched cap), invalid magic (`n+2`), unsupported datatype code, extension/container mismatch, and inconsistent payload metadata.
+- Preprocessing rejects oversized 4D/5D headers before any `get_fdata` (spied) and still accepts moderate 4D within bounds.
+- The endpoint dispatches a valid uncompressed study and, on an invalid modality, returns 400 while cleaning up previously uploaded objects with no leftover temp files.
+
+**Known limitations (not claimed as solved):**
+- No real compressed BraTS `.nii.gz` sample and no live MinIO are available here; the exact `vox_offset + prod(shape)*itemsize` equality rule was validated against real uncompressed BraTS data and nibabel-generated gzip fixtures, not a real compressed BraTS file.
+- The upload decompressed cap is a documented module constant, not env-configurable.
+- `MAX_DECOMPRESSED_SIZE_MB` remains 200 for the float32 estimate (BraTS ~36 MB float32 is well within it).
+- Decompression is streaming and bounded in bytes, but a single <=200 MiB decompressed stream is still accepted; the voxel/estimate caps are what bound the resulting allocation.
+
+**Affected files:**
+- `backend/app/api/routers/scans.py`
+- `backend/ai_pipeline/preprocessing/brats_preprocessing.py`
+- `backend/ai_pipeline/preprocessing/__init__.py`
+- `backend/app/services/ai_tasks.py`
+- `backend/tests/test_nifti_safety_regression.py`
+
+**Status:** Complete (implementation). Supersedes the D-036 "known gaps" for the upload path: a true decompressed-byte limit and early truncated-payload rejection are now enforced.
+
+**Verification:**
+- `test_nifti_safety_regression.py`: 47 passed (including the dataset-gated real-BraTS test).
+- `test_auth.py`, `test_config_security.py`, `test_db_models.py`, `test_provenance_wiring.py`, `test_preprocessing_parity.py`, `test_nifti_safety_regression.py`: 144 passed.
+- Full non-database suite: 221 passed; the 31 database-backed tests still require a live PostgreSQL (unavailable here).
+- Read-only real-data probe: BraTS2020 t1/seg `.nii` and gzipped t1 accepted.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

@@ -499,7 +499,10 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
         # Download all 4 modalities from MinIO
         with tempfile.TemporaryDirectory() as tmpdir:
             for modality, object_name in modality_objects.items():
-                local_path = os.path.join(tmpdir, f"{modality}.nii.gz")
+                # Preserve the uploaded container so both uncompressed (.nii) and
+                # gzipped (.nii.gz) single-file NIfTI-1 inputs are loadable.
+                suffix = ".nii.gz" if object_name.endswith(".nii.gz") else ".nii"
+                local_path = os.path.join(tmpdir, f"{modality}{suffix}")
                 minio_client.fget_object("neuroscan-bucket", object_name, local_path)
                 local_paths[modality] = local_path
             
@@ -508,8 +511,8 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
             
             # Rename files to match BraTS naming convention expected by preprocessor
             for modality, local_path in local_paths.items():
-                expected_name = f"study_{modality}.nii.gz"
-                expected_path = patient_dir / expected_name
+                suffix = ".nii.gz" if local_path.endswith(".nii.gz") else ".nii"
+                expected_path = patient_dir / f"study_{modality}{suffix}"
                 os.rename(local_path, expected_path)
                 local_paths[modality] = expected_path
             

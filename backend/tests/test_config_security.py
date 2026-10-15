@@ -8,7 +8,9 @@ Tests verify that application configuration:
 - Preserves non-secret configuration behavior
 """
 import os
+import subprocess
 import pytest
+from pathlib import Path
 from pydantic import ValidationError
 from datetime import timedelta
 
@@ -395,6 +397,72 @@ class TestPresignedURLTTLConfiguration:
         
         assert settings.PRESIGNED_URL_TTL_MINUTES == 1440
         assert settings.presigned_url_ttl == timedelta(minutes=1440)
+
+
+class TestAdminCredentialRemoval:
+    """Regression tests for SG3-F5-B: Remove Hardcoded Administrator Credential.
+
+    Verifies the obsolete password-based administrator bootstrap script is
+    removed and that no tracked Python source contains the default
+    administrator password. Identity remains Firebase UID-based
+    (app/core/security.py: get_current_user keys User on firebase_uid from a
+    verified Firebase ID token); no password-based authentication is
+    introduced by this change.
+    """
+
+    PROHIBITED_PASSWORD = "Admin@123!"
+
+    @staticmethod
+    def _repo_root() -> Path:
+        root = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"], text=True
+        ).strip()
+        return Path(root)
+
+    @staticmethod
+    def _tracked_python_files(root: Path):
+        output = subprocess.check_output(
+            ["git", "-C", str(root), "ls-files", "*.py"], text=True
+        )
+        return [root / line for line in output.splitlines() if line.strip()]
+
+    def test_obsolete_admin_bootstrap_script_removed(self):
+        """backend/init_system.py must not exist.
+
+        It hardcoded the default administrator password Admin@123! and
+        bootstrapped a password-based Admin user against columns
+        (password_hash, role) that no longer exist on the User model. No
+        supported workflow depends on it; identity is Firebase UID-based.
+        """
+        backend_dir = Path(__file__).resolve().parent.parent
+        obsolete_script = backend_dir / "init_system.py"
+        assert not obsolete_script.exists(), (
+            "backend/init_system.py still exists. Remove the hardcoded-"
+            "administrator bootstrap path (SG3-F5-B)."
+        )
+
+    def test_no_hardcoded_default_administrator_password_in_tracked_source(self):
+        """No tracked Python source may contain the default administrator password.
+
+        Scans every tracked .py file (this test file is excluded because it
+        intentionally names the prohibited literal). Reads only tracked
+        source; never reads .env and never exposes other secret values.
+        """
+        root = self._repo_root()
+        test_file = Path(__file__).resolve()
+        for path in self._tracked_python_files(root):
+            if not path.exists():
+                # Deleted in the working tree (e.g. the removed bootstrap
+                # script); a deleted file cannot contain a prohibited literal.
+                continue
+            if path.resolve() == test_file:
+                # This test file intentionally names the prohibited literal.
+                continue
+            text = path.read_text(encoding="utf-8")
+            assert self.PROHIBITED_PASSWORD not in text, (
+                f"{path.relative_to(root)} contains the hardcoded default "
+                f"administrator password {self.PROHIBITED_PASSWORD!r}"
+            )
 
 
 if __name__ == "__main__":

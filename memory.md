@@ -817,6 +817,27 @@ Audit findings:
 - Raw hosted job logs require GitHub sign-in (unavailable here); the hosted conclusion, step list, and the failing step's exit code are read from the public REST API.
 - The workflow installs the full `requirements.txt` including the large CUDA `torch` wheel. The job's tests are CPU-only and do not require CUDA (`torch.cuda.is_available()` is never asserted true, and `torchvision` is used only by a non-tested preprocessing helper), so a CPU-only wheel would be lighter -- but no switch was made, as it is outside this task's scope and would require a PyTorch CPU index URL plus a re-verification of the scientific stack.
 
+### D-041 --- Remove hardcoded administrator credential (SG3-F5-B)
+
+**Date:** 2026-10-15
+
+**Context:** `backend/init_system.py` bootstrapped a password-based `Admin` user by hashing a hardcoded default administrator password and creating `User(email, password_hash, role="Admin")`. The current `User` model (migration 006) keys identity on `firebase_uid` and stores no password or auth credentials; the columns `password_hash` and `role` no longer exist, so the script targets a nonexistent schema. Auth is Firebase UID-based (`app/core/security.py::get_current_user` gets/creates `User` from a verified Firebase ID token). The only reference to `init_system.py` was `backend/ingest_datasets.py` (unreferenced dead code that itself imports nonexistent `Patient`/`MRIScan`); nothing in CI, Docker, or scripts runs either script. No supported workflow depends on it.
+
+**Decision:** Delete `backend/init_system.py` (removing the hardcoded-default-administrator-bootstrap path). Do not introduce password-based authentication or bypass the Firebase UID-based identity model. Leave `ingest_datasets.py` unmodified (unsupported dead code, contains no credential). Add a focused regression test in `backend/tests/test_config_security.py::TestAdminCredentialRemoval` asserting (a) `backend/init_system.py` no longer exists and (b) no tracked Python source contains the default administrator password (scanning tracked `.py` via `git ls-files`, excluding the test file itself which names the prohibited literal; never reading `.env`).
+
+**Reason:** rules.md #14 ("No default administrator passwords in committed code"), #9/#17; PRD NFR "Free of hard-coded credentials"; memory.md D-012 ("Credentials must come from environment or secret management"), D-029.
+
+**Affected files:**
+- `backend/init_system.py` (deleted)
+- `backend/tests/test_config_security.py` (added `TestAdminCredentialRemoval`, 2 tests)
+
+**Status:** Complete.
+
+**Verification:**
+- `python -m pytest tests/test_config_security.py -v` from `backend/`: **21 passed** (incl. both new tests). Note: 3 pre-existing `TestConfigSecurity` tests require `CORS_ORIGINS` (provided by CI's workflow env block); they fail in a shell without that var but pass with it, unrelated to this change.
+- Full backend suite `tests/` against an isolated disposable `postgres:16-alpine` (dedicated `neuroscan_ci` DB, CI-only credentials, migrations `001 -> 006`, `alembic upgrade head`): **256 passed, 0 failed**, matching the GitHub Actions procedure (`.github/workflows/backend-tests.yml`).
+- `git diff --check`: clean. No `.env` read; no credentials exposed; no password literal recorded here.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

@@ -239,7 +239,7 @@ Make the prototype safe for controlled demonstration.
 
 ### Tasks
 
--   [ ] Remove default credentials.
+-   [x] Remove default credentials. (SG3-F5-B: deleted obsolete `backend/init_system.py`, which hardcoded the default administrator password and bootstrapped a password-based `Admin` user against nonexistent `password_hash`/`role` columns; identity is Firebase UID-based and no supported workflow depends on the script. Added `TestAdminCredentialRemoval` regression tests in `backend/tests/test_config_security.py`. Full backend suite on disposable PostgreSQL 16: 256 passed, 0 failed.)
 -   [ ] Validate upload types.
 -   [ ] Validate file size.
 -   [ ] Validate modality completeness.

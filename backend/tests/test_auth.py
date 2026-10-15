@@ -564,6 +564,27 @@ class TestCrossUserOwnership:
 class TestUploadValidation:
     """Test upload validation for MRI files."""
 
+    @pytest.fixture(autouse=True)
+    def _reject_upload_auth(self):
+        """Reject authentication without touching Firebase.
+
+        Every test below asserts ``401`` because authentication is supposed to
+        fail before upload validation runs. Nothing here mocks Firebase, so
+        without this fixture ``auth.verify_id_token`` tries to load Application
+        Default Credentials (absent in CI); the resulting
+        ``DefaultCredentialsError`` is not a ``FirebaseError`` and escapes as a
+        500. Patching the Firebase call with ``InvalidIdTokenError`` reproduces
+        the intended "auth fails first" path using the same pattern as the
+        invalid/revoked-token tests above.
+        """
+        from firebase_admin.auth import InvalidIdTokenError
+
+        with patch(
+            "app.core.security.auth.verify_id_token",
+            side_effect=InvalidIdTokenError("Invalid token"),
+        ):
+            yield
+
     def test_upload_rejects_invalid_extension(self):
         """Upload rejects files with invalid extension."""
         from io import BytesIO

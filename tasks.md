@@ -318,6 +318,27 @@ No critical security or destructive-data defects remain.
 > (migrations 001->006; full `tests/` 254 passed; the three DB modules 33 passed;
 > resolution succeeds for CPython 3.11/Linux). See `memory.md` D-039. Unproven:
 > the workflow itself has not run on a GitHub-hosted runner.
+>
+> **SG3-F4-C hosted CI verification note (2026-10-15):** The workflow was
+> exercised on the GitHub-hosted runner. The repository is public, so the run
+> result is readable through the unauthenticated GitHub REST API: push run
+> `38769341345` (head `f39f070`) reached the final step and **failed** --
+> `python -m pytest tests/ -v` returned exit code 2 (a collection error), while
+> every earlier step (checkout, Python 3.11, dependency install, PostgreSQL
+> readiness, schema recreate, `alembic upgrade head`) succeeded. Reproducing the
+> workflow verbatim against the exact pinned stack (Python 3.11.17) and a
+> disposable PostgreSQL 16 container exposed two blockers: (a) `httpx` was
+> undeclared, so `fastapi.testclient` could not be imported and `test_auth.py`
+> aborted collection (exit 2); (b) five `TestUploadValidation` tests asserted 401
+> but never mocked Firebase, so the real `auth.verify_id_token` raised
+> `DefaultCredentialsError` (no ADC on a clean runner), which is not a
+> `FirebaseError` and escaped as a 500. Fix: pin `httpx==0.26.0` in
+> `backend/requirements-dev.txt` (newest release compatible with Starlette
+> 0.36.3's `app=` constructor kwarg) and add a class-scoped autouse fixture to
+> `TestUploadValidation` that makes authentication reject with 401 without ADC
+> (assertions unchanged). Post-fix: `tests/test_auth.py` 28 passed; complete
+> `tests/` 254 passed, 0 failed. See `memory.md` D-040. This resolves the D-039
+> "has not run on a GitHub-hosted runner" limitation.
 
 ------------------------------------------------------------------------
 

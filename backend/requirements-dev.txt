@@ -5,3 +5,10 @@
 # ``@pytest.mark.asyncio`` for the async Firebase auth verification tests.
 pytest==9.1.1
 pytest-asyncio==1.4.0
+
+# httpx is required by fastapi.testclient.TestClient (re-exported from
+# Starlette). Starlette 0.36.3 constructs its transport with ``app=self.app``,
+# a keyword httpx removed in 0.27.0, so the newest compatible release is pinned
+# here (<0.27). Without httpx the test client cannot even be imported, which
+# makes pytest abort test_auth.py collection with exit code 2.
+httpx==0.26.0

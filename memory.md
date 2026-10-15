@@ -783,6 +783,40 @@ Audit findings:
 - The workflow installs the full `requirements.txt` (including the large CUDA `torch` wheel); it is correct but heavyweight.
 - The system interpreter's NumPy/OpenCV versions (2.x / 5.x) differ from the corrected pins, which is why the pin conflict was not caught earlier.
 
+### D-040 --- SG3-F4-C: Hosted CI verification and closed backend test blockers
+
+**Date:** 2026-10-15
+
+**Context:** D-039 left the explicit limitation "the workflow has not run on a GitHub-hosted runner." The repository is public, so the hosted result is readable through the unauthenticated GitHub REST API (no `gh` CLI/token is available here, and raw job logs require sign-in). A push to `main` had already triggered run `38769341345` (run_number 1, head_sha `f39f070095704d3144caefd8a0ee7d11867a8972`), which **failed** on the final step `python -m pytest tests/ -v` with exit code 2 (a collection error). Steps 1-8 (checkout, Python 3.11 setup, dependency install, PostgreSQL readiness, schema recreate, `alembic upgrade head`) all succeeded. Reproducing the workflow verbatim against an isolated disposable PostgreSQL 16 container and the exact pinned dependencies (Python 3.11.17) surfaced two distinct blockers behind exit code 2:
+
+1. `httpx` was not declared in either requirements file. `fastapi.testclient.TestClient` (Starlette) imports `httpx`; its absence makes `tests/test_auth.py` fail at import, which aborts collection of the whole file and yields pytest exit code 2 -- exactly the hosted symptom.
+2. After adding `httpx`, the five `TestUploadValidation` tests failed: they send `Authorization: Bearer valid-token` and assert `401` with the comment "Auth fails first (mocked)", but Firebase is never mocked. With no Application Default Credentials (a clean CI runner), the real `auth.verify_id_token` raises `google.auth.exceptions.DefaultCredentialsError`, which is not a `FirebaseError`, so `app/core/security.py::verify_id_token` does not translate it to 401 and the request returns 500.
+
+**Decision:**
+1. `backend/requirements-dev.txt`: add `httpx==0.26.0`. Starlette 0.36.3 constructs its transport as `httpx.Client(app=self.app, ...)`; httpx removed the `app` argument in 0.27.0, so 0.26.0 is the newest compatible release. Test-only dependency.
+2. `backend/tests/test_auth.py`: add a class-scoped autouse fixture to `TestUploadValidation` that patches `app.core.security.auth.verify_id_token` with `side_effect=InvalidIdTokenError("Invalid token")`, so the endpoint rejects authentication with 401 before upload validation runs, without requiring ADC. The tests' existing `== 401` assertions and intent are unchanged; the fixture mirrors the invalid/revoked-token pattern already used in the same file.
+
+**Reason:** rules.md #3 (step 9, "Update affected source-of-truth records"), #18 ("No task is complete until required tests pass"; "a failing test blocks the phase"), #20; D-038/D-039. Both changes are test-harness/dependency only: no application logic, API contract, database schema, ARMT-GAN architecture, preprocessing, evaluation, or provenance behavior is altered. The upload endpoint's real authentication path is untouched (it is mocked, exactly as the other auth tests already do).
+
+**Affected files:**
+- `backend/requirements-dev.txt` (`httpx==0.26.0` added)
+- `backend/tests/test_auth.py` (`TestUploadValidation` autouse auth-rejection fixture)
+
+**Status:** Complete.
+
+**Verification:**
+- Reproduced the baseline hosted failure locally: exact pinned stack (Python 3.11.17, `requirements.txt` + `requirements-dev.txt`) with no `httpx` -> `ERROR collecting tests/test_auth.py` (`ModuleNotFoundError: No module named 'httpx'`) -> **exit code 2**, matching the hosted annotation.
+- Isolated disposable `postgres:16-alpine` container (dedicated `neuroscan_ci` DB, CI-only credentials, no volume); migrations `001 -> 006` applied with `alembic upgrade head`; the workflow's readiness and schema-recreate steps executed verbatim.
+- Pre-fix, with only `httpx` added: **5 failed, 249 passed** (254 collected) -- the five `TestUploadValidation` tests, all `DefaultCredentialsError`.
+- Post-fix: `tests/test_auth.py` **28 passed**; complete backend suite `tests/`: **254 passed, 0 failed** (2 documented warnings: a Starlette `anyio.abc.BlockingPortal` deprecation and a pre-existing `AsyncMock` coroutine warning in `test_upload_ownership_derived_from_authenticated_identity`).
+- `httpx` compatibility confirmed in-container: `inspect.signature(httpx.Client.__init__)` includes `app`, and `starlette.testclient.TestClient.__init__` passes `app=self.app`; Starlette declares `httpx>=0.22.0`.
+- Dependency resolution for the CI target (CPython 3.11 / `x86_64-unknown-linux-gnu`) was verified in D-039 and is unchanged here.
+- No `.env` was read; no production credentials were used.
+
+**Known limitations:**
+- Raw hosted job logs require GitHub sign-in (unavailable here); the hosted conclusion, step list, and the failing step's exit code are read from the public REST API.
+- The workflow installs the full `requirements.txt` including the large CUDA `torch` wheel. The job's tests are CPU-only and do not require CUDA (`torch.cuda.is_available()` is never asserted true, and `torchvision` is used only by a non-tested preprocessing helper), so a CPU-only wheel would be lighter -- but no switch was made, as it is outside this task's scope and would require a PyTorch CPU index URL plus a re-verification of the scientific stack.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

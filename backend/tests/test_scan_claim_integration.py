@@ -461,6 +461,125 @@ class TestScanClaimIntegration:
             assert complete_artifacts == 0, f"Expected 0 COMPLETE artifacts, got {complete_artifacts}"
 
 
+class TestSessionCleanup:
+    """Verify the primary DB session is always released (on success and failure).
+
+    ``process_scan_task`` opens a session up front. A claim failure returns early
+    while a ``SELECT ... FOR UPDATE`` row lock is still held; if the session is
+    not closed, that lock outlives the call and blocks later writers (observed as
+    a hang in the surrounding suite). These tests track every session created
+    inside the function and assert all of them are closed.
+    """
+
+    @staticmethod
+    def _tracking_session_factory(created, closed):
+        from app.db.database import SessionLocal as RealSessionLocal
+
+        def factory():
+            session = RealSessionLocal()
+            created.append(session)
+            original_close = session.close
+
+            def tracked_close():
+                closed.append(session)
+                original_close()
+
+            session.close = tracked_close
+            return session
+
+        return factory
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    @patch("app.services.ai_tasks.generate_gradient_saliency")
+    @patch("app.services.ai_tasks.generate_clinical_overlays")
+    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks.upload_file_to_minio")
+    def test_successful_processing_closes_primary_session(
+        self,
+        mock_upload_file_to_minio,
+        mock_generate_segmentation_report,
+        mock_generate_clinical_overlays,
+        mock_generate_gradient_saliency,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """A successful run closes the session it opened (no leak)."""
+        import numpy as np
+        from PIL import Image
+        from app.services.xai import XAIProvenance
+
+        scan_id = "test-session-cleanup-001"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = _create_modality_files(db_session, scan_id)
+
+        mock_model = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)
+        mock_get_global_model.return_value = mock_model
+
+        mock_preprocess_brats_study.return_value = (
+            torch.randn(1, 4, 224, 224),
+            torch.randn(1, 1, 224, 224),
+            {"slice_index": 50},
+        )
+        mock_generate_gradient_saliency.return_value = (
+            np.random.rand(1, 1, 224, 224).astype(np.float32),
+            XAIProvenance(model_checkpoint="test.pth", model_version="test-v1"),
+        )
+        mock_generate_clinical_overlays.return_value = (
+            Image.new("RGB", (224, 224)),
+            Image.new("RGB", (224, 224)),
+            True,
+            np.random.rand(224, 224),
+        )
+        mock_minio_client.fget_object.side_effect = _mock_fget_object_creates_file
+
+        created, closed = [], []
+        with patch(
+            "app.services.ai_tasks.SessionLocal",
+            side_effect=self._tracking_session_factory(created, closed),
+        ):
+            process_scan_task(scan_id, modality_objects)
+
+        assert _get_scan_status(db_session, scan_id) == "SEGMENTED"
+        assert len(created) == 1, "success path should open exactly one session"
+        assert closed == created, "the primary session must be closed on success"
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    def test_failed_processing_closes_all_sessions(
+        self,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """A failed run closes both the primary and the FAILED-marking session."""
+        scan_id = "test-session-cleanup-002"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = _create_modality_files(db_session, scan_id)
+
+        mock_get_global_model.return_value = MagicMock()
+        mock_minio_client.fget_object.side_effect = _mock_fget_object_creates_file
+        mock_preprocess_brats_study.side_effect = Exception("Preprocessing failed")
+
+        created, closed = [], []
+        with patch(
+            "app.services.ai_tasks.SessionLocal",
+            side_effect=self._tracking_session_factory(created, closed),
+        ):
+            process_scan_task(scan_id, modality_objects)
+
+        assert _get_scan_status(db_session, scan_id) == "FAILED"
+        assert len(created) == 2, "failure path opens a primary and a fresh session"
+        assert all(s in closed for s in created), "every session must be closed on failure"
+        assert len(closed) == len(created)
+
+
 # Pytest fixture for database session
 @pytest.fixture
 def db_session() -> Session:
@@ -498,10 +617,13 @@ class TestUploadCompensation:
         import tempfile
         import os
 
-        # Create minimal valid NIfTI content
+        # Create minimal valid NIfTI content. Use incompressible (random) data of a
+        # realistic size: an all-zero volume gzips far below the endpoint's 1 KB
+        # minimum-size guard, so it would be rejected as "too small".
         import nibabel as nib
         import numpy as np
-        data = np.zeros((10, 10, 10), dtype=np.float32)
+        rng = np.random.RandomState(0)
+        data = rng.rand(32, 32, 32).astype(np.float32)
         affine = np.eye(4)
         img = nib.Nifti1Image(data, affine)
 
@@ -527,10 +649,11 @@ class TestUploadCompensation:
         return files
 
     def _get_test_client_with_db(self, db_session):
-        """Create a TestClient with the database dependency overridden."""
+        """Create a TestClient with DB and authenticated-user dependencies overridden."""
         from fastapi.testclient import TestClient
         from app.main import app
-        from app.api.dependencies import get_db
+        from app.api.dependencies import get_db, get_current_user
+        from app.db.models import User
 
         def override_get_db():
             try:
@@ -538,7 +661,21 @@ class TestUploadCompensation:
             finally:
                 pass  # Don't close - fixture handles it
 
+        # The S3 ownership batch (823e84f) added get_current_user to /upload, but
+        # these compensation tests were never updated to authenticate, so every
+        # request returned 401. Supply a persisted identity so the endpoint (and
+        # its scans.user_id FK) can be exercised as intended.
+        user = db_session.query(User).filter(User.firebase_uid == "test-upload-user").first()
+        if user is None:
+            user = User(firebase_uid="test-upload-user", email="test-upload@example.com")
+            db_session.add(user)
+            db_session.commit()
+
+        def override_get_current_user():
+            return user
+
         app.dependency_overrides[get_db] = override_get_db
+        app.dependency_overrides[get_current_user] = override_get_current_user
         client = TestClient(app)
         return client, app
 

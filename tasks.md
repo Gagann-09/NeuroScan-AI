@@ -281,6 +281,25 @@ No critical security or destructive-data defects remain.
 > dataset-gated real-BraTS check. Remaining limitation: no real compressed BraTS
 > `.nii.gz` sample or live MinIO here to prove compressed real-data compatibility.
 > See `memory.md` D-037.
+>
+> **SG3-F4-A verification note (2026-10-15):** The three database-backed suites
+> (`test_scan_claim.py`, `test_artifact_lifecycle.py`,
+> `test_scan_claim_integration.py`) now run and pass against an isolated
+> PostgreSQL 16 instance (dedicated `neuroscan_test` database, migrations
+> 001 -> 006 via `alembic upgrade head`; no dev/prod data touched). Confirmed and
+> fixed: (a) `process_scan_task` leaked its primary DB session on every
+> non-exception exit -- `db.close()` ran only in the `except` block, so the early
+> "claim failed" return kept a `FOR UPDATE` row lock open and deadlocked the
+> suite; the session is now closed in a `finally`. (b) The triplicated
+> `generate_segmentation_report` call (with a doubled object-name block) was
+> reduced to one; tracing showed the only side effect was overwriting the same
+> PDF, so no duplicate artifacts/rows were produced. (c) Two pre-existing
+> test-harness regressions were repaired: `TestUploadCompensation` now
+> authenticates (the S3 batch `823e84f` added `get_current_user` to `/upload`
+> without updating the helper) and its NIfTI fixture is large enough to clear
+> the 1 KB minimum-size guard added in `9f11037`. Added `TestSessionCleanup`
+> (success + failure cleanup). Full backend suite `tests/`: 254 passed.
+> See `memory.md` D-038.
 
 ------------------------------------------------------------------------
 

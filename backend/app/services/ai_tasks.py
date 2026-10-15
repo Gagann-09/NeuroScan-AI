@@ -624,21 +624,13 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 seg_final_pil.save(mask_path)
                 xai_final_pil.save(xai_path)
                 
+                # A single PDF is written to report_path and uploaded once below.
                 generate_segmentation_report("PT-ANONYMIZED", scan_id, model_version.id, source_img_path, mask_path, xai_path, report_path)
                 
                 mask_obj_name = f"{scan_id}/mask.png"
                 xai_obj_name = f"{scan_id}/xai.png"
                 report_obj_name = f"{scan_id}/report.pdf"
                 xai_raw_obj_name = f"{scan_id}/xai_raw.npy"
-                
-                generate_segmentation_report("PT-ANONYMIZED", scan_id, model_version.id, source_img_path, mask_path, xai_path, report_path)
-                
-                mask_obj_name = f"{scan_id}/mask.png"
-                xai_obj_name = f"{scan_id}/xai.png"
-                report_obj_name = f"{scan_id}/report.pdf"
-                xai_raw_obj_name = f"{scan_id}/xai_raw.npy"
-                
-                generate_segmentation_report("PT-ANONYMIZED", scan_id, model_version.id, source_img_path, mask_path, xai_path, report_path)
                 
                 # Upload derived artifacts to MinIO, tracking successful uploads for compensation
                 uploaded_derived: list[str] = []
@@ -722,4 +714,7 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
                 fresh_db.commit()
         finally:
             fresh_db.close()
+    finally:
+        # Always release the primary session, including the early-return paths
+        # (claim failed) that otherwise leaked it and held its row lock.
         db.close()

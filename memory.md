@@ -711,6 +711,43 @@ These must be independently auditable per PRD FR-04 ("preprocessing configuratio
 - Full non-database suite: 221 passed; the 31 database-backed tests still require a live PostgreSQL (unavailable here).
 - Read-only real-data probe: BraTS2020 t1/seg `.nii` and gzipped t1 accepted.
 
+### D-038 --- SG3-F4-A: PostgreSQL integration verification, worker session-leak fix, and report dedup
+
+**Date:** 2026-10-15
+
+**Context:** Verification batch for the three database-backed suites (`test_scan_claim.py`, `test_scan_claim_integration.py`, `test_artifact_lifecycle.py`). No PostgreSQL was running locally (no service, no listener on 5432, no server binaries; the Docker daemon was stopped). Docker Desktop was started and an isolated, throwaway PostgreSQL 16 container was used (dedicated `neuroscan_test` database, no shared volume), so no dev/production data was touched. Migrations 001 -> 006 were applied with `alembic upgrade head` before running the suites.
+
+Audit findings:
+1. `process_scan_task` opened a session and closed it only on the exception path (`db.close()` was inside the `except`). Every other exit -- success and the early `return` when the claim failed -- leaked the session. The early-return leak is a correctness bug, not just hygiene: `claim_scan_for_processing` runs `SELECT ... FOR UPDATE NOWAIT`, so the leaked session kept the row lock open and deadlocked the suite's fixture teardown. Observed: the run hung on `test_already_processing_scan_exits_early` before the fix.
+2. `generate_segmentation_report` was called three times with identical arguments, with the object-name block duplicated twice. Side-effect trace: the function only writes one PDF to `report_path` (overwrite), so there were no duplicate artifacts or DB rows -- only redundant image IO. The triplication is a copy-paste artifact.
+3. `TestUploadCompensation` returned HTTP 401 because the S3 ownership batch (`823e84f`, 2026-10-10) added `get_current_user` to `/upload` but never updated the test client helper to authenticate.
+4. The same tests' NIfTI fixture (all-zero 10x10x10) gzips below the endpoint's 1 KB minimum-size guard added in `9f11037` (SG3-F3, 2026-10-10), so uploads were rejected as "too small".
+
+**Decision:**
+1. `backend/app/services/ai_tasks.py`: always release the primary session in a `finally` block (removed the exception-only `db.close()`), covering success, failure, and every early-return claim outcome and releasing the row lock.
+2. `backend/app/services/ai_tasks.py`: call `generate_segmentation_report` exactly once and keep a single object-name block.
+3. `backend/tests/test_scan_claim_integration.py`: override `get_current_user` with a persisted test identity in `_get_test_client_with_db`, and enlarge the upload fixture to incompressible 32x32x32 data so it clears the size guard. Test-harness only; no production or API-contract change.
+4. `backend/tests/test_scan_claim_integration.py`: add `TestSessionCleanup` (2 tests) asserting the primary session is closed on success and that all sessions are closed on failure.
+
+**Reason:** rules.md #17/#18/#20; PRD G7; design.md §7. The session leak contradicted the row-lock claim design (D-035) and blocked the DB-backed suite; a failing test blocks the phase. Transaction boundaries and artifact provenance are preserved: the `finally` only closes the session after `commit()`/error handling completes, and the fresh FAILED-marking transaction is unchanged.
+
+**Affected files:**
+- `backend/app/services/ai_tasks.py` (`finally: db.close()`; single report call)
+- `backend/tests/test_scan_claim_integration.py` (`TestSessionCleanup`; upload helper auth + fixture size)
+
+**Status:** Complete.
+
+**Verification:**
+- Isolated PostgreSQL 16 (ephemeral Docker container, dedicated `neuroscan_test` DB, migrations 001->006) with test-only env values for DATABASE_URL/MINIO/FIREBASE_PROJECT_ID/CORS_ORIGINS.
+- Focused suites: `test_scan_claim.py` 7/7, `test_artifact_lifecycle.py` 9/9, `test_scan_claim_integration.py` 17/17 (the file was hanging before the fix; 5 upload tests were returning 401).
+- Full backend suite `tests/`: **254 passed**, 0 failed.
+- No production credentials read or exposed; `.env` was not read; the dev compose volume was untouched.
+
+**Known limitations:**
+- Verification used a throwaway container, not the compose `postgres_data` volume; CI must provision an equivalent disposable PostgreSQL.
+- `TestUploadCompensation` uses an overridden `get_current_user` (no real Firebase token), consistent with the other integration tests.
+- Pre-existing and unchanged: derived-artifact temp paths use the outer `tmpdir` while `source_img_path` uses the inner `tmpdirname` (cosmetic); `backend/test_pipeline_direct.py` (outside `tests/`) still fails to import (`MRIScan`/`process_mri_scan` removed).
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

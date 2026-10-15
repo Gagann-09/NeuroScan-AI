@@ -26,7 +26,7 @@ os.environ.setdefault("FIREBASE_PROJECT_ID", "neuroscan-medical-vault")
 # cannot be imported without it. Provide a test origin (not a wildcard).
 os.environ.setdefault("CORS_ORIGINS", "http://localhost:3000")
 
-from app.core.security import verify_id_token
+from app.core.security import verify_id_token, get_current_user
 from app.main import app
 
 
@@ -677,6 +677,110 @@ class TestUploadValidation:
         )
         
         assert response.status_code == 401  # Auth fails first (mocked)
+
+
+class TestInfrastructureErrorHandling:
+    """Test that Firebase and database infrastructure errors are handled safely.
+
+    These tests verify that server-side infrastructure failures (missing ADC,
+    Firebase service errors, database errors) return safe 503 responses with
+    generic messages, without leaking internal exception details, credentials,
+    or stack traces to clients.
+    """
+
+    def _clear_firebase_cache(self):
+        """Clear the lru_cache on _get_firebase_app and Firebase app registry."""
+        import firebase_admin
+        from app.core.security import _get_firebase_app
+        _get_firebase_app.cache_clear()
+        firebase_admin._apps.clear()
+
+    @pytest.mark.asyncio
+    async def test_missing_adc_returns_503(self):
+        """Missing Application Default Credentials returns 503, not 500."""
+        from google.auth.exceptions import DefaultCredentialsError
+
+        self._clear_firebase_cache()
+
+        with patch("app.core.security.credentials.ApplicationDefault", side_effect=DefaultCredentialsError("ADC not found")):
+            with pytest.raises(HTTPException) as exc_info:
+                await verify_id_token(authorization="Bearer some-token")
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail == "Authentication service temporarily unavailable"
+        # Verify no internal details leaked
+        assert "ADC not found" not in exc_info.value.detail
+        assert "DefaultCredentialsError" not in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_firebase_init_failure_returns_503(self):
+        """Firebase initialization failure returns 503, not 500."""
+
+        self._clear_firebase_cache()
+
+        with patch("app.core.security.initialize_app", side_effect=ValueError("Project ID mismatch")):
+            with pytest.raises(HTTPException) as exc_info:
+                await verify_id_token(authorization="Bearer some-token")
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail == "Authentication service temporarily unavailable"
+        # Verify no internal details leaked
+        assert "Project ID mismatch" not in exc_info.value.detail
+        assert "ValueError" not in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_google_auth_error_during_verify_returns_503(self):
+        """GoogleAuthError (network, timeout) during token verification returns 503."""
+        from google.auth.exceptions import TransportError
+
+        self._clear_firebase_cache()
+
+        with patch("app.core.security.auth.verify_id_token", side_effect=TransportError("Network unreachable")):
+            with pytest.raises(HTTPException) as exc_info:
+                await verify_id_token(authorization="Bearer some-token")
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail == "Authentication service temporarily unavailable"
+        # Verify no internal details leaked
+        assert "Network unreachable" not in exc_info.value.detail
+        assert "TransportError" not in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_timeout_error_during_verify_returns_503(self):
+        """TimeoutError during token verification returns 503."""
+        from google.auth.exceptions import TimeoutError
+
+        self._clear_firebase_cache()
+
+        with patch("app.core.security.auth.verify_id_token", side_effect=TimeoutError("Request timed out")):
+            with pytest.raises(HTTPException) as exc_info:
+                await verify_id_token(authorization="Bearer some-token")
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail == "Authentication service temporarily unavailable"
+
+    @pytest.mark.asyncio
+    async def test_database_error_in_get_current_user_returns_503(self):
+        """Database error during user lookup/creation returns 503."""
+        from sqlalchemy.exc import OperationalError
+        from unittest.mock import MagicMock
+
+        self._clear_firebase_cache()
+
+        mock_claims = {"uid": "test-uid", "email": "test@example.com"}
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.side_effect = OperationalError("DB connection failed", None, None)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_user(token_claims=mock_claims, db=mock_db)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail == "Authentication service temporarily unavailable"
+        # Verify no internal details leaked
+        assert "DB connection failed" not in exc_info.value.detail
+        assert "OperationalError" not in exc_info.value.detail
+        # Verify rollback was called
+        mock_db.rollback.assert_called_once()
 
 
 if __name__ == "__main__":

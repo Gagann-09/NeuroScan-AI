@@ -859,6 +859,41 @@ Audit findings:
 - Full backend suite `tests/` against an isolated disposable `postgres:16-alpine` (dedicated `neuroscan_ci` DB, CI-only credentials, migrations `001 -> 006`, `alembic upgrade head`): **257 passed, 0 failed**, matching the GitHub Actions procedure.
 - `git diff --check`: clean. No `.env` read; no credentials exposed.
 
+### D-043 --- Firebase infrastructure error handling (SG3-F5-D)
+
+**Date:** 2026-10-15
+
+**Context:** The Firebase authentication path in `backend/app/core/security.py` had four infrastructure error handling defects:
+1. Missing Application Default Credentials (ADC) raised `google.auth.exceptions.DefaultCredentialsError`, which is not a `FirebaseError`, causing unhandled 500 with exception details leaked.
+2. Firebase Admin SDK initialization failures (project ID mismatch, config errors) raised generic exceptions, causing unhandled 500.
+3. Google Auth infrastructure errors during token verification (`TransportError`, `TimeoutError`, etc.) are `GoogleAuthError` subclasses, not `FirebaseError`, causing unhandled 500.
+4. Database errors during user lookup/creation in `get_current_user` raised `SQLAlchemyError`, causing unhandled 500 with connection details leaked.
+
+All four cases represented server-side infrastructure failures that should fail closed with a safe 503 response, not be misrepresented as invalid user credentials (401) or leak internal details.
+
+**Decision:** Update `backend/app/core/security.py` to:
+1. In `_get_firebase_app()`: Catch `GoogleAuthError` (covers missing ADC, invalid credentials) and generic `Exception` (covers project ID mismatch, config errors), log with `exc_info=True` for operators, raise `HTTPException 503` with generic message.
+2. In `verify_id_token()`: Catch `GoogleAuthError` during `auth.verify_id_token()` separately from `FirebaseError`. Token validation failures (`FirebaseError`) → 401 generic. Infrastructure failures (`GoogleAuthError`) → 503 generic. Log both with appropriate levels.
+3. In `get_current_user()`: Wrap database operations in `try/except SQLAlchemyError`, log with `exc_info=True`, rollback, raise `HTTPException 503` generic.
+4. Add structured logging for operator diagnosis without exposing credentials, tokens, or medical data.
+5. Add regression tests in `backend/tests/test_auth.py::TestInfrastructureErrorHandling` (5 tests) covering: missing ADC, init failure, GoogleAuthError during verify, timeout during verify, database error in get_current_user. All verify 503 status, generic message, and no detail leakage.
+
+Preserve existing behavior: invalid/expired/revoked tokens → 401 generic; missing/malformed bearer → 401 generic; valid tokens → decoded claims; cross-user ownership enforcement unchanged.
+
+**Reason:** rules.md #14 (fail closed, no sensitive data in logs), #12 (no auth bypass), PRD G7 (fail closed when inputs invalid), memory.md D-012 (credentials from environment). Firebase infrastructure/configuration failures must not be misrepresented as invalid user credentials. Never return exception strings, tokens, credential contents, project secrets, or stack traces to clients.
+
+**Affected files:**
+- `backend/app/core/security.py` (added GoogleAuthError/SQLAlchemyError handling, logging, 503 responses)
+- `backend/tests/test_auth.py` (added `TestInfrastructureErrorHandling` with 5 regression tests)
+
+**Status:** Complete.
+
+**Verification:**
+- `python -m pytest tests/test_auth.py tests/test_config_security.py -v` from `backend/`: **55 passed** (incl. 5 new infrastructure tests).
+- All non-database backend tests pass (224 tests across test_auth, test_config_security, test_db_models, test_provenance_wiring, test_preprocessing_parity, test_nifti_safety_regression, test_xai, test_robustness_attacks, test_evaluation_protocol).
+- `git diff --check`: clean (trailing whitespace fixed).
+- Defect verification: manual tests confirm missing ADC, init failure, GoogleAuthError, and database errors all return 503 with "Authentication service temporarily unavailable" and no internal details leaked.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

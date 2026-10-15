@@ -277,6 +277,27 @@ class TestCORSConfiguration:
         error_msg = str(exc_info.value)
         assert "cannot be ['*']" in error_msg or "wildcard" in error_msg.lower()
 
+    def test_cors_origins_rejects_mixed_wildcard_and_explicit_origins(self, monkeypatch):
+        """CORS_ORIGINS cannot contain '*' even alongside explicit origins."""
+        import importlib
+        import app.core.config
+        importlib.reload(app.core.config)
+
+        monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/test")
+        monkeypatch.setenv("MINIO_ACCESS_KEY", "testaccess")
+        monkeypatch.setenv("MINIO_SECRET_KEY", "testsecret")
+        monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
+        monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000,*,https://app.example.com")
+
+        from app.core.config import Settings
+        with pytest.raises(ValidationError) as exc_info:
+            Settings()
+
+        errors = exc_info.value.errors()
+        assert any(err["loc"][0] == "CORS_ORIGINS" for err in errors)
+        error_msg = str(exc_info.value)
+        assert "wildcard" in error_msg.lower()
+
     def test_cors_origins_accepts_explicit_origins(self, monkeypatch):
         """CORS_ORIGINS accepts explicit list of trusted origins."""
         monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/testdb")

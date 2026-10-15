@@ -838,6 +838,27 @@ Audit findings:
 - Full backend suite `tests/` against an isolated disposable `postgres:16-alpine` (dedicated `neuroscan_ci` DB, CI-only credentials, migrations `001 -> 006`, `alembic upgrade head`): **256 passed, 0 failed**, matching the GitHub Actions procedure (`.github/workflows/backend-tests.yml`).
 - `git diff --check`: clean. No `.env` read; no credentials exposed; no password literal recorded here.
 
+### D-042 --- Reject wildcards anywhere in CORS origins (SG3-F5-C)
+
+**Date:** 2026-10-15
+
+**Context:** `backend/app/core/config.py::validate_cors_origins` rejected CORS wildcard only when the parsed list was exactly `["*"]` (singleton `"*"`). A mixed list such as `"http://localhost:3000,*,https://app.example.com"` → `["http://localhost:3000", "*", "https://app.example.com"]` passed validation and would be handed to `CORSMiddleware` with `allow_credentials=True` in `backend/app/main.py`, effectively allowing arbitrary origins alongside trusted ones. rules.md #14: "No wildcard CORS for production."
+
+**Decision:** Update `validate_cors_origins` to reject any origin list containing `"*"`, including mixed wildcard-plus-explicit-origin lists. Preserve valid explicit-origin configurations and existing comma-separated parsing semantics. Validation runs in the pydantic field validator at `Settings()` instantiation (`get_settings()`), which is called before `CORSMiddleware` is configured in `main.py`, so rejection occurs before middleware setup. Add regression test `test_cors_origins_rejects_mixed_wildcard_and_explicit_origins` alongside the existing singleton-wildcard and valid-explicit-origins tests in `TestCORSConfiguration`. No changes to authentication, frontend behavior, or unrelated security findings.
+
+**Reason:** rules.md #14 ("No wildcard CORS for production"); PRD G7 ("fail closed when required inputs are invalid").
+
+**Affected files:**
+- `backend/app/core/config.py` (`validate_cors_origins`: `if "*" in origins`)
+- `backend/tests/test_config_security.py` (added `test_cors_origins_rejects_mixed_wildcard_and_explicit_origins`)
+
+**Status:** Complete.
+
+**Verification:**
+- `python -m pytest tests/test_config_security.py -v` from `backend/`: **22 passed** (incl. new mixed-wildcard test). Note: 3 pre-existing `TestConfigSecurity` tests require `CORS_ORIGINS` (provided by CI's workflow env block); they fail in a shell without that var but pass with it, unrelated to this change.
+- Full backend suite `tests/` against an isolated disposable `postgres:16-alpine` (dedicated `neuroscan_ci` DB, CI-only credentials, migrations `001 -> 006`, `alembic upgrade head`): **257 passed, 0 failed**, matching the GitHub Actions procedure.
+- `git diff --check`: clean. No `.env` read; no credentials exposed.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

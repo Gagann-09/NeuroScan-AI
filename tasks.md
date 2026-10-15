@@ -243,7 +243,7 @@ Make the prototype safe for controlled demonstration.
 -   [ ] Validate upload types.
 -   [ ] Validate file size.
 -   [ ] Validate modality completeness.
--   [ ] Restrict CORS.
+-   [x] Restrict CORS. (SG3-F5-C: `backend/app/core/config.py::validate_cors_origins` now rejects any origin list containing `"*"`, including mixed wildcard-plus-explicit-origin lists, not just a singleton `["*"]`. Validation runs at `Settings()` instantiation before `CORSMiddleware` is configured in `main.py`. Added `test_cors_origins_rejects_mixed_wildcard_and_explicit_origins` regression test. Full backend suite on disposable PostgreSQL 16: 257 passed, 0 failed.)
 -   [ ] Add authentication enforcement.
 -   [ ] Add authorization checks.
 -   [ ] Sanitize logs.

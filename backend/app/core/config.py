@@ -108,10 +108,11 @@ class Settings(BaseSettings):
             raise ValueError(
                 "CORS_ORIGINS must contain at least one origin."
             )
-        # Explicitly reject wildcard when credentials are used (allow_credentials=True in middleware)
-        if origins == ["*"]:
+        # Explicitly reject wildcard when credentials are used (allow_credentials=True in middleware).
+        # Reject any list containing '*', including mixed wildcard-plus-explicit-origin lists.
+        if "*" in origins:
             raise ValueError(
-                "CORS_ORIGINS cannot be ['*'] when allow_credentials=True. "
+                "CORS_ORIGINS cannot contain a wildcard origin '*' when allow_credentials=True. "
                 "Explicitly list trusted origins instead."
             )
         return v

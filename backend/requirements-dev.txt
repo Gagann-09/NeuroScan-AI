@@ -1,0 +1,7 @@
+# Test-only dependencies (CI and local development).
+# Runtime/production dependencies are pinned in requirements.txt.
+#
+# pytest-asyncio is required by backend/tests/test_auth.py, which uses
+# ``@pytest.mark.asyncio`` for the async Firebase auth verification tests.
+pytest==9.1.1
+pytest-asyncio==1.4.0

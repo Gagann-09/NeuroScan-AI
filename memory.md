@@ -748,6 +748,41 @@ Audit findings:
 - `TestUploadCompensation` uses an overridden `get_current_user` (no real Firebase token), consistent with the other integration tests.
 - Pre-existing and unchanged: derived-artifact temp paths use the outer `tmpdir` while `source_img_path` uses the inner `tmpdirname` (cosmetic); `backend/test_pipeline_direct.py` (outside `tests/`) still fails to import (`MRIScan`/`process_mri_scan` removed).
 
+### D-039 --- SG3-F4-B: PostgreSQL-backed backend CI workflow
+
+**Date:** 2026-10-15
+
+**Context:** D-038 left the explicit limitation "CI must provision an equivalent disposable PostgreSQL." Auditing the repository showed **no CI provider was configured** (no `.github/`, `.gitlab-ci.yml`, `Jenkinsfile`, Azure Pipelines, CircleCI, or Travis config). The only remote is GitHub (`Gagan-09/NeuroScan-AI`), so GitHub Actions is the smallest compatible provider. Three further blockers to a runnable CI were found:
+
+1. `backend/requirements.txt` was **unsatisfiable**: `opencv-python-headless==5.0.0.93` declares `numpy>=2` for Python >=3.9, but the file pins `numpy==1.26.3` (needed by the frozen `torch==2.2.0` scientific stack, which predates NumPy 2). `pip install` fails with `ResolutionImpossible`. The OpenCV pin was introduced (commit `7c947e4`) alongside the NumPy pin and was never verified to install.
+2. `alembic` was **not declared** anywhere, yet running migrations is required to build the schema.
+3. `pytest` (and `pytest-asyncio`, required by `tests/test_auth.py`) were **not declared**; the suite is not runnable from a clean environment.
+
+**Decision:**
+1. Add `.github/workflows/backend-tests.yml`: a single job that provisions an isolated, disposable `postgres:16-alpine` service container (fresh per run, no volume) with **CI-only credentials** and a **dedicated test database** (`neuroscan_ci`), waits for readiness via the service health check plus an explicit `psycopg2` poll, recreates the `public` schema, applies `alembic upgrade head`, and runs the complete backend suite `python -m pytest tests/ -v`. No step reads `.env`; every required setting is supplied by the workflow `env` block. No production database or credentials are referenced.
+2. Add `backend/requirements-dev.txt` pinning `pytest` and `pytest-asyncio` (test-only deps).
+3. Correct `opencv-python-headless` to `4.11.0.86` (supports `numpy>=1.23.5`, same `cv2` surface used by the overlay renderer) and add `alembic==1.13.2` to `requirements.txt`.
+
+**Reason:** rules.md #17 ("Schema evolution must be migration-based"), #18 ("No task is complete until required tests pass"), #20; D-038 ("CI must provision an equivalent disposable PostgreSQL"). The three database suites depend on PostgreSQL row-level locking (`SELECT ... FOR UPDATE NOWAIT`) and must never be substituted with SQLite. The OpenCV pin correction is a rendering-library version change only; ARMT-GAN architecture, modalities, labels, normalization, resizing, evaluation, database schema, and API contracts are untouched.
+
+**Affected files:**
+- `.github/workflows/backend-tests.yml` (new: PostgreSQL CI job)
+- `backend/requirements-dev.txt` (new: pytest, pytest-asyncio)
+- `backend/requirements.txt` (opencv pin corrected; alembic added)
+
+**Status:** Complete.
+
+**Verification:**
+- Dependency resolution for the CI target (CPython 3.11 / Linux) succeeds: `uv pip compile backend/requirements.txt --python-version 3.11 --python-platform x86_64-unknown-linux-gnu` resolves `numpy==1.26.3`, `opencv-python-headless==4.11.0.86`, `torch==2.2.0`, `torchvision==0.17.0`, `alembic==1.13.2`. The pre-fix pair was demonstrated to fail with `ResolutionImpossible`.
+- Equivalent local disposable-PostgreSQL run (ephemeral Docker `postgres:16-alpine`, dedicated `neuroscan_ci` DB, no volume; the dev `neuroscan_db` container/volume was never touched): migrations `001 -> 006` applied via `alembic upgrade head`; the workflow's readiness and schema-recreate scripts were executed verbatim; the complete backend suite `tests/`: **254 passed, 0 failed**; the three required modules (`test_scan_claim.py` 7, `test_artifact_lifecycle.py` 9, `test_scan_claim_integration.py` 17) re-verified at **33 passed** after a schema drop/recreate.
+- Workflow YAML parsed successfully (single `backend-tests` job, 7 steps).
+- No `.env` was read; no production credentials were used.
+
+**Known limitations:**
+- The workflow was not executed on a GitHub-hosted runner (none is available in this environment); the equivalent local run used the machine's system interpreter (CPython 3.13) rather than the workflow's pinned CPython 3.11 stack, so the exact pinned-stack execution remains unproven here.
+- The workflow installs the full `requirements.txt` (including the large CUDA `torch` wheel); it is correct but heavyweight.
+- The system interpreter's NumPy/OpenCV versions (2.x / 5.x) differ from the corrected pins, which is why the pin conflict was not caught earlier.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

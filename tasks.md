@@ -300,6 +300,24 @@ No critical security or destructive-data defects remain.
 > the 1 KB minimum-size guard added in `9f11037`. Added `TestSessionCleanup`
 > (success + failure cleanup). Full backend suite `tests/`: 254 passed.
 > See `memory.md` D-038.
+>
+> **SG3-F4-B CI integration note (2026-10-15):** No CI provider was configured
+> (no `.github/`, GitLab, Jenkins, Azure, CircleCI, or Travis). Because the only
+> remote is GitHub, the smallest compatible workflow is GitHub Actions:
+> `.github/workflows/backend-tests.yml` provisions an isolated, disposable
+> `postgres:16-alpine` service container (fresh per run) with CI-only credentials
+> and a dedicated `neuroscan_ci` database, waits for readiness, recreates the
+> `public` schema, applies `alembic upgrade head`, and runs the complete backend
+> suite `python -m pytest tests/ -v` (no SQLite substitution, no database tests
+> skipped, no `.env` read). Three CI blockers were fixed: `requirements.txt` was
+> unsatisfiable (`opencv-python-headless==5.0.0.93` requires `numpy>=2` while the
+> stack pins `numpy==1.26.3`/`torch==2.2.0`), `alembic` was undeclared, and the
+> test runner (`pytest`/`pytest-asyncio`) was undeclared. OpenCV is corrected to
+> `4.11.0.86` and `alembic==1.13.2` added; test deps live in
+> `backend/requirements-dev.txt`. Verify: local disposable-PostgreSQL run
+> (migrations 001->006; full `tests/` 254 passed; the three DB modules 33 passed;
+> resolution succeeds for CPython 3.11/Linux). See `memory.md` D-039. Unproven:
+> the workflow itself has not run on a GitHub-hosted runner.
 
 ------------------------------------------------------------------------
 

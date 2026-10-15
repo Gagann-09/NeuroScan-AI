@@ -1,0 +1,139 @@
+name: Backend Tests (PostgreSQL)
+
+# SG3-F4-B: PostgreSQL CI integration for the backend test suite.
+#
+# The repository previously had no CI provider configured. GitHub is the
+# configured remote, so GitHub Actions is the smallest compatible provider.
+#
+# This job provisions an isolated, disposable PostgreSQL service (a fresh
+# container per run) with CI-only credentials and a dedicated test database,
+# applies `alembic upgrade head` to the disposable database, and runs the
+# complete backend suite under `tests/` -- including the database-backed
+# modules `test_scan_claim.py`, `test_artifact_lifecycle.py`, and
+# `test_scan_claim_integration.py` (which require PostgreSQL row-level locking
+# via `SELECT ... FOR UPDATE NOWAIT` and are therefore never run on SQLite).
+#
+# No production database or credentials are used: the credentials below are
+# throwaway values for the ephemeral service container. The gitignored local
+# `.env` is never read because every required setting is provided by this
+# workflow's environment block.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-tests:
+    name: Backend test suite (PostgreSQL 16)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: neuroscan_ci
+          POSTGRES_PASSWORD: neuroscan_ci_password
+          POSTGRES_DB: neuroscan_ci
+        ports:
+          - 5432:5432
+        # The job does not start until this health check passes, so PostgreSQL
+        # is ready before the migration step runs.
+        options: >-
+          --health-cmd "pg_isready -U neuroscan_ci -d neuroscan_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 10s
+
+    env:
+      # CI-only test credentials for the ephemeral service container above.
+      # These are not production credentials and are never reused elsewhere.
+      DATABASE_URL: postgresql+psycopg2://neuroscan_ci:neuroscan_ci_password@localhost:5432/neuroscan_ci
+      MINIO_ACCESS_KEY: ci_test_access_key
+      MINIO_SECRET_KEY: ci_test_secret_key
+      FIREBASE_PROJECT_ID: neuroscan-ci
+      CORS_ORIGINS: http://localhost:3000
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          # torch==2.2.0 publishes wheels up to cp312; 3.11 is the safe pin
+          # for the frozen scientific stack in requirements.txt.
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Wait for PostgreSQL readiness
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import time
+
+          import psycopg2
+
+          dsn = os.environ["DATABASE_URL"].replace(
+              "postgresql+psycopg2://", "postgresql://"
+          )
+          for attempt in range(1, 31):
+              try:
+                  psycopg2.connect(dsn).close()
+                  print("PostgreSQL is ready.")
+                  sys.exit(0)
+              except psycopg2.OperationalError as exc:
+                  print(f"Waiting for PostgreSQL ({attempt}/30): {exc}")
+                  time.sleep(2)
+          print("PostgreSQL did not become ready in time.", file=sys.stderr)
+          sys.exit(1)
+          PY
+
+      - name: Recreate test database schema
+        run: |
+          python - <<'PY'
+          import os
+
+          import psycopg2
+
+          # The service container is disposable, but recreating the public
+          # schema makes the isolation explicit and keeps repeat runs clean.
+          dsn = os.environ["DATABASE_URL"].replace(
+              "postgresql+psycopg2://", "postgresql://"
+          )
+          conn = psycopg2.connect(dsn)
+          conn.autocommit = True
+          with conn.cursor() as cur:
+              cur.execute("DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;")
+          conn.close()
+          print("Recreated public schema.")
+          PY
+
+      - name: Apply migrations (alembic upgrade head)
+        run: alembic upgrade head
+
+      - name: Run complete backend test suite
+        run: python -m pytest tests/ -v

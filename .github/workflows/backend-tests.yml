@@ -170,11 +170,45 @@ jobs:
 
       - name: Configure Redis authentication
         run: |
-          # Set a disposable test password on the running Redis instance.
-          # CONFIG SET does not print the password; --no-auth-warning suppresses
-          # the Redis CLI warning banner for authenticated commands.
-          redis-cli CONFIG SET requirepass "${REDIS_PASSWORD}"
-          redis-cli -a "${REDIS_PASSWORD}" --no-auth-warning ping
+          python - <<'PY'
+          import os
+          import sys
+          from urllib.parse import urlsplit
+
+          import redis
+
+          password = os.environ["REDIS_PASSWORD"]
+
+          # Redis starts without authentication; set a disposable test password
+          # via CONFIG SET. CONFIG SET does not print the password.
+          client = redis.Redis(
+              host="localhost",
+              port=6379,
+              db=0,
+              socket_connect_timeout=2,
+          )
+          try:
+              client.config_set("requirepass", password)
+          except redis.RedisError as exc:
+              print(f"Failed to set Redis requirepass: {exc}", file=sys.stderr)
+              sys.exit(1)
+
+          # Verify authentication works using the authenticated REDIS_URL.
+          parsed = urlsplit(os.environ["REDIS_URL"])
+          authed_client = redis.Redis(
+              host=parsed.hostname,
+              port=parsed.port,
+              password=parsed.password,
+              db=int(parsed.path.lstrip("/")) if parsed.path else 0,
+              socket_connect_timeout=2,
+          )
+          try:
+              authed_client.ping()
+              print("Redis authentication configured successfully.")
+          except redis.RedisError as exc:
+              print(f"Redis authentication verification failed: {exc}", file=sys.stderr)
+              sys.exit(1)
+          PY
         env:
           REDIS_PASSWORD: redis_ci_test_password_99
 

@@ -143,16 +143,22 @@ jobs:
           import os
           import sys
           import time
+          from urllib.parse import urlsplit
 
           import redis
 
           # Redis starts without authentication; wait for it to accept
           # connections before setting the requirepass password.
-          dsn = os.environ["REDIS_URL"].split("@")[-1]
-          unauthenticated = "redis://" + dsn if "@" in dsn else dsn
+          parsed = urlsplit(os.environ["REDIS_URL"])
+          client = redis.Redis(
+              host=parsed.hostname,
+              port=parsed.port,
+              db=int(parsed.path.lstrip("/")) if parsed.path else 0,
+              socket_connect_timeout=2,
+          )
           for attempt in range(1, 31):
               try:
-                  redis.Redis.from_url(unauthenticated, socket_connect_timeout=2).ping()
+                  client.ping()
                   print("Redis is ready.")
                   sys.exit(0)
               except redis.RedisError as exc:

@@ -32,6 +32,10 @@ class Scan(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     # Track when background processing actually started to detect stale/abandoned attempts
     processing_started_at = Column(DateTime, nullable=True)
+    # Number of times the stale-PENDING recovery loop has re-dispatched this
+    # scan. Incremented durably before each re-dispatch; capped at 3, after
+    # which the scan is marked FAILED and not retried again by the loop.
+    attempt_count = Column(Integer, nullable=False, server_default="0", default=0)
     # Owner of this scan (Firebase UID)
     user_id = Column(String, ForeignKey("users.firebase_uid"), index=True, nullable=True)
 

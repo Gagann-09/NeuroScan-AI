@@ -16,6 +16,7 @@ from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Backgro
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db, get_current_user
+from app.core.rate_limiting import enforce_upload_rate_limit
 from app.db.models import Scan, ModalityFile, Prediction, User
 from app.core.storage import minio_client, get_presigned_url
 from app.services.ai_tasks import process_scan_task
@@ -316,6 +317,7 @@ async def upload_scan(
     flair: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    _rate_limit: None = Depends(enforce_upload_rate_limit),
 ):
     scan_id = str(uuid.uuid4())
     bucket_name = "neuroscan-bucket"

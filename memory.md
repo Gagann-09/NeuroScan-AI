@@ -894,6 +894,38 @@ Preserve existing behavior: invalid/expired/revoked tokens → 401 generic; miss
 - `git diff --check`: clean (trailing whitespace fixed).
 - Defect verification: manual tests confirm missing ADC, init failure, GoogleAuthError, and database errors all return 503 with "Authentication service temporarily unavailable" and no internal details leaked.
 
+### D-044 --- Rate limiting and resource-exhaustion controls (SG3-F5-E)
+
+**Date:** 2026-10-15
+
+**Context:** P8 Security + Reliability requires rate limiting for expensive API operations. The application currently runs background work via FastAPI `BackgroundTasks` (in-process, single worker), so an in-memory limiter would NOT be shared across uvicorn workers or service replicas. Redis is already part of the deployment topology (`docker-compose.yml` `redis:7-alpine`, `REDIS_URL` setting in `app/core/config.py`, `redis` package in `requirements.txt`) but is not wired into application code, so using it introduces no new mandatory infrastructure dependency.
+
+**Decision:**
+1. Add `backend/app/core/rate_limiting.py`: a Redis-backed fixed-window rate limiter using an atomic Lua script (`INCR` + `EXPIRE` + `TTL`), keyed per authenticated user (`{prefix}upload:{firebase_uid}`).
+2. Enforce it on `POST /api/v1/scans/upload` only — the expensive endpoint that triggers scan processing (inference dispatched as a background task). Status/results polling are cheap DB reads and are deliberately not rate limited so normal scan monitoring is not broken.
+3. Per-authenticated-user limits only; no IP-based controls (proxy handling not established as trustworthy; client-supplied forwarding headers never trusted).
+4. Limits configurable via `Settings` (`app/core/config.py`) with validated defaults: `RATE_LIMIT_ENABLED=True`, `RATE_LIMIT_STORAGE_BACKEND=redis`, `RATE_LIMIT_KEY_PREFIX=neuroscan:ratelimit:`, `RATE_LIMIT_UPLOAD_MAX_REQUESTS=10`, `RATE_LIMIT_UPLOAD_WINDOW_SECONDS=60`.
+5. Limiter backend unavailable: fail closed — `POST /upload` returns generic `503 Service Unavailable` with no internal details (matches the existing `security.py` infra-failure pattern). Exceeded limit returns `429` with generic body and `Retry-After` header (window TTL).
+6. Wire `Depends(enforce_upload_rate_limit)` into `upload_scan` in `backend/app/api/routers/scans.py`; authentication (`get_current_user`) runs first, so unauthenticated requests get 401 before any limit check.
+
+**Reason:** rules.md #14/#18/#20; PRD G7 (fail closed); requirement for a shared, production-suitable limiter in multi-worker deployments; fail-closed on backend unavailability; do not introduce undocumented infrastructure dependencies.
+
+**Affected files:**
+- `backend/app/core/rate_limiting.py` (new: RedisRateLimiter, get_rate_limiter, enforce_upload_rate_limit)
+- `backend/app/core/config.py` (rate-limit settings + validators)
+- `backend/app/api/routers/scans.py` (wire rate-limit dependency into upload)
+- `backend/tests/test_rate_limiting.py` (new: 15 focused tests)
+- `tasks.md` (SG3-F5-E marked verified)
+- `memory.md` (this record)
+
+**Status:** Verified.
+
+**Verification:**
+- New focused suite `tests/test_rate_limiting.py`: 15 passed, 0 failed (within-limit succeeds; exceeded → 429 + safe body; `Retry-After` correct; Redis failure → 503 with no detail leakage; per-user isolation; config validation; auth still runs first).
+- Full non-database backend suite `tests/`: **244 passed, 0 failed** (baseline 229 + 15 new; no regressions in auth, ownership, upload validation, or error redaction).
+- `git diff --check`: clean.
+- DB-backed modules (`test_scan_claim.py`, `test_artifact_lifecycle.py`, `test_scan_claim_integration.py`) require a live PostgreSQL and run in CI via `.github/workflows/backend-tests.yml` (not executable in this environment); this change touches no database schema or those modules.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

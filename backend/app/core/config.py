@@ -50,6 +50,25 @@ class Settings(BaseSettings):
     # Default 15 minutes to limit exposure window for leaked URLs.
     PRESIGNED_URL_TTL_MINUTES: int = 15
 
+    # ── Rate limiting (resource-exhaustion controls) ──
+    # Per-authenticated-user request limits for expensive API operations.
+    # Redis is the shared backend (already deployed in docker-compose as
+    # `redis:7-alpine` and configured via REDIS_URL); this keeps counters
+    # consistent across uvicorn workers and service replicas. An in-memory
+    # limiter would NOT be shared across workers and is not used here.
+    # When the Redis backend is unavailable, expensive operations fail closed
+    # with a generic 503 (see app/core/rate_limiting.py).
+    # All limits are configurable via environment variables; defaults below
+    # are intended for a controlled demonstration/research prototype and
+    # should be tuned for production load.
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_STORAGE_BACKEND: str = "redis"
+    RATE_LIMIT_KEY_PREFIX: str = "neuroscan:ratelimit:"
+    # Maximum authenticated scan-upload requests per window per user.
+    RATE_LIMIT_UPLOAD_MAX_REQUESTS: int = 10
+    # Rate-limit window length in seconds.
+    RATE_LIMIT_UPLOAD_WINDOW_SECONDS: int = 60
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",
@@ -130,6 +149,38 @@ class Settings(BaseSettings):
             raise ValueError(
                 "PRESIGNED_URL_TTL_MINUTES must not exceed 1440 minutes (24 hours)."
             )
+        return v
+
+    @field_validator("RATE_LIMIT_STORAGE_BACKEND")
+    @classmethod
+    def validate_rate_limit_backend(cls, v: str) -> str:
+        """Validate the rate-limit storage backend.
+
+        Redis is the only supported backend because counters must be shared
+        across uvicorn workers and service replicas. An in-memory limiter is
+        not production protection in a multi-worker deployment.
+        """
+        if not v or not v.strip():
+            raise ValueError("RATE_LIMIT_STORAGE_BACKEND must be set.")
+        if v.strip().lower() != "redis":
+            raise ValueError(
+                "RATE_LIMIT_STORAGE_BACKEND must be 'redis'. "
+                "In-memory rate limiting is not shared across workers."
+            )
+        return v.strip().lower()
+
+    @field_validator("RATE_LIMIT_UPLOAD_MAX_REQUESTS")
+    @classmethod
+    def validate_upload_max_requests(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("RATE_LIMIT_UPLOAD_MAX_REQUESTS must be a positive integer.")
+        return v
+
+    @field_validator("RATE_LIMIT_UPLOAD_WINDOW_SECONDS")
+    @classmethod
+    def validate_upload_window_seconds(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("RATE_LIMIT_UPLOAD_WINDOW_SECONDS must be a positive integer.")
         return v
 
     @property

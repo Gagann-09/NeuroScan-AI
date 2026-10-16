@@ -116,6 +116,8 @@ class TestConfigSecurity:
         monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000")
         # Clear any CI-set REDIS_URL so the default value is tested
         monkeypatch.delenv("REDIS_URL", raising=False)
+        # Clear any CI-set RATE_LIMIT_REDIS_REQUIRE_AUTH so the default value is tested
+        monkeypatch.delenv("RATE_LIMIT_REDIS_REQUIRE_AUTH", raising=False)
         
         from app.core.config import Settings
         settings = Settings()

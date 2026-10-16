@@ -108,6 +108,7 @@ class TestRateLimitConfig:
             "MINIO_SECRET_KEY": "secret",
             "FIREBASE_PROJECT_ID": "proj",
             "CORS_ORIGINS": "http://localhost:3000",
+            "REDIS_URL": "redis://localhost:6379/0",
             "RATE_LIMIT_REDIS_REQUIRE_AUTH": False,
         }
         base.update(overrides)

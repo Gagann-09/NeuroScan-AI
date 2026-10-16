@@ -5,12 +5,17 @@ These tests are deterministic: they use an in-memory fake Redis client, mock
 authentication, never contact real services, and never read production
 credentials. Environment variables required by `Settings` are set before the
 app is imported (mirroring `tests/test_auth.py`).
+
+SG3-F6-C: The ``TestRedisIntegration`` class below adds mandatory
+real-Redis integration tests that connect to a genuine Redis service
+(provisioned by CI or local docker-compose) and are NOT mocked.
 """
 import os
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 import pytest
+import redis
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -22,7 +27,7 @@ os.environ.setdefault("MINIO_SECRET_KEY", "testsecret")
 os.environ.setdefault("FIREBASE_PROJECT_ID", "neuroscan-medical-vault")
 os.environ.setdefault("CORS_ORIGINS", "http://localhost:3000")
 
-from app.core.config import Settings  # noqa: E402
+from app.core.config import Settings, get_settings  # noqa: E402
 from app.core.rate_limiting import (  # noqa: E402
     RedisRateLimiter,
     _DisabledRateLimiter,
@@ -283,3 +288,223 @@ class TestDisabledRateLimiter:
         assert limiter.enabled is False
         allowed, retry_after = limiter.check("any-user")
         assert allowed is True
+
+
+class TestRedisIntegration:
+    """Real-Redis integration tests for the upload rate limiter (SG3-F6-C).
+
+    These tests connect to a genuine Redis service (provisioned by CI or local
+    docker-compose) and are NOT mocked. They are mandatory in CI: the GitHub
+    Actions workflow provisions a ``redis:7-alpine`` service container and sets
+    ``REDIS_URL``, so these tests run against real Redis on every push/PR.
+
+    Local developers without Redis can opt out by setting
+    ``NEUROSCAN_SKIP_REDIS_INTEGRATION=1``; the tests are never silently
+    skipped in CI because that environment variable is not set there.
+    """
+
+    REDIS_URL_AVAILABLE = "redis://localhost:6379/0"
+    REDIS_URL_UNAVAILABLE = "redis://localhost:1/0"  # dead port, connection refused
+
+    @pytest.fixture(autouse=True)
+    def _reset_limiter_and_settings(self):
+        """Clear the cached limiter and settings before/after each test."""
+        reset_rate_limiter_for_tests()
+        get_settings.cache_clear()
+        yield
+        reset_rate_limiter_for_tests()
+        get_settings.cache_clear()
+
+    @pytest.fixture
+    def _skip_if_no_redis(self, request):
+        """Opt-out for local developers without Redis; never skips in CI."""
+        if os.environ.get("NEUROSCAN_SKIP_REDIS_INTEGRATION") == "1":
+            pytest.skip("NEUROSCAN_SKIP_REDIS_INTEGRATION=1; no local Redis")
+
+    def _make_limiter(self, redis_url: str) -> RedisRateLimiter:
+        """Create a RedisRateLimiter connected to the given Redis URL."""
+        settings = get_settings()
+        redis_client = redis.Redis.from_url(
+            redis_url,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+            health_check_interval=1,
+        )
+        return RedisRateLimiter(
+            redis_client=redis_client,
+            prefix=settings.RATE_LIMIT_KEY_PREFIX,
+            max_requests=settings.RATE_LIMIT_UPLOAD_MAX_REQUESTS,
+            window_seconds=settings.RATE_LIMIT_UPLOAD_WINDOW_SECONDS,
+        )
+
+    def _cleanup_rate_limit_keys(self, redis_url: str) -> None:
+        """Delete only rate-limit namespace keys from a real Redis instance.
+
+        Uses SCAN to find keys matching the rate-limit prefix and deletes them
+        individually. Never uses FLUSHDB, so unrelated keys in the same database
+        are preserved.
+        """
+        prefix = f"{get_settings().RATE_LIMIT_KEY_PREFIX}*"
+        client = redis.Redis.from_url(redis_url, socket_connect_timeout=1)
+        try:
+            keys: list = []
+            cursor = 0
+            while True:
+                cursor, batch = client.scan(cursor=cursor, match=prefix, count=100)
+                keys.extend(batch)
+                if cursor == 0:
+                    break
+            if keys:
+                client.delete(*keys)
+        finally:
+            client.close()
+
+    def _upload_files(self):
+        return {
+            "t1": ("t1.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+            "t1ce": ("t1ce.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+            "t2": ("t2.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+            "flair": ("flair.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+        }
+
+    # ------------------------------------------------------------------
+    # 429 against real Redis
+    # ------------------------------------------------------------------
+
+    def test_429_when_limit_exceeded_real_redis(
+        self, monkeypatch, _clean_dependency_overrides, _skip_if_no_redis
+    ):
+        """Exhausting the per-user limit against real Redis yields 429 + Retry-After."""
+        settings = get_settings()
+        mock_user = User(
+            firebase_uid="redis-integration-user", email="redis@example.com"
+        )
+        app.dependency_overrides[get_current_user] = lambda: mock_user
+        app.dependency_overrides[get_db] = lambda: MagicMock()
+
+        limiter = self._make_limiter(self.REDIS_URL_AVAILABLE)
+        monkeypatch.setattr(
+            "app.core.rate_limiting.get_rate_limiter", lambda: limiter
+        )
+
+        try:
+            # Exhaust the counter directly against real Redis.
+            for _ in range(settings.RATE_LIMIT_UPLOAD_MAX_REQUESTS):
+                allowed, _ = limiter.check(mock_user.firebase_uid)
+                assert allowed is True
+
+            # The next request must be rate limited.
+            response = client.post(
+                "/api/v1/scans/upload",
+                files=self._upload_files(),
+                headers={"Authorization": "Bearer any-token"},
+            )
+            assert response.status_code == 429
+            body = response.json()
+            assert body["detail"] == "Rate limit exceeded. Please try again later."
+            assert "Retry-After" in response.headers
+            retry_after = int(response.headers["Retry-After"])
+            assert 1 <= retry_after <= settings.RATE_LIMIT_UPLOAD_WINDOW_SECONDS
+        finally:
+            self._cleanup_rate_limit_keys(self.REDIS_URL_AVAILABLE)
+
+    # ------------------------------------------------------------------
+    # 503 when Redis is unavailable
+    # ------------------------------------------------------------------
+
+    def test_503_when_redis_unavailable(
+        self, monkeypatch, _clean_dependency_overrides, _skip_if_no_redis
+    ):
+        """Unavailable Redis backend yields a generic 503, no detail leaked."""
+        mock_user = User(firebase_uid="redis-503-user", email="503@example.com")
+        app.dependency_overrides[get_current_user] = lambda: mock_user
+        app.dependency_overrides[get_db] = lambda: MagicMock()
+
+        limiter = self._make_limiter(self.REDIS_URL_UNAVAILABLE)
+        monkeypatch.setattr(
+            "app.core.rate_limiting.get_rate_limiter", lambda: limiter
+        )
+
+        response = client.post(
+            "/api/v1/scans/upload",
+            files=self._upload_files(),
+            headers={"Authorization": "Bearer any-token"},
+        )
+
+        assert response.status_code == 503
+        body = response.json()
+        assert body["detail"] == "Service temporarily unavailable"
+        # No Redis failure details, credentials, or internal text in the body.
+        response_text = response.text.lower()
+        assert "connection" not in response_text
+        assert "refused" not in response_text
+        assert "redis" not in response_text
+        assert "localhost" not in response_text
+        assert "6379" not in response_text
+
+    # ------------------------------------------------------------------
+    # Auth before rate limit
+    # ------------------------------------------------------------------
+
+    def test_auth_before_rate_limit_real_redis(
+        self, _clean_dependency_overrides, _skip_if_no_redis
+    ):
+        """Unauthenticated requests are rejected with 401 before rate limiting."""
+        # Do not override get_current_user; no auth header sent.
+        response = client.post("/api/v1/scans/upload", files=self._upload_files())
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid or expired authentication token"
+
+    # ------------------------------------------------------------------
+    # No credential leakage on 503
+    # ------------------------------------------------------------------
+
+    def test_no_credential_leakage_on_503(
+        self, monkeypatch, _clean_dependency_overrides, _skip_if_no_redis
+    ):
+        """The 503 body contains no Redis connection details or credentials."""
+        mock_user = User(firebase_uid="redis-leak-user", email="leak@example.com")
+        app.dependency_overrides[get_current_user] = lambda: mock_user
+        app.dependency_overrides[get_db] = lambda: MagicMock()
+
+        limiter = self._make_limiter(self.REDIS_URL_UNAVAILABLE)
+        monkeypatch.setattr(
+            "app.core.rate_limiting.get_rate_limiter", lambda: limiter
+        )
+
+        response = client.post(
+            "/api/v1/scans/upload",
+            files=self._upload_files(),
+            headers={"Authorization": "Bearer any-token"},
+        )
+
+        assert response.status_code == 503
+        body = response.json()
+        assert body["detail"] == "Service temporarily unavailable"
+        # Explicitly assert no sensitive strings appear anywhere in the response.
+        assert "redis://" not in response.text
+        assert "localhost:1" not in response.text
+        assert "connection refused" not in response.text.lower()
+        assert "redis" not in response.text.lower()
+
+    def test_cleanup_preserves_unrelated_keys(self, _skip_if_no_redis):
+        """Rate-limit cleanup deletes only namespaced keys, leaving unrelated keys intact."""
+        client_redis = redis.Redis.from_url(
+            self.REDIS_URL_AVAILABLE, socket_connect_timeout=1
+        )
+        try:
+            # Insert an unrelated key outside the rate-limit namespace.
+            unrelated_key = "unrelated:survival:test-key"
+            client_redis.set(unrelated_key, "survive")
+
+            # Run rate-limit cleanup.
+            self._cleanup_rate_limit_keys(self.REDIS_URL_AVAILABLE)
+
+            # Unrelated key must survive.
+            assert client_redis.get(unrelated_key) == b"survive"
+        finally:
+            # Best-effort cleanup of the test's own unrelated key.
+            try:
+                client_redis.delete("unrelated:survival:test-key")
+            finally:
+                client_redis.close()

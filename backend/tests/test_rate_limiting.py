@@ -337,14 +337,27 @@ class TestRedisIntegration:
             window_seconds=settings.RATE_LIMIT_UPLOAD_WINDOW_SECONDS,
         )
 
-    def _flush_rate_limit_keys(self, redis_url: str) -> None:
-        """Best-effort cleanup of rate-limit keys from a real Redis instance."""
+    def _cleanup_rate_limit_keys(self, redis_url: str) -> None:
+        """Delete only rate-limit namespace keys from a real Redis instance.
+
+        Uses SCAN to find keys matching the rate-limit prefix and deletes them
+        individually. Never uses FLUSHDB, so unrelated keys in the same database
+        are preserved.
+        """
+        prefix = f"{get_settings().RATE_LIMIT_KEY_PREFIX}*"
+        client = redis.Redis.from_url(redis_url, socket_connect_timeout=1)
         try:
-            client = redis.Redis.from_url(redis_url, socket_connect_timeout=1)
-            client.flushdb()
+            keys: list = []
+            cursor = 0
+            while True:
+                cursor, batch = client.scan(cursor=cursor, match=prefix, count=100)
+                keys.extend(batch)
+                if cursor == 0:
+                    break
+            if keys:
+                client.delete(*keys)
+        finally:
             client.close()
-        except redis.RedisError:
-            pass
 
     def _upload_files(self):
         return {
@@ -393,7 +406,7 @@ class TestRedisIntegration:
             retry_after = int(response.headers["Retry-After"])
             assert 1 <= retry_after <= settings.RATE_LIMIT_UPLOAD_WINDOW_SECONDS
         finally:
-            self._flush_rate_limit_keys(self.REDIS_URL_AVAILABLE)
+            self._cleanup_rate_limit_keys(self.REDIS_URL_AVAILABLE)
 
     # ------------------------------------------------------------------
     # 503 when Redis is unavailable
@@ -473,3 +486,25 @@ class TestRedisIntegration:
         assert "localhost:1" not in response.text
         assert "connection refused" not in response.text.lower()
         assert "redis" not in response.text.lower()
+
+    def test_cleanup_preserves_unrelated_keys(self, _skip_if_no_redis):
+        """Rate-limit cleanup deletes only namespaced keys, leaving unrelated keys intact."""
+        client_redis = redis.Redis.from_url(
+            self.REDIS_URL_AVAILABLE, socket_connect_timeout=1
+        )
+        try:
+            # Insert an unrelated key outside the rate-limit namespace.
+            unrelated_key = "unrelated:survival:test-key"
+            client_redis.set(unrelated_key, "survive")
+
+            # Run rate-limit cleanup.
+            self._cleanup_rate_limit_keys(self.REDIS_URL_AVAILABLE)
+
+            # Unrelated key must survive.
+            assert client_redis.get(unrelated_key) == b"survive"
+        finally:
+            # Best-effort cleanup of the test's own unrelated key.
+            try:
+                client_redis.delete("unrelated:survival:test-key")
+            finally:
+                client_redis.close()

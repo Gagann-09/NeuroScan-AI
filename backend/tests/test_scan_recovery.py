@@ -194,6 +194,53 @@ class TestStalePendingRecovery:
         assert pairs == []
         assert _get_scan(db_session, scan_id).status == "FAILED"
 
+    def test_recovery_missing_modality_marks_failed_not_processing(
+        self, db_session: Session
+    ):
+        """A stale PENDING scan with missing source modality records is marked
+        FAILED, not left stranded in PROCESSING where the recovery loop never
+        revisits it. The recovery attempt is still durably accounted."""
+        scan_id = "test-recovery-nomodality-010"
+        _create_scan(db_session, scan_id, "PENDING", created_at=_stale_created_at())
+        # Deliberately no ModalityFile records for this scan.
+
+        pairs = recover_stale_pending_scans(db_session)
+
+        # Nothing dispatched: missing sources cannot be processed.
+        assert pairs == []
+        scan = _get_scan(db_session, scan_id)
+        assert scan.status == "FAILED", f"Expected FAILED, got {scan.status}"
+        # Attempt was accounted even though dispatch was not possible.
+        assert scan.attempt_count == 1
+        assert scan.processing_started_at is not None
+
+    def test_recovery_incomplete_modality_marks_failed(
+        self, db_session: Session
+    ):
+        """A stale PENDING scan with only some required modalities is marked
+        FAILED rather than dispatched with incomplete source data."""
+        scan_id = "test-recovery-partial-011"
+        _create_scan(db_session, scan_id, "PENDING", created_at=_stale_created_at())
+        # Create only 2 of the 4 required modalities.
+        db_session.add(
+            ModalityFile(scan_id=scan_id, modality="t1", object_path=f"{scan_id}/source_t1.nii.gz")
+        )
+        db_session.add(
+            ModalityFile(
+                scan_id=scan_id,
+                modality="t1ce",
+                object_path=f"{scan_id}/source_t1ce.nii.gz",
+            )
+        )
+        db_session.commit()
+
+        pairs = recover_stale_pending_scans(db_session)
+
+        assert pairs == []
+        scan = _get_scan(db_session, scan_id)
+        assert scan.status == "FAILED"
+        assert scan.attempt_count == 1
+
     def test_recovery_concurrent_no_duplicate_attempt(self, db_session: Session):
         """Two concurrent recovery cycles increment attempt_count exactly once."""
         scan_id = "test-recovery-concurrent-006"

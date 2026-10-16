@@ -40,6 +40,11 @@ STALE_PENDING_THRESHOLD_SECONDS: int = 300  # 5 minutes
 # marked FAILED and is not retried again by the recovery loop.
 MAX_RECOVERY_ATTEMPTS: int = 3
 
+# Four BraTS source modalities required before a scan can be dispatched for
+# processing. A stale PENDING scan missing any of these can never be processed
+# and must be failed terminally rather than left stranded in PROCESSING.
+REQUIRED_MODALITIES: frozenset[str] = frozenset({"t1", "t1ce", "t2", "flair"})
+
 
 def _validate_nifti_file(path: Path) -> None:
     """
@@ -382,10 +387,24 @@ def recover_stale_pending_scans(
         db.commit()
 
         modality_objects = _get_modality_objects(db, scan_id)
-        if modality_objects:
+        if set(modality_objects) >= REQUIRED_MODALITIES:
             re_dispatched.append((scan_id, modality_objects, True))  # skip_claim=True
         else:
-            logger.warning("Scan %s has no source modality files; not re-dispatched", scan_id)
+            # Source modality records are missing or incomplete: the scan can
+            # never be processed. Mark terminal FAILED rather than leaving it
+            # stranded in PROCESSING (the recovery loop never revisits
+            # PROCESSING scans, so a PROCESSING scan with missing sources would
+            # be abandoned forever). The attempt was already accounted above.
+            db.execute(
+                text("UPDATE scans SET status = 'FAILED' WHERE id = :scan_id"),
+                {"scan_id": scan_id},
+            )
+            db.commit()
+            logger.warning(
+                "Scan %s has missing/incomplete source modality files; marked FAILED "
+                "(not re-dispatched)",
+                scan_id,
+            )
 
     return re_dispatched
 

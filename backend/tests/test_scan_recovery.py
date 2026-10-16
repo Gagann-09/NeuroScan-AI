@@ -305,15 +305,14 @@ class TestStalePendingRecovery:
                 pass
             assert mock_claim.call_count == 1
 
-            # The claim transitioned PENDING -> PROCESSING (committed by
-            # process_scan_task's own session; read via a fresh session to
-            # avoid db_session's identity cache).
+            # The claim transitioned PENDING -> PROCESSING, but preprocessing
+            # then failed and the error path marked the scan FAILED.
             fresh = SessionLocal()
             try:
                 scan = fresh.query(Scan).filter(Scan.id == scan_id).one()
             finally:
                 fresh.close()
-            assert scan.status == "PROCESSING"
+            assert scan.status == "FAILED"
             assert scan.attempt_count == 0  # upload path does not count recovery attempts
 
 
@@ -375,12 +374,17 @@ def db_session() -> Session:
     """Provide a clean database session for each test."""
     db = SessionLocal()
     try:
+        # Child rows first (modality_files.scan_id FK has no ON DELETE CASCADE),
+        # then parent scan rows.
+        db.query(ModalityFile).filter(ModalityFile.scan_id.like("test-recovery-%")).delete()
         db.query(Scan).filter(Scan.id.like("test-recovery-%")).delete()
         db.commit()
         yield db
     finally:
-        db.query(Scan).filter(Scan.id.like("test-recovery-%")).delete()
+        # Child rows first (modality_files.scan_id FK has no ON DELETE CASCADE),
+        # then parent scan rows.
         db.query(ModalityFile).filter(ModalityFile.scan_id.like("test-recovery-%")).delete()
+        db.query(Scan).filter(Scan.id.like("test-recovery-%")).delete()
         db.commit()
         db.close()
 

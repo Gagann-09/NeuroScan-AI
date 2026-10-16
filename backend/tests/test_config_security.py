@@ -114,6 +114,8 @@ class TestConfigSecurity:
         monkeypatch.setenv("MINIO_SECRET_KEY", "testsecret")
         monkeypatch.setenv("FIREBASE_PROJECT_ID", "test-project")
         monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000")
+        # Clear any CI-set REDIS_URL so the default value is tested
+        monkeypatch.delenv("REDIS_URL", raising=False)
         
         from app.core.config import Settings
         settings = Settings()
@@ -178,6 +180,8 @@ class TestConfigDevelopmentWorkflow:
         monkeypatch.setenv("REDIS_URL", "redis://redis:6379/0")
         monkeypatch.setenv("FIREBASE_PROJECT_ID", "neuroscan-medical-vault")
         monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000")
+        # Docker compose uses unauthenticated Redis, so auth enforcement must be off
+        monkeypatch.delenv("RATE_LIMIT_REDIS_REQUIRE_AUTH", raising=False)
         
         from app.core.config import Settings
         settings = Settings()

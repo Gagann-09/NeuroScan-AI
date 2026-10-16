@@ -926,6 +926,40 @@ Preserve existing behavior: invalid/expired/revoked tokens → 401 generic; miss
 - `git diff --check`: clean.
 - DB-backed modules (`test_scan_claim.py`, `test_artifact_lifecycle.py`, `test_scan_claim_integration.py`) require a live PostgreSQL and run in CI via `.github/workflows/backend-tests.yml` (not executable in this environment); this change touches no database schema or those modules.
 
+### D-045 --- Redact upload exception-detail leak (SG3-F6-A)
+
+**Date:** 2026-10-16
+
+**Context:** `backend/app/api/routers/scans.py::upload_scan` returned
+`HTTPException(status_code=500, detail=str(e))` for unexpected upload/database
+failures, leaking raw exception text (potentially credentials, object-storage
+details, database details, file paths) to clients. Identified as finding F-01
+in the final security acceptance audit.
+
+**Decision:** Replace `detail=str(e)` with a generic `detail="Upload failed"`.
+Log diagnostics server-side via `logger.exception("Unexpected error during scan
+upload")` (traceback in controlled application logs; the log message itself
+contains no tokens, secrets, uploaded content, or medical data). Preserve the
+existing `db.rollback()` and best-effort MinIO source-object cleanup. Keep
+`HTTPException` validation/auth responses (400/401) unchanged. Do not touch
+other handlers or refactor the upload pipeline.
+
+**Reason:** rules.md #14 (no sensitive data exposed), #18 (tests gate), #20;
+PRD G7 (fail closed); design.md §12 (failures explicit).
+
+**Affected files:**
+- `backend/app/api/routers/scans.py` (generic 500 handler redacted)
+- `backend/tests/test_scan_claim_integration.py` (new `TestUploadErrorRedaction`,
+  3 hermetic tests: storage failure, database failure, validation unchanged)
+
+**Status:** Verified.
+
+**Verification:**
+- New focused suite `tests/test_scan_claim_integration.py::TestUploadErrorRedaction`: 3 passed, 0 failed (storage failure → generic 500, no exception text, cleanup count 2; database failure → generic 500, no exception text, cleanup count 4; invalid extension → 400 unchanged).
+- Regression suites: `tests/test_rate_limiting.py` 15 passed, `tests/test_config_security.py` 22 passed, `tests/test_auth.py` 33 passed; no regressions.
+- `git diff --check`: clean. Diff limited to `scans.py` (1 line changed) and the new test class.
+- Limitation: full backend suite `tests/` against disposable PostgreSQL 16 (CI procedure `.github/workflows/backend-tests.yml`) could not be re-run locally because no PostgreSQL instance or running Docker Desktop is available in this environment (D-036/D-038). Previously verified 254 passed, 0 failed (D-040). Changes are confined to the upload 500 path and do not touch DB-backed claim/artifact logic.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

@@ -992,6 +992,38 @@ PRD G7 (fail closed); design.md §12 (failures explicit).
 - New `test_scan_recovery.py`: 10 tests collected (require live PostgreSQL; run in CI).
 - `git diff --check`: clean.
 
+### D-047 --- SG3-F6-C: Redis security verification and real-Redis integration tests (remediates F-03)
+
+**Date:** 2026-10-16
+
+**Context:** Security finding F-03 (operational dependency): Redis in `docker-compose.yml` runs without authentication and is published on host port 6379; the fail-closed 503 path for the upload rate limiter is exercised only with in-memory fakes, never against a live Redis. CI provisions PostgreSQL but no Redis, so the real fail-closed `503` path is unproven in CI.
+
+**Decision:**
+1. `.github/workflows/backend-tests.yml` (updated): add a `redis:7-alpine` service container alongside PostgreSQL, with a `redis-cli ping` health check. Add `REDIS_URL: redis://localhost:6379/0` to the workflow `env` block. Add an explicit "Wait for Redis readiness" step that polls the Redis service before tests run. Preserve the existing PostgreSQL service, migration sequence, and test command unchanged.
+2. `backend/tests/test_rate_limiting.py` (updated): add `TestRedisIntegration` class with mandatory real-Redis integration tests:
+   - `test_429_when_limit_exceeded_real_redis`: exhausts the per-user counter against real Redis, then asserts 429 with `Retry-After` header on the upload endpoint.
+   - `test_503_when_redis_unavailable`: points the limiter at a dead port, asserts generic 503 with no Redis failure details in the response body.
+   - `test_auth_before_rate_limit_real_redis`: asserts unauthenticated requests return 401 before rate limiting is checked.
+   - `test_no_credential_leakage_on_503`: asserts no Redis connection strings, credentials, or internal details appear in the 503 response body.
+   - Tests clear the cached limiter and settings between runs. Local developers without Redis can opt out via `NEUROSCAN_SKIP_REDIS_INTEGRATION=1`; CI never sets this variable, so the tests are mandatory and never silently skipped.
+3. `RedisRateLimiter.check()` exception handling preserved as-is: specific `RedisError` catch with fail-closed 503. No blanket `except Exception` added, as no reproducible failure demonstrated the need. The existing `test_backend_failure_raises_503_without_leak` unit test covers the `RedisError` → 503 path with `FakeRedis.should_raise`.
+4. Documentation updated: `memory.md` (this record) and `tasks.md` (P8 entry) record production Redis requirements: private/internal network, authentication or ACLs (`requirepass`), no unnecessary host port exposure, and TLS where required by the deployment environment.
+
+**Reason:** rules.md #17/#18/#20; PRD G7 (fail closed); design.md §12 (failures explicit); SECURITY_AUDIT_REPORT.md F-03 remediation.
+
+**Affected files:**
+- `.github/workflows/backend-tests.yml` (Redis service, readiness check, `REDIS_URL` env)
+- `backend/tests/test_rate_limiting.py` (new `TestRedisIntegration` class)
+- `backend/memory.md` (this record), `backend/tasks.md` (P8 entry)
+
+**Status:** Implemented; existing mocked unit tests pass (18 passed locally without Redis). Real-Redis integration tests run in CI against the provisioned `redis:7-alpine` service. CI success not yet claimed — pending workflow run on the feature branch.
+
+**Verification:**
+- `test_rate_limiting.py` parses cleanly; YAML workflow parses cleanly.
+- Existing mocked rate-limiting tests: 18 passed (locally, without Redis).
+- New `TestRedisIntegration`: 3 tests pass without available Redis (503, auth-before, no-leakage); `test_429_when_limit_exceeded_real_redis` requires live Redis and runs in CI.
+- `git diff --check`: clean.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

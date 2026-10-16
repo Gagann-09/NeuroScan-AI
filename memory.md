@@ -1052,12 +1052,13 @@ PRD G7 (fail closed); design.md §12 (failures explicit).
 - `backend/tests/test_rate_limiting.py` (new authenticated tests and config validation tests)
 - `backend/memory.md` (this record), `backend/tasks.md` (P8 entry)
 
-**Status:** Implemented; focused non-DB suite passes. Real-Redis authenticated integration tests run in CI against the provisioned `redis:7-alpine` service with `--requirepass`. CI success not yet claimed — pending workflow run on the feature branch.
+**Status:** Complete. GitHub Actions Run #24 passed on commit `758c78358b7152f8334800161dcb589a57985a1d` (head of PR #4 branch `sg3-f6-d-redis-auth`): https://github.com/Gagann-09/NeuroScan-AI/actions/runs/38925698847
 
 **Verification:**
 - `config.py`, `rate_limiting.py`, `test_rate_limiting.py`, workflow YAML all parse cleanly.
 - Non-DB backend suite: tests pass locally (without Redis).
 - New config validation tests: 5 passed (default off, requires password when on, accepts authenticated URL, accepts rediss://, rejects empty credentials).
+- GitHub Actions Run #24 (`backend-tests.yml`) passed on commit `758c78358b7152f8334800161dcb589a57985a1d`: https://github.com/Gagann-09/NeuroScan-AI/actions/runs/38925698847
 - `git diff --check`: clean.
 
 ## 4. Research Direction

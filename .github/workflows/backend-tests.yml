@@ -68,7 +68,7 @@ jobs:
         # GitHub Actions service containers do not support `command`; start
         # Redis without authentication, then set a disposable test password
         # via CONFIG SET in a setup step below. The password is never printed
-        # in command output thanks to --no-auth-warning.
+        # in command output.
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s
@@ -85,7 +85,8 @@ jobs:
       FIREBASE_PROJECT_ID: neuroscan-ci
       CORS_ORIGINS: http://localhost:3000
       # Authenticated Redis URL for CI. The default user "default" authenticates
-      # with the password set via --requirepass above.
+      # with the password set via `CONFIG SET requirepass` in the
+      # "Configure Redis authentication" setup step above.
       REDIS_URL: redis://:redis_ci_test_password_99@localhost:6379/0
       RATE_LIMIT_REDIS_REQUIRE_AUTH: "true"
 

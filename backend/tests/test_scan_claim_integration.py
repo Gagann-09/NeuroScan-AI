@@ -904,9 +904,12 @@ class TestUploadCompensation:
             # Verify HTTP 500 returned
             assert response.status_code == 500
 
-            # Verify original error message is in response (not cleanup error)
+            # Verify client receives only the generic redacted error; the
+            # original exception text and the cleanup failure must not leak.
             data = response.json()
-            assert "Original upload error" in str(data.get("detail", ""))
+            assert data["detail"] == "Upload failed"
+            assert "Original upload error" not in response.text
+            assert "Cleanup failed" not in response.text
         finally:
             app.dependency_overrides.clear()
 

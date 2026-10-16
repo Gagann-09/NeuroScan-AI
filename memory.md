@@ -1024,6 +1024,42 @@ PRD G7 (fail closed); design.md §12 (failures explicit).
 - New `TestRedisIntegration`: 3 tests pass without available Redis (503, auth-before, no-leakage); `test_429_when_limit_exceeded_real_redis` requires live Redis and runs in CI.
 - `git diff --check`: clean.
 
+### D-048 --- SG3-F6-D: Redis authentication enforcement (remediates F-03)
+
+**Date:** 2026-10-16
+
+**Context:** Security finding F-03 (confirmed): Redis is published on host port 6379 without authentication in `docker-compose.yml:24`; `REDIS_URL` defaults to `redis://localhost:6379/0` with no credentials in `config.py:34`; no validation exists for Redis authentication (unlike `DATABASE_URL`, `MINIO_ACCESS_KEY`, `FIREBASE_PROJECT_ID` which are required fields). Production deployments that don't override `REDIS_URL` inherit an unauthenticated connection.
+
+**Decision:**
+1. `backend/app/core/config.py` (updated): add `RATE_LIMIT_REDIS_REQUIRE_AUTH: bool = False` setting. When `True`, a `@model_validator(mode="after")` (`validate_redis_auth_configuration`) requires `REDIS_URL` to use `redis://` or `rediss://` scheme with a non-empty password component. Validation errors never include credentials or connection details. Default `False` preserves local development and CI workflows that use the unauthenticated `redis://localhost:6379/0` default.
+2. `backend/app/core/rate_limiting.py`: no changes needed. `redis.Redis.from_url()` already supports authenticated URLs (`redis://user:pass@host:port/db`). `AuthenticationError` is a subclass of `RedisError`, already caught by the existing `except RedisError` block → generic 503, no detail leaked.
+3. `.github/workflows/backend-tests.yml` (updated): provision `redis:7-alpine` with `--requirepass redis_ci_test_password_99`; health check uses `redis-cli -a <password> --no-auth-warning ping` (password never printed in output); set `REDIS_URL: redis://:redis_ci_test_password_99@localhost:6379/0` and `RATE_LIMIT_REDIS_REQUIRE_AUTH: "true"`.
+4. `backend/tests/test_rate_limiting.py` (updated): add authenticated Redis tests to `TestRedisIntegration`:
+   - `test_429_when_limit_exceeded_authenticated_redis`: correct credentials → requests succeed; exceeding limit → 429 + `Retry-After`.
+   - `test_503_when_redis_wrong_password`: wrong credentials → generic 503, no credential leakage in body.
+   - `test_auth_before_rate_limit_authenticated_redis`: unauthenticated → 401 before rate limiting.
+   - `test_no_credential_leakage_on_wrong_password_503`: no Redis credentials or connection details in 503 body.
+   - Update `test_429_when_limit_exceeded_real_redis` and `test_cleanup_preserves_unrelated_keys` to use authenticated URL when enforcement is enabled.
+   - Add `TestRateLimitConfig` unit tests: default off (unauthenticated URL accepted), required URL credentials when on, `rediss://` scheme accepted, empty credentials rejected.
+   - `TestRedisIntegration` is mandatory in CI (never silently skipped); local opt-out via `NEUROSCAN_SKIP_REDIS_INTEGRATION=1`.
+5. `backend/tasks.md` and `backend/memory.md` (updated): document production Redis requirements — enforce authentication server-side, private/internal network, no unnecessary host port exposure, TLS where required by deployment environment.
+
+**Reason:** rules.md #14 (no hard-coded production credentials), #17/#18/#20; PRD G7 (fail closed); PRD NFR "Free of hard-coded credentials"; SECURITY_AUDIT_REPORT.md F-03 remediation.
+
+**Affected files:**
+- `backend/app/core/config.py` (`RATE_LIMIT_REDIS_REQUIRE_AUTH`, `validate_redis_auth_configuration`)
+- `.github/workflows/backend-tests.yml` (authenticated Redis service, `REDIS_URL`, `RATE_LIMIT_REDIS_REQUIRE_AUTH`)
+- `backend/tests/test_rate_limiting.py` (new authenticated tests and config validation tests)
+- `backend/memory.md` (this record), `backend/tasks.md` (P8 entry)
+
+**Status:** Implemented; focused non-DB suite passes. Real-Redis authenticated integration tests run in CI against the provisioned `redis:7-alpine` service with `--requirepass`. CI success not yet claimed — pending workflow run on the feature branch.
+
+**Verification:**
+- `config.py`, `rate_limiting.py`, `test_rate_limiting.py`, workflow YAML all parse cleanly.
+- Non-DB backend suite: tests pass locally (without Redis).
+- New config validation tests: 5 passed (default off, requires password when on, accepts authenticated URL, accepts rediss://, rejects empty credentials).
+- `git diff --check`: clean.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

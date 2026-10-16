@@ -2,6 +2,7 @@ name: Backend Tests (PostgreSQL + Redis)
 
 # SG3-F4-B: PostgreSQL CI integration for the backend test suite.
 # SG3-F6-C: Redis integration for upload rate-limiter verification.
+# SG3-F6-D: Redis authentication enforcement for upload rate limiter.
 #
 # The repository previously had no CI provider configured. GitHub is the
 # configured remote, so GitHub Actions is the smallest compatible provider.
@@ -14,9 +15,9 @@ name: Backend Tests (PostgreSQL + Redis)
 # `test_scan_claim_integration.py` (which require PostgreSQL row-level locking
 # via `SELECT ... FOR UPDATE NOWAIT` and are therefore never run on SQLite).
 #
-# A Redis 7 service is also provisioned so that the upload rate limiter's
-# fail-closed 503 and 429 behavior can be verified against a real Redis
-# instance rather than only in-memory fakes.
+# A Redis 7 service is also provisioned with authentication so that the upload
+# rate limiter's Redis-auth enforcement and fail-closed 503 behavior can be
+# verified against a real Redis instance.
 #
 # No production database or credentials are used: the credentials below are
 # throwaway values for the ephemeral service containers. The gitignored local
@@ -64,10 +65,13 @@ jobs:
         image: redis:7-alpine
         ports:
           - 6379:6379
-        # The job does not start until this health check passes, so Redis is
-        # ready before the rate-limiter integration tests run.
+        # Redis is started with a disposable test password so CI verifies the
+        # authenticated Redis code path (RATE_LIMIT_REDIS_REQUIRE_AUTH=true).
+        # The password is never printed in command output thanks to
+        # --no-auth-warning.
+        command: ["redis-server", "--requirepass", "redis_ci_test_password_99"]
         options: >-
-          --health-cmd "redis-cli ping"
+          --health-cmd "redis-cli -a redis_ci_test_password_99 --no-auth-warning ping"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -81,7 +85,10 @@ jobs:
       MINIO_SECRET_KEY: ci_test_secret_key
       FIREBASE_PROJECT_ID: neuroscan-ci
       CORS_ORIGINS: http://localhost:3000
-      REDIS_URL: redis://localhost:6379/0
+      # Authenticated Redis URL for CI. The default user "default" authenticates
+      # with the password set via --requirepass above.
+      REDIS_URL: redis://:redis_ci_test_password_99@localhost:6379/0
+      RATE_LIMIT_REDIS_REQUIRE_AUTH: "true"
 
     defaults:
       run:

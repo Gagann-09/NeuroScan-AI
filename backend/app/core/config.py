@@ -10,9 +10,10 @@ are retained. Docker Compose provides development credentials for local workflow
 """
 from pydantic_settings import BaseSettings
 from functools import lru_cache
-from pydantic import field_validator, ValidationError
+from pydantic import field_validator, ValidationError, model_validator
 from datetime import timedelta
 from typing import Union
+from urllib.parse import urlparse
 
 
 class Settings(BaseSettings):
@@ -68,6 +69,12 @@ class Settings(BaseSettings):
     RATE_LIMIT_UPLOAD_MAX_REQUESTS: int = 10
     # Rate-limit window length in seconds.
     RATE_LIMIT_UPLOAD_WINDOW_SECONDS: int = 60
+    # When True, REDIS_URL must include a non-empty password component
+    # (redis:// or rediss:// scheme with user:password@host). Production
+    # deployments should set this to True and provide Redis credentials via
+    # REDIS_URL. Local development and CI keep the default False so that the
+    # unauthenticated redis://localhost:6379/0 default continues to work.
+    RATE_LIMIT_REDIS_REQUIRE_AUTH: bool = False
 
     model_config = {
         "env_file": ".env",
@@ -182,6 +189,27 @@ class Settings(BaseSettings):
         if v <= 0:
             raise ValueError("RATE_LIMIT_UPLOAD_WINDOW_SECONDS must be a positive integer.")
         return v
+
+    @model_validator(mode="after")
+    def validate_redis_auth_configuration(self) -> "Settings":
+        """When RATE_LIMIT_REDIS_REQUIRE_AUTH is True, REDIS_URL must contain
+        a non-empty password component (redis:// or rediss:// scheme with
+        user:password@host). Credentials are never included in error messages
+        or logs.
+        """
+        if self.RATE_LIMIT_REDIS_REQUIRE_AUTH:
+            parsed = urlparse(self.REDIS_URL)
+            if parsed.scheme not in ("redis", "rediss"):
+                raise ValueError(
+                    "REDIS_URL must use the redis:// or rediss:// scheme when "
+                    "RATE_LIMIT_REDIS_REQUIRE_AUTH=True."
+                )
+            if not parsed.password:
+                raise ValueError(
+                    "REDIS_URL must include credentials (username and "
+                    "password) when RATE_LIMIT_REDIS_REQUIRE_AUTH=True."
+                )
+        return self
 
     @property
     def cors_origins_list(self) -> list[str]:

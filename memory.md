@@ -960,6 +960,38 @@ PRD G7 (fail closed); design.md §12 (failures explicit).
 - `git diff --check`: clean. Diff limited to `scans.py` (1 line changed) and the new test class.
 - Limitation: full backend suite `tests/` against disposable PostgreSQL 16 (CI procedure `.github/workflows/backend-tests.yml`) could not be re-run locally because no PostgreSQL instance or running Docker Desktop is available in this environment (D-036/D-038). Previously verified 254 passed, 0 failed (D-040). Changes are confined to the upload 500 path and do not touch DB-backed claim/artifact logic.
 
+### D-046 --- SG3-F6-B: Stale-PENDING scan recovery loop with atomic retry accounting (remediates F-02)
+
+**Date:** 2026-10-16
+
+**Context:** Security finding F-02 (confirmed design gap): scans left in `PENDING` are stranded on worker restart because FastAPI `BackgroundTasks` are in-process and lost on restart. `claim_scan_for_processing` accepts `PENDING`/`FAILED` → `PROCESSING`, but nothing re-claims a stranded `PENDING` scan. `processing_started_at` (migration 005) existed but was never queried for recovery. No retry accounting or attempt cap existed.
+
+**Decision:**
+1. `backend/alembic/versions/007_add_scan_retry_count.py` (new migration 007): add `scans.attempt_count` (Integer, default 0) to durably track recovery re-dispatches per scan.
+2. `backend/app/services/ai_tasks.py`: add `recover_stale_pending_scans()` which selects stranded scans (`status='PENDING'`, `processing_started_at IS NULL`, `created_at` older than the staleness threshold), locks each with `FOR UPDATE NOWAIT`, and in one transaction increments `attempt_count` and claims `PENDING → PROCESSING` (setting `processing_started_at`), committed durably *before* dispatch. Attempts are capped at `MAX_RECOVERY_ATTEMPTS = 3`; beyond the cap the scan is marked `FAILED` (terminal) and not retried again by the loop. Concurrent cycles cannot consume duplicate retry counts: an asyncio lock serializes cycles within a process, and the row lock + status change to `PROCESSING` serializes across processes.
+3. `backend/app/services/ai_tasks.py`: `process_scan_task(scan_id, modality_objects, skip_claim=False)` gains a backward-compatible `skip_claim` parameter (default `False`, preserving the existing upload claim path). The recovery loop passes `skip_claim=True` because it already claimed atomically before dispatch; inference behavior is unchanged.
+4. `backend/app/main.py`: FastAPI managed `lifespan` starts `_recovery_loop` on startup and stops it cleanly on shutdown. Each cycle runs within the asyncio lock (no overlapping cycles), scopes one `SessionLocal` to the operation, dispatches blocking `process_scan_task` via `asyncio.to_thread` (never blocks the asyncio event loop with model inference), logs and continues after cycle-level failures, and re-runs on a fixed interval.
+5. `backend/tests/test_scan_recovery.py` (new): PostgreSQL-backed tests for attempt accounting, recent/processing/segmented/failed scan skipping, max-3-attempts cap → FAILED, concurrency (no duplicate retry consumption), upload claim-path preservation, and cycle dispatch/failure-continuation.
+6. Condition 4 honored: only stale `PENDING` scans are recovered; `PROCESSING` scans are never reclaimed; no ownership, API, UI, or scientific-pipeline changes. Condition 3 honored: `process_scan_task` is synchronous/blocking and is never called on the event loop.
+
+**Reason:** rules.md #17/#18/#20; PRD G7 (fail closed); design.md §12 (failures explicit, preserve scan state); memory.md D-038 (session hygiene). Resolves security finding F-02.
+
+**Affected files:**
+- `backend/alembic/versions/007_add_scan_retry_count.py` (new)
+- `backend/app/services/ai_tasks.py` (recovery loop, attempt accounting, `skip_claim`)
+- `backend/app/main.py` (lifespan-managed recovery loop)
+- `backend/tests/test_scan_recovery.py` (new)
+- `backend/memory.md` (this record), `backend/tasks.md` (P8 entry)
+
+**Status:** Implemented; focused non-DB suite passes, new tests collect. PostgreSQL 16 DB-backed verification runs on the GitHub Actions workflow via the PR (CI success not yet claimed — condition 6).
+
+**Verification:**
+- `ai_tasks.py`, `main.py`, migration 007, `test_scan_recovery.py` all parse cleanly.
+- App imports successfully with test settings; scan routes register.
+- Non-DB backend suite: 123 passed (config security, rate limiting, XAI, preprocessing parity, evaluation protocol, robustness).
+- New `test_scan_recovery.py`: 10 tests collected (require live PostgreSQL; run in CI).
+- `git diff --check`: clean.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

@@ -4,12 +4,13 @@ import torch
 import numpy as np
 import tempfile
 import hashlib
+import asyncio
 from PIL import Image
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 import logging
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Literal
 import nibabel as nib
 
@@ -29,6 +30,15 @@ from ai_pipeline.preprocessing.brats_preprocessing import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── Stale-PENDING recovery configuration ──
+# A PENDING scan whose created_at is older than this threshold is considered
+# stranded (e.g. the worker restarted before the in-process BackgroundTasks
+# could claim it) and is eligible for re-dispatch by the recovery loop.
+STALE_PENDING_THRESHOLD_SECONDS: int = 300  # 5 minutes
+# Maximum number of recovery attempts per scan. Once reached the scan is
+# marked FAILED and is not retried again by the recovery loop.
+MAX_RECOVERY_ATTEMPTS: int = 3
 
 
 def _validate_nifti_file(path: Path) -> None:
@@ -240,6 +250,228 @@ def claim_scan_for_processing(db: Session, scan_id: str) -> ScanClaimResult:
     db.flush()
     
     return ScanClaimResult(success=True, reason="CLAIMED", scan_id=scan_id)
+
+
+# ── Stale-PENDING recovery loop ──
+# Reclaims scans stranded in PENDING (e.g. worker restart before the in-process
+# BackgroundTasks could claim them) and re-dispatches them for processing, with
+# atomic, durable retry accounting capped at MAX_RECOVERY_ATTEMPTS.
+
+# Asyncio lock serialized across recovery cycles within a single process so
+# concurrent cycles cannot consume duplicate retry counts for the same scan.
+_RECOVERY_LOCK = asyncio.Lock()
+
+
+def _get_modality_objects(db: Session, scan_id: str) -> dict[str, str]:
+    """Return {modality: object_path} for a scan's source ModalityFile rows."""
+    rows = db.execute(
+        text("SELECT modality, object_path FROM modality_files WHERE scan_id = :scan_id"),
+        {"scan_id": scan_id},
+    ).fetchall()
+    return {modality: object_path for modality, object_path in rows}
+
+
+def _lock_unavailable(exc: Exception) -> bool:
+    """True if a PostgreSQL error reports that a row lock could not be obtained."""
+    message = str(exc).lower()
+    return "could not obtain lock" in message or "lock_not_available" in message
+
+
+def recover_stale_pending_scans(
+    db: Session,
+    max_attempts: int = MAX_RECOVERY_ATTEMPTS,
+    staleness_seconds: int = STALE_PENDING_THRESHOLD_SECONDS,
+) -> list[tuple[str, dict[str, str], bool]]:
+    """
+    Atomically account for and re-dispatch stale PENDING scans.
+
+    Only scans stuck in PENDING that were never claimed
+    (``processing_started_at IS NULL``) and are older than the staleness
+    threshold are recovered. PROCESSING scans are never reclaimed, and no
+    ownership or API changes are made.
+
+    For each recovered scan the ``attempt_count`` is incremented and committed
+    durably *before* dispatch, capped at ``max_attempts``. Scans that exceed
+    the cap are marked ``FAILED`` (terminal) and are not retried again by this
+    loop.
+
+    Returns a list of ``(scan_id, modality_objects, skip_claim)`` triples ready
+    for dispatch. Dispatch itself is performed by the caller off the asyncio
+    event loop (see :func:`_recovery_loop`) so model inference never blocks
+    asyncio; ``skip_claim`` is ``True`` because the recovery loop already
+    claimed the scan before dispatch.
+
+    Attempt semantics:
+      - One attempt = one recovery re-dispatch of a PENDING scan.
+      - Accounting is atomic: the row is locked with FOR UPDATE NOWAIT, the
+        increment is committed while the lock is held, then the lock is
+        released before dispatch.
+      - Concurrent cycles cannot consume duplicate retry counts because the
+        asyncio lock serializes cycles within a process and the row lock
+        serializes across processes.
+      - The maximum of ``max_attempts`` (default 3) is enforced; beyond it the
+        scan is marked FAILED.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=staleness_seconds)
+
+    # Candidate ids without a lock first (a single FOR UPDATE NOWAIT over the
+    # whole result fails entirely if any one row is contended).
+    candidate_rows = db.execute(
+        text("""
+            SELECT id, attempt_count FROM scans
+            WHERE status = 'PENDING'
+              AND processing_started_at IS NULL
+              AND created_at < :cutoff
+            ORDER BY id
+        """),
+        {"cutoff": cutoff},
+    ).fetchall()
+
+    re_dispatched: list[tuple[str, dict[str, str]]] = []
+    for scan_id, attempt_count in candidate_rows:
+        # Re-fetch the row under a row lock so a concurrent cycle/worker that
+        # already claimed it is detected and skipped.
+        try:
+            row = db.execute(
+                text(
+                    "SELECT id, attempt_count, status FROM scans WHERE id = :scan_id FOR UPDATE NOWAIT"
+                ),
+                {"scan_id": scan_id},
+            ).fetchone()
+        except Exception as exc:
+            if _lock_unavailable(exc):
+                # Another transaction holds this scan; skip it for this cycle.
+                continue
+            raise
+
+        if not row or row.status != "PENDING":
+            # Already claimed/completed by another worker or cycle.
+            continue
+
+        new_attempt = attempt_count + 1
+
+        if new_attempt > max_attempts:
+            # Cap reached: stop retrying, mark terminal FAILED.
+            db.execute(
+                text(
+                    "UPDATE scans SET status = 'FAILED', processing_started_at = :now WHERE id = :scan_id"
+                ),
+                {"scan_id": scan_id, "now": now},
+            )
+            db.commit()
+            logger.warning(
+                "Scan %s exceeded max %d recovery attempts; marked FAILED",
+                scan_id,
+                max_attempts,
+            )
+            continue
+
+        # Durable retry accounting before dispatch: increment attempt_count and
+        # claim the scan (PENDING -> PROCESSING) in the same transaction, then
+        # commit while holding the row lock before releasing it. This makes the
+        # increment + claim atomic so concurrent cycles cannot consume duplicate
+        # retry counts, and the scan is no longer PENDING-eligible once claimed.
+        db.execute(
+            text(
+                "UPDATE scans SET attempt_count = :attempt, status = 'PROCESSING', "
+                "processing_started_at = :now WHERE id = :scan_id"
+            ),
+            {"scan_id": scan_id, "attempt": new_attempt, "now": now},
+        )
+        db.commit()
+
+        modality_objects = _get_modality_objects(db, scan_id)
+        if modality_objects:
+            re_dispatched.append((scan_id, modality_objects, True))  # skip_claim=True
+        else:
+            logger.warning("Scan %s has no source modality files; not re-dispatched", scan_id)
+
+    return re_dispatched
+
+
+async def _dispatch_scan(
+    scan_id: str,
+    modality_objects: dict[str, str],
+    skip_claim: bool = True,
+) -> None:
+    """
+    Dispatch ``process_scan_task`` off the asyncio event loop.
+
+    ``process_scan_task`` is synchronous and blocking (MinIO downloads, file
+    IO, ARMT-GAN inference), so it must not run directly on the event loop.
+    ``asyncio.to_thread`` runs it in a worker thread; the claim path and
+    inference behavior are unchanged. Exceptions are logged (the function
+    itself marks the scan FAILED) so one failed dispatch never aborts the loop.
+    """
+    try:
+        await asyncio.to_thread(process_scan_task, scan_id, modality_objects, skip_claim)
+    except Exception:
+        # process_scan_task catches its own exceptions and marks FAILED, but
+        # guard the loop boundary anyway so a single scan never kills a cycle.
+        logger.exception("Recovery dispatch failed for scan %s", scan_id)
+
+
+async def _recovery_cycle(
+    max_attempts: int = MAX_RECOVERY_ATTEMPTS,
+    staleness_seconds: int = STALE_PENDING_THRESHOLD_SECONDS,
+) -> list[tuple[str, dict[str, str], bool]]:
+    """
+    Run a single recovery cycle within the asyncio lock (no overlapping cycles).
+
+    Database sessions are scoped to this operation: one SessionLocal opened,
+    used, and closed here. Dispatch happens off the event loop in threads, so
+    the event loop is never blocked by model inference. Cycle-level failures
+    are logged and the cycle returns an empty list so the loop continues.
+    """
+    async with _RECOVERY_LOCK:
+        db = SessionLocal()
+        try:
+            pairs = recover_stale_pending_scans(
+                db, max_attempts=max_attempts, staleness_seconds=staleness_seconds
+            )
+            if pairs:
+                await asyncio.gather(
+                    *(
+                        _dispatch_scan(scan_id, modality_objects, skip_claim)
+                        for scan_id, modality_objects, skip_claim in pairs
+                    )
+                )
+            return pairs
+        except Exception:
+            logger.exception("Recovery cycle failed")
+            return []
+        finally:
+            db.close()
+
+
+async def _recovery_loop(
+    stop_event: asyncio.Event,
+    interval_seconds: float = 60.0,
+    max_attempts: int = MAX_RECOVERY_ATTEMPTS,
+    staleness_seconds: int = STALE_PENDING_THRESHOLD_SECONDS,
+) -> None:
+    """
+    Periodic recovery loop managed by FastAPI's managed lifespan.
+
+    Starts on startup, stops cleanly on shutdown, continues safely after
+    logged cycle-level failures, and never blocks the asyncio event loop with
+    model inference.
+    """
+    while not stop_event.is_set():
+        try:
+            await _recovery_cycle(
+                max_attempts=max_attempts, staleness_seconds=staleness_seconds
+            )
+        except Exception:
+            # Defensive: _recovery_cycle already logs, but keep the loop alive
+            # under any circumstance.
+            logger.exception("Recovery loop iteration failed")
+        # Wait for the next interval or for shutdown, whichever comes first.
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+        except asyncio.TimeoutError:
+            pass
 
 
 class ArtifactStateTransition:
@@ -475,7 +707,11 @@ def create_reference_image(modality_arrays: dict[str, np.ndarray], slice_index: 
     return Image.fromarray(rgb, mode="RGB")
 
 
-def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
+def process_scan_task(
+    scan_id: str,
+    modality_objects: dict[str, str],
+    skip_claim: bool = False,
+):
     """
     Process a 4-modality BraTS study through the ARMT-GAN pipeline.
     
@@ -483,6 +719,10 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
         scan_id: Unique scan identifier
         modality_objects: Dict mapping modality name to MinIO object path
             e.g., {"t1": "scan_id/source_t1.nii.gz", ...}
+        skip_claim: When True, the scan is already claimed (PROCESSING) by the
+            stale-PENDING recovery loop, which performed atomic, durable retry
+            accounting before dispatch. The existing claim path (upload) calls
+            this with ``skip_claim=False`` so behavior there is unchanged.
     """
     db: Session = SessionLocal()
     local_paths = {}
@@ -490,11 +730,15 @@ def process_scan_task(scan_id: str, modality_objects: dict[str, str]):
     try:
         logger.info(f"Starting 4-modality inference for Scan ID: {scan_id}")
         
-        # Attempt to claim the scan for processing
-        claim_result = claim_scan_for_processing(db, scan_id)
-        if not claim_result.success:
-            logger.info(f"Scan {scan_id} not claimed: {claim_result.reason}")
-            return  # Exit early — another worker claimed it, or already complete/failed/not found
+        # Attempt to claim the scan for processing.
+        # The recovery loop pre-claims (PENDING -> PROCESSING) atomically with
+        # retry accounting before dispatch, so it passes skip_claim=True and
+        # skips this claim to avoid rejecting its own scan.
+        if not skip_claim:
+            claim_result = claim_scan_for_processing(db, scan_id)
+            if not claim_result.success:
+                logger.info(f"Scan {scan_id} not claimed: {claim_result.reason}")
+                return  # Exit early — another worker claimed it, or already complete/failed/not found
         
         # Download all 4 modalities from MinIO
         with tempfile.TemporaryDirectory() as tmpdir:

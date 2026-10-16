@@ -65,13 +65,12 @@ jobs:
         image: redis:7-alpine
         ports:
           - 6379:6379
-        # Redis is started with a disposable test password so CI verifies the
-        # authenticated Redis code path (RATE_LIMIT_REDIS_REQUIRE_AUTH=true).
-        # The password is never printed in command output thanks to
-        # --no-auth-warning.
-        command: ["redis-server", "--requirepass", "redis_ci_test_password_99"]
+        # GitHub Actions service containers do not support `command`; start
+        # Redis without authentication, then set a disposable test password
+        # via CONFIG SET in a setup step below. The password is never printed
+        # in command output thanks to --no-auth-warning.
         options: >-
-          --health-cmd "redis-cli -a redis_ci_test_password_99 --no-auth-warning ping"
+          --health-cmd "redis-cli ping"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -147,10 +146,13 @@ jobs:
 
           import redis
 
-          dsn = os.environ["REDIS_URL"]
+          # Redis starts without authentication; wait for it to accept
+          # connections before setting the requirepass password.
+          dsn = os.environ["REDIS_URL"].split("@")[-1]
+          unauthenticated = "redis://" + dsn if "@" in dsn else dsn
           for attempt in range(1, 31):
               try:
-                  redis.Redis.from_url(dsn, socket_connect_timeout=2).ping()
+                  redis.Redis.from_url(unauthenticated, socket_connect_timeout=2).ping()
                   print("Redis is ready.")
                   sys.exit(0)
               except redis.RedisError as exc:
@@ -159,6 +161,16 @@ jobs:
           print("Redis did not become ready in time.", file=sys.stderr)
           sys.exit(1)
           PY
+
+      - name: Configure Redis authentication
+        run: |
+          # Set a disposable test password on the running Redis instance.
+          # CONFIG SET does not print the password; --no-auth-warning suppresses
+          # the Redis CLI warning banner for authenticated commands.
+          redis-cli CONFIG SET requirepass "${REDIS_PASSWORD}"
+          redis-cli -a "${REDIS_PASSWORD}" --no-auth-warning ping
+        env:
+          REDIS_PASSWORD: redis_ci_test_password_99
 
       - name: Recreate test database schema
         run: |

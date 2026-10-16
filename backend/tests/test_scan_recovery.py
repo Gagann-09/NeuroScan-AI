@@ -179,8 +179,21 @@ class TestStalePendingRecovery:
         assert scan.attempt_count == MAX_RECOVERY_ATTEMPTS  # 3
 
         # Reset to PENDING at the cap to simulate another stranded recovery.
+        # The scan must be unclaimed again (processing_started_at cleared) to be
+        # eligible for recovery; the recovery loop only selects scans that were
+        # never claimed (processing_started_at IS NULL).
         scan.status = "PENDING"
+        scan.processing_started_at = None
         db_session.commit()
+
+        # The reset scan is eligible again (PENDING, unclaimed, stale).
+        fresh = SessionLocal()
+        try:
+            reset_scan = fresh.query(Scan).filter(Scan.id == scan_id).one()
+        finally:
+            fresh.close()
+        assert reset_scan.status == "PENDING"
+        assert reset_scan.processing_started_at is None
 
         # Fourth attempt would exceed the cap -> marked FAILED, not returned.
         pairs = recover_stale_pending_scans(db_session)

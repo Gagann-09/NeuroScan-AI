@@ -967,6 +967,164 @@ class TestUploadCompensation:
             app.dependency_overrides.clear()
 
 
+class TestUploadErrorRedaction:
+    """Regression tests for SG3-F6-A: redact upload exception-detail leak.
+
+    Verifies that unexpected upload/database failures return a generic HTTP 500
+    with no raw exception text, credentials, object-storage details, database
+    details, file paths, or stack traces in the response body, while preserving
+    rollback and best-effort MinIO cleanup. Existing validation (400) and auth
+    (401) responses are unchanged.
+
+    These tests are hermetic: they mock the database session (no live
+    PostgreSQL required), MinIO, Redis, and Firebase. No ``.env`` file or
+    secret value is read or printed.
+    """
+
+    def _comp(self) -> "TestUploadCompensation":
+        """Helper to access the shared upload-compensation test fixtures.
+
+        ``TestUploadCompensation._get_test_client_with_db`` and
+        ``_create_upload_files`` do not reference ``self``, so a plain
+        instance suffices. Kept local to this class to avoid coupling.
+        """
+        return TestUploadCompensation()
+
+    @patch("app.api.routers.scans.minio_client")
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("fastapi.BackgroundTasks.add_task")
+    @patch("uuid.uuid4")
+    def test_storage_failure_returns_generic_500_without_exception_text(
+        self,
+        mock_uuid,
+        mock_add_task,
+        mock_ai_minio_client,
+        mock_minio_client,
+    ):
+        """Unexpected MinIO failure returns generic 500, no exception text leaked; cleanup preserved."""
+        comp = self._comp()
+        mock_db = MagicMock()
+        client, app = comp._get_test_client_with_db(mock_db)
+        try:
+            mock_uuid.return_value = "test-upload-redact-storage-001"
+            mock_minio_client.bucket_exists.return_value = True
+            # Fail on the third source upload so the first two are staged for cleanup.
+            call_count = [0]
+
+            def failing_fput_object(bucket, object_name, file_path):
+                call_count[0] += 1
+                if call_count[0] == 3:  # Third modality (t2) fails
+                    raise Exception("MinIO internal error: access key leaked")
+
+            mock_minio_client.fput_object.side_effect = failing_fput_object
+            mock_minio_client.remove_object.return_value = None
+            mock_ai_minio_client.bucket_exists.return_value = True
+            mock_ai_minio_client.fput_object.return_value = None
+            mock_ai_minio_client.fget_object = MagicMock()
+            mock_add_task.return_value = None
+
+            upload_files = comp._create_upload_files()
+            injected_text = "MinIO internal error: access key leaked"
+
+            response = client.post(
+                "/api/v1/scans/upload",
+                files={
+                    "t1": ("t1.nii.gz", upload_files["t1"].file, "application/octet-stream"),
+                    "t1ce": ("t1ce.nii.gz", upload_files["t1ce"].file, "application/octet-stream"),
+                    "t2": ("t2.nii.gz", upload_files["t2"].file, "application/octet-stream"),
+                    "flair": ("flair.nii.gz", upload_files["flair"].file, "application/octet-stream"),
+                },
+            )
+
+            assert response.status_code == 500
+            body = response.json()
+            assert body["detail"] == "Upload failed"
+            # Injected exception text (and any credential hint) must not leak.
+            assert injected_text not in response.text
+            assert injected_text not in body["detail"]
+            assert "access key" not in response.text
+            # First two objects uploaded, third failed; cleanup attempted for the two staged.
+            assert mock_minio_client.fput_object.call_count == 3
+            assert mock_minio_client.remove_object.call_count == 2
+        finally:
+            app.dependency_overrides.clear()
+
+    @patch("app.api.routers.scans.minio_client")
+    @patch("uuid.uuid4")
+    def test_database_failure_returns_generic_500_without_exception_text(
+        self,
+        mock_uuid,
+        mock_minio_client,
+    ):
+        """Unexpected DB failure returns generic 500, no exception text leaked; rollback + cleanup preserved."""
+        comp = self._comp()
+        mock_db = MagicMock()
+        client, app = comp._get_test_client_with_db(mock_db)
+        try:
+            mock_uuid.return_value = "test-upload-redact-db-002"
+            mock_minio_client.bucket_exists.return_value = True
+            mock_minio_client.fput_object.return_value = None
+            mock_minio_client.remove_object.return_value = None
+
+            # Replace commit so the DB transaction fails after all four uploads.
+            original_commit = mock_db.commit
+            injected_text = "Simulated DB commit failure: password=postgres"
+
+            def failing_commit():
+                raise Exception(injected_text)
+
+            mock_db.commit = failing_commit
+
+            upload_files = comp._create_upload_files()
+
+            response = client.post(
+                "/api/v1/scans/upload",
+                files={
+                    "t1": ("t1.nii.gz", upload_files["t1"].file, "application/octet-stream"),
+                    "t1ce": ("t1ce.nii.gz", upload_files["t1ce"].file, "application/octet-stream"),
+                    "t2": ("t2.nii.gz", upload_files["t2"].file, "application/octet-stream"),
+                    "flair": ("flair.nii.gz", upload_files["flair"].file, "application/octet-stream"),
+                },
+            )
+
+            assert response.status_code == 500
+            body = response.json()
+            assert body["detail"] == "Upload failed"
+            # Injected exception text (and any credential hint) must not leak.
+            assert injected_text not in response.text
+            assert injected_text not in body["detail"]
+            assert "password" not in response.text
+            # All four objects uploaded, then rollback + cleanup attempted for all four.
+            assert mock_minio_client.fput_object.call_count == 4
+            assert mock_minio_client.remove_object.call_count == 4
+        finally:
+            mock_db.commit = original_commit
+            app.dependency_overrides.clear()
+
+    @patch("app.api.routers.scans.minio_client")
+    def test_invalid_extension_still_returns_400(self, mock_minio_client):
+        """Validation (HTTPException) responses are unchanged: invalid extension -> 400."""
+        comp = self._comp()
+        mock_db = MagicMock()
+        mock_minio_client.bucket_exists.return_value = True
+        client, app = comp._get_test_client_with_db(mock_db)
+        try:
+            from io import BytesIO
+
+            files = {
+                "t1": ("t1.txt", BytesIO(b"dummy"), "text/plain"),
+                "t1ce": ("t1ce.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+                "t2": ("t2.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+                "flair": ("flair.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+            }
+            response = client.post("/api/v1/scans/upload", files=files)
+
+            assert response.status_code == 400
+            assert "must be .nii or .nii.gz format" in response.json()["detail"]
+        finally:
+            app.dependency_overrides.clear()
+
+
 # =============================================================================
 # DERIVED ARTIFACT COMPENSATION TESTS
 # =============================================================================

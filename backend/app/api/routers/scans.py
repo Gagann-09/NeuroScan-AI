@@ -427,7 +427,10 @@ async def upload_scan(
         db.rollback()
         if uploaded_objects:
             _cleanup_source_objects(bucket_name, uploaded_objects)
-        raise HTTPException(status_code=500, detail=str(e))
+        # Log diagnostics server-side (traceback) without returning exception
+        # text, credentials, or internal details to the client.
+        logger.exception("Unexpected error during scan upload")
+        raise HTTPException(status_code=500, detail="Upload failed")
 
 
 @router.get("/status/{scan_id}", response_model=StatusResponse)

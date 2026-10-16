@@ -674,8 +674,24 @@ class TestUploadCompensation:
         def override_get_current_user():
             return user
 
+        # Bypass the new per-user upload rate limiter in these tests: they mock
+        # MinIO and Firebase already, and CI does not run a Redis service, so the
+        # real Redis-backed limiter would fail closed (503) for want of a backend.
+        # This is test-only; production behavior (fail-closed 503 when Redis is
+        # unavailable) is unchanged.
+        from app.core.rate_limiting import enforce_upload_rate_limit
+        from fastapi import Depends
+
+        async def override_enforce_upload_rate_limit(
+            current_user: User = Depends(get_current_user),
+        ) -> None:
+            return None
+
         app.dependency_overrides[get_db] = override_get_db
         app.dependency_overrides[get_current_user] = override_get_current_user
+        app.dependency_overrides[enforce_upload_rate_limit] = (
+            override_enforce_upload_rate_limit
+        )
         client = TestClient(app)
         return client, app
 

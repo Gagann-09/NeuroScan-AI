@@ -17,10 +17,10 @@ from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db, get_current_user
 from app.core.rate_limiting import enforce_upload_rate_limit
-from app.db.models import Scan, ModalityFile, Prediction, User
+from app.db.models import Scan, ModalityFile, Prediction, User, KaggleScan, KagglePrediction, KaggleModelVersion
 from app.core.storage import minio_client, get_presigned_url
-from app.services.ai_tasks import process_scan_task
-from app.schemas.scan_schema import UploadRequest, UploadResponse, StatusResponse, ResultsResponse
+from app.services.ai_tasks import process_scan_task, process_kaggle_task
+from app.schemas.scan_schema import UploadRequest, UploadResponse, StatusResponse, ResultsResponse, KaggleUploadResponse, KaggleStatusResponse, KaggleResultsResponse
 from ai_pipeline.preprocessing import (
     MAX_DECOMPRESSED_SIZE_MB,
     NIFTI1_DTYPE_CODES,
@@ -305,7 +305,13 @@ def _cleanup_source_objects(bucket_name: str, object_names: List[str]) -> None:
             if error_code == "NoSuchKey":
                 logger.debug(f"Object {obj_name} already absent during cleanup")
             else:
-                logger.warning(f"Failed to cleanup source object {obj_name}: {e}")
+                # Log only the exception type, not the message: the message may
+                # contain MinIO credentials, endpoints, or other sensitive data.
+                logger.warning(
+                    "Failed to cleanup source object %s: %s",
+                    obj_name,
+                    type(e).__name__,
+                )
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -340,6 +346,11 @@ async def upload_scan(
 
         modality_objects = {}
         for modality, file in modality_files.items():
+            if not file.filename:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Modality {modality} must have a filename",
+                )
             filename_lower = file.filename.lower()
             if filename_lower.endswith(".nii.gz"):
                 file_type = ".nii.gz"
@@ -433,20 +444,48 @@ async def upload_scan(
         raise HTTPException(status_code=500, detail="Upload failed")
 
 
+def get_scan_with_ownership(
+    db: Session,
+    scan_id: str,
+    current_user: User,
+) -> Scan:
+    """
+    Retrieve a scan by ID and verify the current user owns it.
+
+    Centralizes the scan authorization check so every endpoint that reads
+    or mutates a scan enforces ownership in one place. Fail closed: raises
+    404 if the scan does not exist, 403 if the scan belongs to another user.
+
+    Args:
+        db: Database session
+        scan_id: Scan identifier
+        current_user: Authenticated user from Firebase
+
+    Returns:
+        Scan: The owned scan record
+
+    Raises:
+        HTTPException: 404 if scan not found, 403 if not owned by user
+    """
+    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    # Enforce ownership
+    if scan.user_id != current_user.firebase_uid:
+        raise HTTPException(status_code=403, detail="Access denied: scan belongs to another user")
+
+    return scan
+
+
 @router.get("/status/{scan_id}", response_model=StatusResponse)
 def get_scan_status(
     scan_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    scan = db.query(Scan).filter(Scan.id == scan_id).first()
-    if not scan:
-        raise HTTPException(status_code=404, detail="Scan not found")
-    
-    # Enforce ownership
-    if scan.user_id != current_user.firebase_uid:
-        raise HTTPException(status_code=403, detail="Access denied: scan belongs to another user")
-    
+    scan = get_scan_with_ownership(db, scan_id, current_user)
+
     return StatusResponse(
         scan_id=scan.id,
         status=scan.status,
@@ -459,13 +498,7 @@ def get_scan_results(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    scan = db.query(Scan).filter(Scan.id == scan_id).first()
-    if not scan:
-        raise HTTPException(status_code=404, detail="Scan not found")
-
-    # Enforce ownership
-    if scan.user_id != current_user.firebase_uid:
-        raise HTTPException(status_code=403, detail="Access denied: scan belongs to another user")
+    scan = get_scan_with_ownership(db, scan_id, current_user)
 
     prediction = db.query(Prediction).filter(Prediction.scan_id == scan_id).first()
 
@@ -477,4 +510,185 @@ def get_scan_results(
         tumor_detected=prediction.tumor_detected if prediction else False,
         max_tumor_probability=prediction.max_tumor_probability if prediction else 0.0,
         model_version=prediction.model_version_id if prediction else None,
+    )
+
+
+# =========================================================================
+# Kaggle Classification Endpoints
+# =========================================================================
+
+# Kaggle-specific constants
+KAGGLE_BUCKET = "neuroscan-bucket"
+KAGGLE_MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB for JPG/PNG
+KAGGLE_ALLOWED_EXTENSIONS = (".jpg", ".jpeg", ".png")
+KAGGLE_CLASS_NAMES = ("glioma", "meningioma", "notumor", "pituitary")
+
+
+def _validate_kaggle_image(file_obj: BinaryIO, file_ext: str) -> bool:
+    """
+    Validate a JPG/PNG image file for Kaggle upload.
+
+    Basic validation: file extension, size, and PIL-readable.
+    """
+    original_pos = file_obj.tell()
+    try:
+        file_obj.seek(0, os.SEEK_END)
+        total_bytes = file_obj.tell()
+        file_obj.seek(0)
+        if total_bytes > KAGGLE_MAX_FILE_SIZE:
+            return False
+        if total_bytes < 1024:  # Minimum 1KB
+            return False
+
+        # Try to open with PIL to verify it's a valid image
+        from PIL import Image, UnidentifiedImageError
+        file_obj.seek(0)
+        try:
+            img = Image.open(file_obj)
+            img.verify()  # Verify it's a valid image
+            file_obj.seek(0)
+            return True
+        except (UnidentifiedImageError, OSError):
+            return False
+    finally:
+        file_obj.seek(original_pos)
+
+
+def get_kaggle_scan_with_ownership(
+    db: Session,
+    scan_id: str,
+    current_user: User,
+) -> KaggleScan:
+    """
+    Retrieve a Kaggle scan by ID and verify the current user owns it.
+
+    Fail closed: raises 404 if scan not found, 403 if scan belongs to another user.
+    """
+    scan = db.query(KaggleScan).filter(KaggleScan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    # Enforce ownership
+    if scan.user_id != current_user.firebase_uid:
+        raise HTTPException(status_code=403, detail="Access denied: scan belongs to another user")
+
+    return scan
+
+
+@router.post("/kaggle/upload", response_model=KaggleUploadResponse)
+async def upload_kaggle_scan(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    _rate_limit: None = Depends(enforce_upload_rate_limit),
+):
+    """
+    Upload a single JPG/PNG image for Kaggle brain tumor classification.
+
+    Accepts .jpg, .jpeg, .png files up to 20MB.
+    """
+    scan_id = str(uuid.uuid4())
+    bucket_name = KAGGLE_BUCKET
+
+    # Validate file extension
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="File must have a filename")
+    filename_lower = file.filename.lower()
+    if not any(filename_lower.endswith(ext) for ext in KAGGLE_ALLOWED_EXTENSIONS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"File must be .jpg, .jpeg, or .png format"
+        )
+
+    # Validate image content
+    if not _validate_kaggle_image(file.file, ""):
+        raise HTTPException(
+            status_code=400,
+            detail="File is not a valid JPG/PNG image or exceeds size limits"
+        )
+
+    uploaded_objects = []
+    try:
+        if not minio_client.bucket_exists(bucket_name):
+            minio_client.make_bucket(bucket_name)
+
+        os.makedirs("temp_uploads", exist_ok=True)
+
+        # Save to temp file
+        file_ext = os.path.splitext(filename_lower)[1]
+        temp_path = os.path.join("temp_uploads", f"{scan_id}_source{file_ext}")
+
+        total_bytes = 0
+        try:
+            with open(temp_path, "wb") as buffer:
+                total_bytes = _copyfileobj_with_limit(file.file, buffer, KAGGLE_MAX_FILE_SIZE)
+        except HTTPException:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
+
+        object_name = f"kaggle/{scan_id}/source{file_ext}"
+        minio_client.fput_object(bucket_name, object_name, temp_path)
+        os.remove(temp_path)
+        uploaded_objects.append(object_name)
+
+        # Create Kaggle scan record
+        scan_record = KaggleScan(
+            id=scan_id,
+            filename=f"kaggle/{scan_id}/source{file_ext}",
+            status="PENDING",
+            image_path=object_name,
+            user_id=current_user.firebase_uid,
+        )
+        db.add(scan_record)
+        db.commit()
+
+        # Dispatch background classification task
+        background_tasks.add_task(process_kaggle_task, scan_id, object_name)
+
+        return KaggleUploadResponse(
+            message="Kaggle image uploaded and dispatched successfully",
+            scan_id=scan_id,
+            status="PROCESSING",
+        )
+
+    except HTTPException:
+        if uploaded_objects:
+            _cleanup_source_objects(bucket_name, uploaded_objects)
+        raise
+    except Exception as e:
+        db.rollback()
+        if uploaded_objects:
+            _cleanup_source_objects(bucket_name, uploaded_objects)
+        logger.exception("Unexpected error during Kaggle scan upload")
+        raise HTTPException(status_code=500, detail="Upload failed")
+
+
+@router.get("/kaggle/status/{scan_id}", response_model=KaggleStatusResponse)
+def get_kaggle_scan_status(
+    scan_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    scan = get_kaggle_scan_with_ownership(db, scan_id, current_user)
+    return KaggleStatusResponse(scan_id=scan.id, status=scan.status)
+
+
+@router.get("/kaggle/results/{scan_id}", response_model=KaggleResultsResponse)
+def get_kaggle_scan_results(
+    scan_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    scan = get_kaggle_scan_with_ownership(db, scan_id, current_user)
+    prediction = db.query(KagglePrediction).filter(KagglePrediction.scan_id == scan_id).first()
+
+    return KaggleResultsResponse(
+        scan_id=scan.id,
+        class_index=prediction.class_index if prediction else None,
+        class_name=prediction.class_name if prediction else None,
+        probabilities=prediction.probabilities if prediction else None,
+        model_version=prediction.model_version_id if prediction else None,
+        image_url=get_presigned_url(scan.image_path) if scan.image_path else None,
     )

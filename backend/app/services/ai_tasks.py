@@ -15,7 +15,7 @@ from typing import Literal
 import nibabel as nib
 
 from app.db.database import SessionLocal
-from app.db.models import Scan, ModalityFile, Prediction, ModelVersion, Artifact
+from app.db.models import Scan, ModalityFile, Prediction, ModelVersion, Artifact, KaggleScan, KagglePrediction, KaggleModelVersion
 from app.core.storage import minio_client, upload_file_to_minio
 from app.services.reporting import generate_segmentation_report
 from ai_pipeline.models.armt_gan import ARMTGenerator2D
@@ -31,7 +31,7 @@ from ai_pipeline.preprocessing.brats_preprocessing import (
 
 logger = logging.getLogger(__name__)
 
-# ── Stale-PENDING recovery configuration ──
+# â”€â”€ Stale-PENDING recovery configuration â”€â”€
 # A PENDING scan whose created_at is older than this threshold is considered
 # stranded (e.g. the worker restarted before the in-process BackgroundTasks
 # could claim it) and is eligible for re-dispatch by the recovery loop.
@@ -53,8 +53,31 @@ def _validate_nifti_file(path: Path) -> None:
     Raises ValueError if validation fails.
     """
     image = nib.load(str(path))
-    _validate_nifti_image(image)
+    try:
+        _validate_nifti_image(image)
+    finally:
+        image.uncache()
+        for file_holder in image.file_map.values():
+            file_obj = file_holder.fileobj
+            if file_obj is not None and not file_obj.closed:
+                file_obj.close()
 
+def _load_nifti_volume(path: Path) -> np.ndarray:
+    """Load a validated NIfTI volume into independent float32 memory."""
+    image = nib.load(str(path))
+    try:
+        _validate_nifti_image(image)
+        return np.array(
+            image.get_fdata(dtype=np.float32),
+            dtype=np.float32,
+            copy=True,
+        )
+    finally:
+        image.uncache()
+        for file_holder in image.file_map.values():
+            file_obj = file_holder.fileobj
+            if file_obj is not None and not file_obj.closed:
+                file_obj.close()
 
 def _cleanup_derived_objects(bucket_name: str, object_names: list[str]) -> None:
     """
@@ -71,10 +94,16 @@ def _cleanup_derived_objects(bucket_name: str, object_names: list[str]) -> None:
             if error_code == "NoSuchKey":
                 logger.debug(f"Derived object {obj_name} already absent during cleanup")
             else:
-                logger.warning(f"Failed to cleanup derived object {obj_name}: {e}")
+                # Log only the exception type, not the message: the message may
+                # contain MinIO credentials, endpoints, or other sensitive data.
+                logger.warning(
+                    "Failed to cleanup derived object %s: %s",
+                    obj_name,
+                    type(e).__name__,
+                )
 
 
-# ── LAZY MODEL LOADING ──
+# â”€â”€ LAZY MODEL LOADING â”€â”€
 _DEVICE = None
 _GLOBAL_MODEL = None
 _WEIGHTS_PATH = None
@@ -107,7 +136,9 @@ def _get_global_model():
         _GLOBAL_MODEL = ARMTGenerator2D().to(_get_device())
         weights_path = _get_weights_path()
         if os.path.exists(weights_path):
-            _GLOBAL_MODEL.load_state_dict(torch.load(weights_path, map_location=_get_device()))
+            checkpoint = torch.load(weights_path, map_location=_get_device())
+            state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+            _GLOBAL_MODEL.load_state_dict(state_dict)
         _GLOBAL_MODEL.eval()
         _CHECKPOINT_IDENTIFIER = os.path.basename(weights_path) if os.path.exists(weights_path) else "unknown"
         logger.info("ARMT-GAN model successfully cached in memory.")
@@ -207,11 +238,11 @@ def claim_scan_for_processing(db: Session, scan_id: str) -> ScanClaimResult:
     If another transaction holds the lock, returns immediately with failure.
     
     State transitions:
-    - PENDING    → PROCESSING (claimed, processing_started_at set)
-    - FAILED     → PROCESSING (claimed, processing_started_at set)  
-    - PROCESSING → REJECTED (another worker holds the lock)
-    - SEGMENTED  → REJECTED (already complete)
-    - NOT FOUND  → REJECTED (scan does not exist)
+    - PENDING    â†’ PROCESSING (claimed, processing_started_at set)
+    - FAILED     â†’ PROCESSING (claimed, processing_started_at set)
+    - PROCESSING â†’ REJECTED (another worker holds the lock)
+    - SEGMENTED  â†’ REJECTED (already complete)
+    - NOT FOUND  â†’ REJECTED (scan does not exist)
     
     Args:
         db: Database session
@@ -257,7 +288,7 @@ def claim_scan_for_processing(db: Session, scan_id: str) -> ScanClaimResult:
     return ScanClaimResult(success=True, reason="CLAIMED", scan_id=scan_id)
 
 
-# ── Stale-PENDING recovery loop ──
+# â”€â”€ Stale-PENDING recovery loop â”€â”€
 # Reclaims scans stranded in PENDING (e.g. worker restart before the in-process
 # BackgroundTasks could claim them) and re-dispatches them for processing, with
 # atomic, durable retry accounting capped at MAX_RECOVERY_ATTEMPTS.
@@ -700,7 +731,7 @@ def generate_clinical_overlays(original_pil: Image.Image, mask_tensor: np.ndarra
     xai_final_pil = Image.fromarray(cv2.cvtColor(xai_overlay, cv2.COLOR_BGR2RGB))
     
     tumor_area_px = cv2.countNonZero(clean_mask)
-    # No heuristic cm² conversion - pixel count only for internal thresholding
+    # No heuristic cmÂ² conversion - pixel count only for internal thresholding
     tumor_detected = tumor_area_px > 0
     
     return seg_final_pil, xai_final_pil, tumor_detected, norm_mask
@@ -757,7 +788,7 @@ def process_scan_task(
             claim_result = claim_scan_for_processing(db, scan_id)
             if not claim_result.success:
                 logger.info(f"Scan {scan_id} not claimed: {claim_result.reason}")
-                return  # Exit early — another worker claimed it, or already complete/failed/not found
+                return  # Exit early â€” another worker claimed it, or already complete/failed/not found
         
         # Download all 4 modalities from MinIO
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -807,7 +838,7 @@ def process_scan_task(
                 if modality == "flair":
                     # Validate before loading for reference image
                     _validate_nifti_file(path)
-                    flair_volume = nib.load(str(path)).get_fdata(dtype=np.float32)
+                    flair_volume = _load_nifti_volume(path)
                     break
             
             slice_index = metadata["slice_index"]
@@ -818,7 +849,7 @@ def process_scan_task(
                 for modality in ["t1", "t1ce", "t2"]:
                     path = local_paths[modality]
                     _validate_nifti_file(path)
-                    vol = nib.load(str(path)).get_fdata(dtype=np.float32)
+                    vol = _load_nifti_volume(path)
                     modality_arrays[modality] = vol
                 original_pil = create_reference_image(modality_arrays, slice_index)
             else:
@@ -827,7 +858,7 @@ def process_scan_task(
             
             original_pil = original_pil.resize((224, 224))
             
-            # ── RUN INFERENCE WITH GLOBAL MODEL ──
+            # â”€â”€ RUN INFERENCE WITH GLOBAL MODEL â”€â”€
             model = _get_global_model()
             with torch.inference_mode():
                 mask_tensor = model(image_tensor)
@@ -865,8 +896,9 @@ def process_scan_task(
             )
             
             # Compute max tumor probability from model output (raw sigmoid probability)
-            max_tumor_probability = round(float(torch.sigmoid(mask_tensor).max().item()), 4)
-            
+
+            max_tumor_probability = round(float(mask_tensor.max().item()), 4)
+
             # Get or create ModelVersion for this checkpoint (needed for report and provenance)
             model_version = _get_or_create_model_version(
                 db, _get_model_version_id(), _get_weights_path(), _get_model_version_config_hash(), _get_preprocessing_version()
@@ -958,13 +990,18 @@ def process_scan_task(
                         raise RuntimeError(f"Failed to transition {artifact_type} artifact {artifact.id} to COMPLETE: {result.reason}")
                 
                 db.commit()
-            
-            logger.info(f"Successfully processed 4-modality inference for ID: {scan_id}")
         
     except Exception as e:
         # Roll back the failed transaction first
         db.rollback()
-        logger.error(f"Pipeline failed for Scan ID {scan_id}: {str(e)}")
+        # Log only the exception type, not the message: the message may contain
+        # credentials, file paths, or other sensitive data.
+        logger.error(
+            "Pipeline failed for Scan ID %s: %s",
+            scan_id,
+            type(e).__name__,
+            exc_info=True,
+            )
         # Best-effort cleanup of derived objects uploaded during this attempt
         if uploaded_derived:
             _cleanup_derived_objects("neuroscan-bucket", uploaded_derived)
@@ -980,4 +1017,173 @@ def process_scan_task(
     finally:
         # Always release the primary session, including the early-return paths
         # (claim failed) that otherwise leaked it and held its row lock.
+        db.close()
+
+
+# =========================================================================
+# Kaggle Classification Task
+# =========================================================================
+
+# Lazy-loaded Kaggle classifier
+_KAGGLE_DEVICE = None
+_KAGGLE_MODEL = None
+_KAGGLE_CHECKPOINT_IDENTIFIER = None
+_KAGGLE_MODEL_VERSION_ID = None
+_KAGGLE_WEIGHTS_PATH = None
+_KAGGLE_CLASS_NAMES = ("glioma", "meningioma", "notumor", "pituitary")
+
+
+def _get_kaggle_device():
+    global _KAGGLE_DEVICE
+    if _KAGGLE_DEVICE is None:
+        _KAGGLE_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return _KAGGLE_DEVICE
+
+
+def _get_kaggle_weights_path():
+    global _KAGGLE_WEIGHTS_PATH
+    if _KAGGLE_WEIGHTS_PATH is None:
+        _KAGGLE_WEIGHTS_PATH = os.path.join(os.path.dirname(__file__), "../../ai_pipeline/weights/kaggle_classifier_best.pth")
+    return _KAGGLE_WEIGHTS_PATH
+
+
+def _get_kaggle_model():
+    """Lazily load and return the global Kaggle classifier model."""
+    global _KAGGLE_MODEL, _KAGGLE_CHECKPOINT_IDENTIFIER
+    if _KAGGLE_MODEL is None:
+        logger.info("Initializing Kaggle classifier model into global memory...")
+        from ai_pipeline.models.kaggle_classifier import KaggleBrainTumorClassifier
+        _KAGGLE_MODEL = KaggleBrainTumorClassifier().to(_get_kaggle_device())
+        weights_path = _get_kaggle_weights_path()
+        if os.path.exists(weights_path):
+            checkpoint = torch.load(weights_path, map_location=_get_kaggle_device())
+            state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+            _KAGGLE_MODEL.load_state_dict(state_dict)
+        _KAGGLE_MODEL.eval()
+        _KAGGLE_CHECKPOINT_IDENTIFIER = os.path.basename(weights_path) if os.path.exists(weights_path) else "unknown"
+        logger.info("Kaggle classifier model successfully cached in memory.")
+    return _KAGGLE_MODEL
+
+
+def _get_kaggle_checkpoint_identifier():
+    _get_kaggle_model()
+    return _KAGGLE_CHECKPOINT_IDENTIFIER
+
+
+def _get_kaggle_model_version_id():
+    global _KAGGLE_MODEL_VERSION_ID
+    if _KAGGLE_MODEL_VERSION_ID is None:
+        weights_path = _get_kaggle_weights_path()
+        _KAGGLE_MODEL_VERSION_ID = _compute_model_version_id(weights_path)
+    return _KAGGLE_MODEL_VERSION_ID
+
+
+def _get_or_create_kaggle_model_version(db: Session, version_id: str, checkpoint_path: str, config_hash: str, preprocessing_version: str) -> KaggleModelVersion:
+    """
+    Get existing KaggleModelVersion or create new one.
+    Ensures deterministic reuse of the same model version for the same checkpoint.
+    """
+    model_version = db.query(KaggleModelVersion).filter(KaggleModelVersion.id == version_id).first()
+    if model_version is None:
+        model_version = KaggleModelVersion(
+            id=version_id,
+            checkpoint_path=checkpoint_path,
+            config_hash=config_hash,
+            preprocessing_version=preprocessing_version,
+        )
+        db.add(model_version)
+        db.flush()
+        logger.info(f"Created new KaggleModelVersion: {version_id}")
+    return model_version
+
+
+def process_kaggle_task(
+    scan_id: str,
+    image_object_path: str,
+):
+    """
+    Process a single Kaggle JPG/PNG image through the classifier pipeline.
+
+    Args:
+        scan_id: Unique scan identifier
+        image_object_path: MinIO object path for the source JPG/PNG image
+    """
+    db: Session = SessionLocal()
+    try:
+        logger.info(f"Starting Kaggle classification for Scan ID: {scan_id}")
+
+        # Download image from MinIO
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "source_image")
+            minio_client.fget_object("neuroscan-bucket", image_object_path, local_path)
+
+            # Load and preprocess image using Kaggle preprocessing
+            from PIL import Image
+            from torchvision import transforms
+
+            # Use same preprocessing as training/eval
+            transform = transforms.Compose([
+                transforms.Grayscale(num_output_channels=1),
+                transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.5,), std=(0.5,)),
+            ])
+
+            with Image.open(local_path) as img:
+                original_size = img.size
+                image = img.convert("L")
+                image_tensor = transform(image).unsqueeze(0)  # Add batch dimension [1, 1, 224, 224]
+
+            # Run inference
+            model = _get_kaggle_model()
+            image_tensor = image_tensor.to(_get_kaggle_device())
+            with torch.inference_mode():
+                logits = model(image_tensor)
+                probabilities = torch.softmax(logits, dim=1).cpu().numpy()[0]  # Shape: [4]
+
+            # Get predicted class
+            class_index = int(probabilities.argmax())
+            class_name = _KAGGLE_CLASS_NAMES[class_index]
+            probs_dict = {name: float(prob) for name, prob in zip(_KAGGLE_CLASS_NAMES, probabilities)}
+
+            # Get or create model version for provenance
+            model_version = _get_or_create_kaggle_model_version(
+                db,
+                _get_kaggle_model_version_id(),
+                _get_kaggle_weights_path(),
+                "arch:kaggle-classifier-cnn|backbone:conv-4block|classes:4|loss:crossentropy",
+                "preproc:kaggle-grayscale-224-normalize-0.5",
+            )
+
+            # Update database with results
+            scan_record = db.query(KaggleScan).filter(KaggleScan.id == scan_id).first()
+            if scan_record:
+                scan_record.status = "COMPLETED"
+
+                prediction = KagglePrediction(
+                    scan_id=scan_id,
+                    model_version_id=model_version.id,
+                    class_index=class_index,
+                    class_name=class_name,
+                    probabilities=probs_dict,
+                )
+                db.add(prediction)
+                db.commit()
+
+            logger.info(f"Successfully processed Kaggle classification for ID: {scan_id}, class={class_name}, probs={probs_dict}")
+
+    except Exception as e:
+        # Roll back the failed transaction first
+        db.rollback()
+        logger.error("Kaggle pipeline failed for Scan ID %s: %s", scan_id, type(e).__name__)
+        # Use a fresh, valid transaction to mark the Scan FAILED
+        fresh_db: Session = SessionLocal()
+        try:
+            scan_record = fresh_db.query(KaggleScan).filter(KaggleScan.id == scan_id).first()
+            if scan_record:
+                scan_record.status = "FAILED"
+                fresh_db.commit()
+        finally:
+            fresh_db.close()
+    finally:
         db.close()

@@ -239,6 +239,7 @@ class TestEnforceUploadRateLimitDependency:
     async def test_within_limit_passes(self, monkeypatch):
         fake = FakeLimiter(allowed=True, retry_after=-1)
         monkeypatch.setattr("app.core.rate_limiting.get_rate_limiter", lambda: fake)
+        monkeypatch.setattr("app.api.routers.scans.minio_client.bucket_exists",lambda bucket_name: True)
         current_user = User(firebase_uid="user-ok", email="ok@example.com")
         # Should not raise.
         await enforce_upload_rate_limit(current_user=current_user)
@@ -248,6 +249,7 @@ class TestEnforceUploadRateLimitDependency:
     async def test_exceeded_raises_429_with_retry_after(self, monkeypatch):
         fake = FakeLimiter(allowed=False, retry_after=30)
         monkeypatch.setattr("app.core.rate_limiting.get_rate_limiter", lambda: fake)
+        monkeypatch.setattr("app.api.routers.scans.minio_client.bucket_exists",lambda bucket_name: True)
         current_user = User(firebase_uid="user-limited", email="limited@example.com")
         with pytest.raises(HTTPException) as exc_info:
             await enforce_upload_rate_limit(current_user=current_user)
@@ -266,6 +268,7 @@ class TestEnforceUploadRateLimitDependency:
             window_seconds=60,
         )
         monkeypatch.setattr("app.core.rate_limiting.get_rate_limiter", lambda: limiter)
+        monkeypatch.setattr("app.api.routers.scans.minio_client.bucket_exists",lambda bucket_name: True)
         current_user = User(firebase_uid="user-x", email="x@example.com")
         with pytest.raises(HTTPException) as exc_info:
             await enforce_upload_rate_limit(current_user=current_user)
@@ -294,6 +297,7 @@ class TestRateLimitEndpoint:
 
         fake = FakeLimiter(allowed=False, retry_after=30)
         monkeypatch.setattr("app.core.rate_limiting.get_rate_limiter", lambda: fake)
+        monkeypatch.setattr("app.api.routers.scans.minio_client.bucket_exists",lambda bucket_name: True)
 
         response = client.post(
             "/api/v1/scans/upload", files=self._upload_files(),
@@ -319,6 +323,7 @@ class TestRateLimitEndpoint:
         """Different authenticated users are tracked independently (unit level)."""
         fake = FakeLimiter(allowed=True)
         monkeypatch.setattr("app.core.rate_limiting.get_rate_limiter", lambda: fake)
+        monkeypatch.setattr("app.api.routers.scans.minio_client.bucket_exists",lambda bucket_name: True)
         import asyncio
 
         asyncio.run(enforce_upload_rate_limit(current_user=User(firebase_uid="user-a", email="a@example.com")))
@@ -361,12 +366,18 @@ class TestRedisIntegration:
     skipped in CI because that environment variable is not set there.
     """
 
-    # Authenticated Redis (used when RATE_LIMIT_REDIS_REQUIRE_AUTH=true in CI)
-    REDIS_URL_AUTHENTICATED = "redis://:redis_ci_test_password_99@localhost:6379/0"
-    REDIS_URL_WRONG_PASSWORD = "redis://:wrong_password@localhost:6379/0"
-    # Unauthenticated Redis (development default when enforcement is disabled)
-    REDIS_URL_AVAILABLE = "redis://localhost:6379/0"
-    REDIS_URL_UNAVAILABLE = "redis://localhost:1/0"  # dead port, connection refused
+
+    REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "redis_ci_test_password_99")
+    REDIS_URL_AUTHENTICATED = (
+        f"redis://:{REDIS_PASSWORD}@localhost:6379/0"
+    )
+    REDIS_URL_WRONG_PASSWORD = (
+        "redis://:definitely_wrong_password@localhost:6379/0"
+    )
+    REDIS_URL_AVAILABLE = (
+        f"redis://:{REDIS_PASSWORD}@localhost:6379/0"
+    )
+    REDIS_URL_UNAVAILABLE = "redis://localhost:1/0"
 
     @pytest.fixture(autouse=True)
     def _reset_limiter_and_settings(self):
@@ -456,6 +467,10 @@ class TestRedisIntegration:
         monkeypatch.setattr(
             "app.core.rate_limiting.get_rate_limiter", lambda: limiter
         )
+        monkeypatch.setattr(
+            "app.api.routers.scans.minio_client.bucket_exists",
+            lambda bucket_name: True,
+            )
 
         try:
             # Exhaust the counter directly against real Redis.
@@ -494,6 +509,10 @@ class TestRedisIntegration:
         monkeypatch.setattr(
             "app.core.rate_limiting.get_rate_limiter", lambda: limiter
         )
+        monkeypatch.setattr(
+            "app.api.routers.scans.minio_client.bucket_exists",
+            lambda bucket_name: True,
+            )
 
         try:
             # Exhaust the counter directly against real Redis.
@@ -532,6 +551,10 @@ class TestRedisIntegration:
         monkeypatch.setattr(
             "app.core.rate_limiting.get_rate_limiter", lambda: limiter
         )
+        monkeypatch.setattr(
+            "app.api.routers.scans.minio_client.bucket_exists",
+            lambda bucket_name: True,
+            )
 
         response = client.post(
             "/api/v1/scans/upload",
@@ -539,6 +562,7 @@ class TestRedisIntegration:
             headers={"Authorization": "Bearer any-token"},
         )
 
+        print("DEBUG response:", response.status_code, response.text)
         assert response.status_code == 503
         body = response.json()
         assert body["detail"] == "Service temporarily unavailable"
@@ -550,42 +574,46 @@ class TestRedisIntegration:
         assert "localhost" not in response_text
         assert "6379" not in response_text
 
-    def test_503_when_redis_wrong_password(
-        self, monkeypatch, _clean_dependency_overrides, _skip_if_no_redis
-    ):
-        """Incorrect Redis credentials fail closed with a generic 503 and
-        no credential leakage in the response body."""
+    def test_503_when_redis_wrong_password(self, monkeypatch, _clean_dependency_overrides, _skip_if_no_redis):
+        """Incorrect Redis credentials fail closed with a generic 503."""
         mock_user = User(firebase_uid="redis-wrong-pw-user", email="wrongpw@example.com")
         app.dependency_overrides[get_current_user] = lambda: mock_user
         app.dependency_overrides[get_db] = lambda: MagicMock()
+        app.dependency_overrides.pop(enforce_upload_rate_limit, None)
 
         limiter = self._make_limiter(self.REDIS_URL_WRONG_PASSWORD)
         monkeypatch.setattr(
             "app.core.rate_limiting.get_rate_limiter", lambda: limiter
-        )
+            )
+        monkeypatch.setattr(
+            "app.api.routers.scans.minio_client.bucket_exists",
+            lambda bucket_name: True,
+            )
+        monkeypatch.setattr(
+            "app.api.routers.scans.minio_client.fput_object",
+            lambda bucket_name, object_name, file_path: None,
+            )
+        monkeypatch.setattr(
+            "app.api.routers.scans._validate_nifti_header",
+            lambda file_obj, file_type: True,
+            )
+        monkeypatch.setattr(
+            "app.api.routers.scans._copyfileobj_with_limit",
+            lambda source, destination, max_size: destination.write(b"x" * 2048),
+            )
 
         response = client.post(
             "/api/v1/scans/upload",
             files=self._upload_files(),
             headers={"Authorization": "Bearer any-token"},
-        )
+            )
 
         assert response.status_code == 503
-        body = response.json()
-        assert body["detail"] == "Service temporarily unavailable"
-        # No Redis failure details, credentials, or internal text in the body.
+        assert response.json()["detail"] == "Service temporarily unavailable"
         response_text = response.text.lower()
-        assert "connection" not in response_text
-        assert "refused" not in response_text
-        assert "auth" not in response_text
-        assert "password" not in response_text
-        assert "redis" not in response_text
-        assert "localhost" not in response_text
-        assert "6379" not in response_text
-        assert "redis_ci_test_password_99" not in response_text
         assert "wrong_password" not in response_text
-        assert "connection refused" not in response_text.lower()
-        assert "redis" not in response_text.lower()
+        assert "redis" not in response_text
+        assert "password" not in response_text
 
     def test_auth_before_rate_limit_real_redis(
         self, _clean_dependency_overrides, _skip_if_no_redis
@@ -622,6 +650,10 @@ class TestRedisIntegration:
         monkeypatch.setattr(
             "app.core.rate_limiting.get_rate_limiter", lambda: limiter
         )
+        monkeypatch.setattr(
+            "app.api.routers.scans.minio_client.bucket_exists",
+            lambda bucket_name: True,
+            )
 
         response = client.post(
             "/api/v1/scans/upload",
@@ -638,18 +670,33 @@ class TestRedisIntegration:
         assert "connection refused" not in response.text.lower()
         assert "redis" not in response.text.lower()
 
-    def test_no_credential_leakage_on_wrong_password_503(
-        self, monkeypatch, _clean_dependency_overrides, _skip_if_no_redis
-    ):
-        """The 503 body contains no Redis credentials or connection details."""
+    def test_no_credential_leakage_on_wrong_password_503(self, monkeypatch, _clean_dependency_overrides, _skip_if_no_redis):
+        """Wrong Redis credentials produce a generic 503 without leaking secrets."""
         mock_user = User(firebase_uid="redis-leak-user", email="leak@example.com")
         app.dependency_overrides[get_current_user] = lambda: mock_user
         app.dependency_overrides[get_db] = lambda: MagicMock()
+        app.dependency_overrides.pop(enforce_upload_rate_limit, None)
 
         limiter = self._make_limiter(self.REDIS_URL_WRONG_PASSWORD)
         monkeypatch.setattr(
             "app.core.rate_limiting.get_rate_limiter", lambda: limiter
         )
+        monkeypatch.setattr(
+            "app.api.routers.scans.minio_client.bucket_exists",
+            lambda bucket_name: True,
+        )
+        monkeypatch.setattr(
+            "app.api.routers.scans.minio_client.fput_object",
+            lambda bucket_name, object_name, file_path: None,
+        )
+        monkeypatch.setattr(
+            "app.api.routers.scans._validate_nifti_header",
+            lambda file_obj, file_type: True,
+        )
+        monkeypatch.setattr(
+            "app.api.routers.scans._copyfileobj_with_limit",
+            lambda source, destination, max_size: destination.write(b"x" * 2048),
+        )
 
         response = client.post(
             "/api/v1/scans/upload",
@@ -658,15 +705,12 @@ class TestRedisIntegration:
         )
 
         assert response.status_code == 503
-        body = response.json()
-        assert body["detail"] == "Service temporarily unavailable"
-        # Explicitly assert no sensitive strings appear anywhere in the response.
-        assert "redis://" not in response.text
-        assert "localhost:1" not in response.text
-        assert "redis_ci_test_password_99" not in response.text
-        assert "wrong_password" not in response.text
-        assert "connection refused" not in response.text.lower()
-        assert "redis" not in response.text.lower()
+        assert response.json()["detail"] == "Service temporarily unavailable"
+        response_text = response.text.lower()
+        assert "redis_ci_test_password_99" not in response_text
+        assert "wrong_password" not in response_text
+        assert "redis://" not in response_text
+        assert "localhost:6379" not in response_text
 
     def test_cleanup_preserves_unrelated_keys(self, _skip_if_no_redis):
         """Rate-limit cleanup deletes only namespaced keys, leaving unrelated

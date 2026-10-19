@@ -181,13 +181,25 @@ class BraTSPreprocessor:
         return None
 
     def load_nifti(self, path: Path) -> np.ndarray:
-        """Load a NIfTI file as float32 with validation."""
+        """Load a NIfTI file as float32 with validation and explicit cleanup."""
         image = nib.load(str(path))
-        
-        # Validate NIfTI header and data before loading full volume
-        self._validate_nifti_image(image)
-        
-        return image.get_fdata(dtype=np.float32)
+        try:
+            # Preserve safety checks before loading the full volume.
+            self._validate_nifti_image(image)
+
+            # Return independent memory so it remains valid after image cleanup.
+            return np.array(
+                image.get_fdata(dtype=np.float32),
+                dtype=np.float32,
+                copy=True,
+            )
+        finally:
+            image.uncache()
+            file_map = getattr(image, "file_map", {})
+            for file_holder in file_map.values():
+                file_obj = getattr(file_holder, "fileobj", None)
+                if file_obj is not None and not file_obj.closed:
+                    file_obj.close()
 
     def _validate_nifti_image(self, image: nib.Nifti1Image) -> None:
         """

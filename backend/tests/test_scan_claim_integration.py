@@ -1453,5 +1453,592 @@ class TestDerivedArtifactCompensation:
         assert scan_status == "FAILED"
 
 
+# =============================================================================
+# WORKER FAILURE-STATE TESTS
+# =============================================================================
+
+class TestWorkerFailureStates:
+    """Test failure handling in process_scan_task worker function.
+
+    These tests verify that all failure paths in the worker correctly:
+    - Roll back database transactions
+    - Clean up derived artifacts uploaded to MinIO
+    - Persist FAILED scan state via fresh transaction
+    - Release all database sessions
+    - Do not leak sensitive information in logs
+    """
+
+    @staticmethod
+    def _mock_fget_object_creates_file(bucket: str, object_name: str, local_path: str):
+        """Side effect for minio_client.fget_object that creates a minimal valid NIfTI file."""
+        import nibabel as nib
+        import numpy as np
+        from pathlib import Path
+
+        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        data = np.zeros((240, 240, 155), dtype=np.float32)
+        data[100:140, 100:140, 50] = 1.0
+        affine = np.eye(4)
+        img = nib.Nifti1Image(data, affine)
+        nib.save(img, local_path)
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    def test_minio_download_failure_marks_failed_cleans_sessions(
+        self,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """MinIO fget_object failure marks scan FAILED and closes sessions."""
+        scan_id = "test-worker-fail-001"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = _create_modality_files(db_session, scan_id)
+
+        mock_minio_client.fget_object.side_effect = Exception("MinIO connection refused")
+
+        created, closed = [], []
+        from app.db.database import SessionLocal as RealSessionLocal
+        def tracking_factory():
+            session = RealSessionLocal()
+            created.append(session)
+            original_close = session.close
+            def tracked_close():
+                closed.append(session)
+                original_close()
+            session.close = tracked_close
+            return session
+
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=tracking_factory):
+            process_scan_task(scan_id, modality_objects)
+
+        # Verify scan marked FAILED
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+
+        # Verify no prediction/artifact created
+        assert _get_prediction_count(db_session, scan_id) == 0
+        assert _get_artifact_count(db_session, scan_id) == 0
+
+        # Verify all sessions closed
+        assert len(created) == 2, "failure path opens primary + fresh session"
+        assert all(s in closed for s in created), "every session must be closed"
+
+        # Verify preprocessing never called
+        mock_preprocess_brats_study.assert_not_called()
+        mock_get_global_model.assert_not_called()
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    def test_downloaded_file_validation_failure_marks_failed(
+        self,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """Invalid downloaded NIfTI file (fails validation) marks scan FAILED."""
+        scan_id = "test-worker-fail-002"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = _create_modality_files(db_session, scan_id)
+
+        # Return a corrupted file from MinIO
+        def bad_fget_object(bucket, object_name, local_path):
+            from pathlib import Path
+            Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(local_path).write_bytes(b"not a nifti file")
+
+        mock_minio_client.fget_object.side_effect = bad_fget_object
+
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=lambda: db_session):
+            process_scan_task(scan_id, modality_objects)
+
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+        assert _get_prediction_count(db_session, scan_id) == 0
+
+        mock_preprocess_brats_study.assert_not_called()
+        mock_get_global_model.assert_not_called()
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    def test_preprocessing_failure_marks_failed(
+        self,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """Preprocessing failure marks scan FAILED and cleans up."""
+        scan_id = "test-worker-fail-003"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = _create_modality_files(db_session, scan_id)
+
+        mock_minio_client.fget_object.side_effect = self._mock_fget_object_creates_file
+        mock_preprocess_brats_study.side_effect = Exception("Preprocessing failed: shape mismatch")
+
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=lambda: db_session):
+            process_scan_task(scan_id, modality_objects)
+
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+        assert _get_prediction_count(db_session, scan_id) == 0
+
+        mock_get_global_model.assert_not_called()
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    @patch("app.services.ai_tasks.generate_gradient_saliency")
+    def test_model_loading_failure_marks_failed(
+        self,
+        mock_generate_gradient_saliency,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """Model loading failure (_get_global_model) marks scan FAILED."""
+        scan_id = "test-worker-fail-004"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = _create_modality_files(db_session, scan_id)
+
+        import torch
+        import numpy as np
+        from ai_pipeline.preprocessing import PreprocessingConfig
+
+        mock_minio_client.fget_object.side_effect = self._mock_fget_object_creates_file
+        mock_preprocess_brats_study.return_value = (
+            torch.randn(1, 4, 224, 224),
+            torch.randn(1, 1, 224, 224),
+            {"slice_index": 50},
+        )
+        mock_get_global_model.side_effect = RuntimeError("CUDA out of memory")
+
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=lambda: db_session):
+            process_scan_task(scan_id, modality_objects)
+
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+        assert _get_prediction_count(db_session, scan_id) == 0
+
+        mock_generate_gradient_saliency.assert_not_called()
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    @patch("app.services.ai_tasks.generate_gradient_saliency")
+    def test_inference_failure_marks_failed(
+        self,
+        mock_generate_gradient_saliency,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """Model inference failure marks scan FAILED."""
+        scan_id = "test-worker-fail-005"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = _create_modality_files(db_session, scan_id)
+
+        import torch
+        import numpy as np
+        from app.services.xai import XAIProvenance
+
+        mock_minio_client.fget_object.side_effect = self._mock_fget_object_creates_file
+        mock_preprocess_brats_study.return_value = (
+            torch.randn(1, 4, 224, 224),
+            torch.randn(1, 1, 224, 224),
+            {"slice_index": 50},
+        )
+        mock_model = MagicMock()
+        mock_model.side_effect = RuntimeError("Inference failed")
+        mock_get_global_model.return_value = mock_model
+
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=lambda: db_session):
+            process_scan_task(scan_id, modality_objects)
+
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+        assert _get_prediction_count(db_session, scan_id) == 0
+
+        mock_generate_gradient_saliency.assert_not_called()
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    @patch("app.services.ai_tasks.generate_gradient_saliency")
+    @patch("app.services.ai_tasks.generate_clinical_overlays")
+    def test_xai_generation_failure_marks_failed(
+        self,
+        mock_generate_clinical_overlays,
+        mock_generate_gradient_saliency,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """XAI generation failure marks scan FAILED."""
+        scan_id = "test-worker-fail-006"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = _create_modality_files(db_session, scan_id)
+
+        import torch
+        import numpy as np
+        from app.services.xai import XAIProvenance
+
+        mock_minio_client.fget_object.side_effect = self._mock_fget_object_creates_file
+        mock_preprocess_brats_study.return_value = (
+            torch.randn(1, 4, 224, 224),
+            torch.randn(1, 1, 224, 224),
+            {"slice_index": 50},
+        )
+        mock_model = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)
+        mock_get_global_model.return_value = mock_model
+        mock_generate_gradient_saliency.side_effect = RuntimeError("Gradient computation failed")
+
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=lambda: db_session):
+            process_scan_task(scan_id, modality_objects)
+
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+        assert _get_prediction_count(db_session, scan_id) == 0
+
+        mock_generate_clinical_overlays.assert_not_called()
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    @patch("app.services.ai_tasks.generate_gradient_saliency")
+    @patch("app.services.ai_tasks.generate_clinical_overlays")
+    def test_overlay_generation_failure_marks_failed(
+        self,
+        mock_generate_clinical_overlays,
+        mock_generate_gradient_saliency,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """Overlay generation failure marks scan FAILED."""
+        scan_id = "test-worker-fail-007"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = _create_modality_files(db_session, scan_id)
+
+        import torch
+        import numpy as np
+        from PIL import Image
+        from app.services.xai import XAIProvenance
+
+        mock_minio_client.fget_object.side_effect = self._mock_fget_object_creates_file
+        mock_preprocess_brats_study.return_value = (
+            torch.randn(1, 4, 224, 224),
+            torch.randn(1, 1, 224, 224),
+            {"slice_index": 50},
+        )
+        mock_model = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)
+        mock_get_global_model.return_value = mock_model
+        mock_generate_gradient_saliency.return_value = (
+            np.random.rand(1, 1, 224, 224).astype(np.float32),
+            XAIProvenance(model_checkpoint="test.pth", model_version="test-v1"),
+        )
+        mock_generate_clinical_overlays.side_effect = Exception("OpenCV error")
+
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=lambda: db_session):
+            process_scan_task(scan_id, modality_objects)
+
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+        assert _get_prediction_count(db_session, scan_id) == 0
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    @patch("app.services.ai_tasks.generate_gradient_saliency")
+    @patch("app.services.ai_tasks.generate_clinical_overlays")
+    @patch("app.services.ai_tasks.generate_segmentation_report")
+    def test_report_generation_failure_marks_failed_no_uploads(
+        self,
+        mock_generate_segmentation_report,
+        mock_generate_clinical_overlays,
+        mock_generate_gradient_saliency,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """Report generation failure marks scan FAILED; no uploads occur since report is before uploads."""
+        scan_id = "test-worker-fail-008"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = _create_modality_files(db_session, scan_id)
+
+        import torch
+        import numpy as np
+        from PIL import Image
+        from app.services.xai import XAIProvenance
+
+        mock_minio_client.fget_object.side_effect = self._mock_fget_object_creates_file
+        mock_preprocess_brats_study.return_value = (
+            torch.randn(1, 4, 224, 224),
+            torch.randn(1, 1, 224, 224),
+            {"slice_index": 50},
+        )
+        mock_model = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)
+        mock_get_global_model.return_value = mock_model
+        mock_generate_gradient_saliency.return_value = (
+            np.random.rand(1, 1, 224, 224).astype(np.float32),
+            XAIProvenance(model_checkpoint="test.pth", model_version="test-v1"),
+        )
+        mock_generate_clinical_overlays.return_value = (
+            Image.new("RGB", (224, 224)),
+            Image.new("RGB", (224, 224)),
+            True,
+            np.random.rand(224, 224),
+        )
+        mock_generate_segmentation_report.side_effect = Exception("PDF generation failed")
+
+        from app.services.ai_tasks import upload_file_to_minio
+        with patch("app.services.ai_tasks.upload_file_to_minio") as mock_upload:
+            with patch("app.services.ai_tasks.SessionLocal", side_effect=lambda: db_session):
+                process_scan_task(scan_id, modality_objects)
+
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+        assert _get_prediction_count(db_session, scan_id) == 0
+        assert _get_artifact_count(db_session, scan_id) == 0
+
+        # Report generation happens BEFORE uploads, so no uploads should be attempted
+        assert mock_upload.call_count == 0
+        # No cleanup needed since no uploads happened
+        assert mock_minio_client.remove_object.call_count == 0
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    @patch("app.services.ai_tasks.generate_gradient_saliency")
+    @patch("app.services.ai_tasks.generate_clinical_overlays")
+    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks.upload_file_to_minio")
+    def test_derived_upload_failure_marks_failed_cleans_previous(
+        self,
+        mock_upload_file_to_minio,
+        mock_generate_segmentation_report,
+        mock_generate_clinical_overlays,
+        mock_generate_gradient_saliency,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """Derived artifact upload failure cleans up previously uploaded derived objects."""
+        scan_id = "test-worker-fail-009"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = _create_modality_files(db_session, scan_id)
+
+        import torch
+        import numpy as np
+        from PIL import Image
+        from app.services.xai import XAIProvenance
+
+        mock_minio_client.fget_object.side_effect = self._mock_fget_object_creates_file
+        mock_preprocess_brats_study.return_value = (
+            torch.randn(1, 4, 224, 224),
+            torch.randn(1, 1, 224, 224),
+            {"slice_index": 50},
+        )
+        mock_model = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)
+        mock_get_global_model.return_value = mock_model
+        mock_generate_gradient_saliency.return_value = (
+            np.random.rand(1, 1, 224, 224).astype(np.float32),
+            XAIProvenance(model_checkpoint="test.pth", model_version="test-v1"),
+        )
+        mock_generate_clinical_overlays.return_value = (
+            Image.new("RGB", (224, 224)),
+            Image.new("RGB", (224, 224)),
+            True,
+            np.random.rand(224, 224),
+        )
+        mock_generate_segmentation_report.return_value = None
+
+        # Fail on 3rd upload (report)
+        call_count = [0]
+        def failing_upload(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 3:
+                raise Exception("MinIO upload failed for report")
+        mock_upload_file_to_minio.side_effect = failing_upload
+        mock_minio_client.remove_object = MagicMock()
+
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=lambda: db_session):
+            process_scan_task(scan_id, modality_objects)
+
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+        assert _get_prediction_count(db_session, scan_id) == 0
+        assert _get_artifact_count(db_session, scan_id) == 0
+
+        # Verify 3 uploads attempted (mask, xai, report), xai_raw not reached
+        assert mock_upload_file_to_minio.call_count == 3
+        # Verify cleanup for first 2 (mask, xai)
+        assert mock_minio_client.remove_object.call_count == 2
+
+    @patch("app.services.ai_tasks.minio_client")
+    @patch("app.services.ai_tasks._get_global_model")
+    @patch("app.services.ai_tasks.preprocess_brats_study")
+    @patch("app.services.ai_tasks.generate_gradient_saliency")
+    @patch("app.services.ai_tasks.generate_clinical_overlays")
+    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks.upload_file_to_minio")
+    def test_all_derived_uploads_succeed_db_commit_failure_cleans_all(
+        self,
+        mock_upload_file_to_minio,
+        mock_generate_segmentation_report,
+        mock_generate_clinical_overlays,
+        mock_generate_gradient_saliency,
+        mock_preprocess_brats_study,
+        mock_get_global_model,
+        mock_minio_client,
+        db_session: Session,
+    ):
+        """All derived uploads succeed but DB commit fails -> cleanup all 4, mark FAILED."""
+        scan_id = "test-worker-fail-010"
+        _create_scan(db_session, scan_id, "PENDING")
+        modality_objects = _create_modality_files(db_session, scan_id)
+
+        import torch
+        import numpy as np
+        from PIL import Image
+        from app.services.xai import XAIProvenance
+
+        mock_minio_client.fget_object.side_effect = self._mock_fget_object_creates_file
+        mock_preprocess_brats_study.return_value = (
+            torch.randn(1, 4, 224, 224),
+            torch.randn(1, 1, 224, 224),
+            {"slice_index": 50},
+        )
+        mock_model = MagicMock()
+        mock_model.return_value = torch.randn(1, 1, 224, 224)
+        mock_get_global_model.return_value = mock_model
+        mock_generate_gradient_saliency.return_value = (
+            np.random.rand(1, 1, 224, 224).astype(np.float32),
+            XAIProvenance(model_checkpoint="test.pth", model_version="test-v1"),
+        )
+        mock_generate_clinical_overlays.return_value = (
+            Image.new("RGB", (224, 224)),
+            Image.new("RGB", (224, 224)),
+            True,
+            np.random.rand(224, 224),
+        )
+        mock_generate_segmentation_report.return_value = None
+        mock_upload_file_to_minio.return_value = None
+        mock_minio_client.remove_object = MagicMock()
+
+        # Inject commit failure on primary session only
+        from app.db.database import SessionLocal
+        call_count = [0]
+        def failing_session_local():
+            call_count[0] += 1
+            session = SessionLocal()
+            if call_count[0] == 1:
+                original_commit = session.commit
+                def fail_commit():
+                    raise Exception("Simulated DB commit failure")
+                session.commit = fail_commit
+            return session
+
+        with patch("app.services.ai_tasks.SessionLocal", side_effect=failing_session_local):
+            process_scan_task(scan_id, modality_objects)
+
+        scan_status = _get_scan_status(db_session, scan_id)
+        assert scan_status == "FAILED"
+        assert _get_prediction_count(db_session, scan_id) == 0
+        assert _get_artifact_count(db_session, scan_id) == 0
+
+        # All 4 uploads succeeded
+        assert mock_upload_file_to_minio.call_count == 4
+        # All 4 cleaned up
+        assert mock_minio_client.remove_object.call_count == 4
+
+
+class TestRecoveryLoopFailureStates:
+    """Test failure handling in the stale-PENDING recovery loop."""
+
+    @pytest.mark.asyncio
+    @patch("app.services.ai_tasks.process_scan_task")
+    async def test_recovery_dispatch_failure_continues_loop(
+        self,
+        mock_process_scan_task,
+        db_session: Session,
+    ):
+        """A failed dispatch in recovery loop is logged and loop continues."""
+        from app.services.ai_tasks import _recovery_cycle, STALE_PENDING_THRESHOLD_SECONDS
+        from datetime import datetime, timezone, timedelta
+
+        scan_id = "test-recovery-fail-001"
+        stale_time = datetime.now(timezone.utc) - timedelta(seconds=STALE_PENDING_THRESHOLD_SECONDS + 60)
+        _create_scan(db_session, scan_id, "PENDING")
+        # Manually set created_at to stale time
+        scan = db_session.query(Scan).filter(Scan.id == scan_id).first()
+        scan.created_at = stale_time
+        db_session.commit()
+        _create_modality_files(db_session, scan_id)
+
+        mock_process_scan_task.side_effect = Exception("Simulated worker crash")
+
+        # Should not raise; cycle continues after logged failure
+        pairs = await _recovery_cycle(staleness_seconds=1)
+
+        assert len(pairs) == 1
+        assert pairs[0][0] == scan_id
+        mock_process_scan_task.assert_called_once()
+
+        # Scan should be claimed (PROCESSING) with attempt counted
+        scan = db_session.query(Scan).filter(Scan.id == scan_id).first()
+        assert scan.status == "PROCESSING"
+        assert scan.attempt_count == 1
+
+    @pytest.mark.asyncio
+    @patch("app.services.ai_tasks.process_scan_task")
+    async def test_recovery_cycle_db_error_returns_empty(
+        self,
+        mock_process_scan_task,
+        db_session: Session,
+    ):
+        """Database error during recovery cycle returns empty list, loop survives."""
+        from app.services.ai_tasks import _recovery_cycle, recover_stale_pending_scans
+        from sqlalchemy.exc import OperationalError
+
+        # Mock recover_stale_pending_scans to raise DB error
+        with patch("app.services.ai_tasks.recover_stale_pending_scans", side_effect=OperationalError("DB down", None, None)):
+            pairs = await _recovery_cycle(staleness_seconds=1)
+
+        assert pairs == []
+        mock_process_scan_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_recovery_loop_stop_event(
+        self,
+        db_session: Session,
+    ):
+        """Recovery loop respects stop_event and exits cleanly."""
+        from app.services.ai_tasks import _recovery_loop
+        import asyncio
+
+        stop_event = asyncio.Event()
+        # Set stop immediately
+        stop_event.set()
+
+        # Should exit immediately without running any cycle
+        await _recovery_loop(stop_event, interval_seconds=0.01)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

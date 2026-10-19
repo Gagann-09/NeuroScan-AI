@@ -25,9 +25,23 @@ export type ScanResults = {
   xai_url: string | null
   report_url: string | null
   tumor_detected: boolean
-  anomaly_area_cm2: number | null
-  confidence_score: number | null
-  who_grade: string | null
+  max_tumor_probability: number | null
+  model_version: string | null
+  anomaly_area_cm2?: number | null
+  confidence_score?: number | null
+  who_grade?: string | null
+}
+
+/**
+ * Kaggle classification API response types.
+ */
+export type KaggleScanResults = {
+  scan_id: string
+  class_index: number
+  class_name: string
+  probabilities: Record<string, number>
+  model_version: string
+  image_url: string
 }
 
 /**
@@ -141,10 +155,61 @@ export function createApiClient(
         xai_url: data.xai_url ?? null,
         report_url: data.report_url ?? null,
         tumor_detected: Boolean(data.tumor_detected),
+        max_tumor_probability: data.max_tumor_probability ?? null,
+        model_version: data.model_version ?? null,
         anomaly_area_cm2: data.anomaly_area_cm2 ?? null,
         confidence_score: data.confidence_score ?? null,
         who_grade: data.who_grade ?? null,
       }
+    },
+
+    async uploadKaggleScan(file: File): Promise<{ scan_id: string }> {
+      const formData = new FormData()
+      formData.append("file", file)
+
+      const response = await authedFetch(
+        getIdToken,
+        onUnauthorized,
+        `${API_BASE_URL}/api/v1/scans/kaggle/upload`,
+        {
+          method: "POST",
+          body: formData,
+        }
+      )
+
+      if (!response.ok) {
+        throw new Error(await parseError(response))
+      }
+
+      return response.json()
+    },
+
+    async getKaggleScanStatus(scanId: string): Promise<{ status: string }> {
+      const response = await authedFetch(
+        getIdToken,
+        onUnauthorized,
+        `${API_BASE_URL}/api/v1/scans/kaggle/status/${scanId}`
+      )
+
+      if (!response.ok) {
+        throw new Error(await parseError(response))
+      }
+
+      return response.json()
+    },
+
+    async getKaggleScanResults(scanId: string): Promise<KaggleScanResults> {
+      const response = await authedFetch(
+        getIdToken,
+        onUnauthorized,
+        `${API_BASE_URL}/api/v1/scans/kaggle/results/${scanId}`
+      )
+
+      if (!response.ok) {
+        throw new Error(await parseError(response))
+      }
+
+      return response.json()
     },
   }
 }

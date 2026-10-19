@@ -121,21 +121,36 @@ export function UploadPill({ onAnalyze }: UploadPillProps) {
               onDragOver={handleDragOver(modality)}
               onDragLeave={handleDragLeave}
               onDrop={handleDrop(modality)}
+              onClick={() => {
+                if (!file) {
+                  document.getElementById(`file-input-${modality}`)?.click()
+                }
+              }}
               className={`relative bg-card/80 backdrop-blur-3xl border shadow-[0_20px_60px_rgba(0,0,0,0.6)] flex flex-col transition-all duration-300 ${
                 dragging
                   ? "border-neuro-cyan/70 ring-2 ring-neuro-cyan/30"
                   : file
                   ? "border-neuro-cyan/50"
-                  : "border-white/10"
+                  : "border-white/10 hover:border-white/20 cursor-pointer"
               } rounded-2xl p-4 min-h-[180px]`}
             >
+              <input
+                type="file"
+                id={`file-input-${modality}`}
+                accept=".nii,.nii.gz"
+                className="hidden"
+                onChange={handleFileSelect(modality)}
+              />
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-medium text-white/70 uppercase tracking-wide">
                   {MODALITY_LABELS[modality]}
                 </span>
                 {file && (
                   <button
-                    onClick={() => clearFile(modality)}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      clearFile(modality)
+                    }}
                     aria-label={`Remove ${MODALITY_LABELS[modality]}`}
                     className="bg-white/10 hover:bg-destructive border border-white/20 rounded-full p-1 text-white opacity-0 group-hover:opacity-100 transition-opacity"
                   >

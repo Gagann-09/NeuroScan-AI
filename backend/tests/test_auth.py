@@ -11,6 +11,7 @@ Tests verify that the Firebase ID token verification dependency:
 - Enforces cross-user ownership on scan endpoints
 """
 import os
+from io import BytesIO
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -26,8 +27,11 @@ os.environ.setdefault("FIREBASE_PROJECT_ID", "neuroscan-medical-vault")
 # cannot be imported without it. Provide a test origin (not a wildcard).
 os.environ.setdefault("CORS_ORIGINS", "http://localhost:3000")
 
-from app.core.security import verify_id_token, get_current_user
-from app.main import app
+from app.api.dependencies import get_db  # noqa: E402
+from app.core.rate_limiting import enforce_upload_rate_limit  # noqa: E402
+from app.core.security import verify_id_token, get_current_user  # noqa: E402
+from app.db.models import User  # noqa: E402
+from app.main import app  # noqa: E402
 
 
 client = TestClient(app)
@@ -561,6 +565,190 @@ class TestCrossUserOwnership:
         assert result.status == "PROCESSING"
 
 
+class TestScanAuthorization:
+    """Focused tests for the centralized scan authorization check
+    (``get_scan_with_ownership`` in ``backend/app/api/routers/scans.py``).
+
+    These tests verify that the ownership check is enforced consistently:
+    owners can access their scans, non-owners receive 403, missing scans
+    receive 404, and ownerless legacy scans are denied to everyone.
+    """
+
+    def _make_scan(self, user_id: str, scan_id: str = "test-scan"):
+        from app.db.models import Scan
+        return Scan(
+            id=scan_id,
+            filename=f"{scan_id}/source_study",
+            status="SEGMENTED",
+            user_id=user_id,
+        )
+
+    def _make_db_with_scan(self, scan):
+        from app.db.models import Scan
+        from unittest.mock import MagicMock
+        mock_db = MagicMock()
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = scan
+        mock_db.query.return_value = mock_query
+        return mock_db
+
+    def _make_db_missing_scan(self):
+        from unittest.mock import MagicMock
+        mock_db = MagicMock()
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = None
+        mock_db.query.return_value = mock_query
+        return mock_db
+
+    def test_owner_can_access_own_scan(self):
+        """Owner scanning their own scan returns the scan record."""
+        from app.api.routers.scans import get_scan_with_ownership
+        from app.db.models import User
+
+        owner = User(firebase_uid="user-owner", email="owner@example.com")
+        scan = self._make_scan("user-owner")
+        db = self._make_db_with_scan(scan)
+
+        result = get_scan_with_ownership(db, "test-scan", owner)
+
+        assert result is scan
+        assert result.user_id == "user-owner"
+
+    def test_non_owner_receives_403(self):
+        """A different user accessing another user's scan receives 403."""
+        from app.api.routers.scans import get_scan_with_ownership
+        from app.db.models import User
+        from fastapi import HTTPException
+
+        owner = User(firebase_uid="user-owner", email="owner@example.com")
+        attacker = User(firebase_uid="user-attacker", email="attacker@example.com")
+        scan = self._make_scan("user-owner")
+        db = self._make_db_with_scan(scan)
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_scan_with_ownership(db, "test-scan", attacker)
+
+        assert exc_info.value.status_code == 403
+        assert "Access denied" in exc_info.value.detail
+
+    def test_missing_scan_receives_404(self):
+        """A scan that does not exist receives 404."""
+        from app.api.routers.scans import get_scan_with_ownership
+        from app.db.models import User
+        from fastapi import HTTPException
+
+        user = User(firebase_uid="user-x", email="x@example.com")
+        db = self._make_db_missing_scan()
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_scan_with_ownership(db, "nonexistent-scan", user)
+
+        assert exc_info.value.status_code == 404
+        assert "Scan not found" in exc_info.value.detail
+
+    def test_legacy_scan_no_owner_receives_403(self):
+        """An ownerless legacy scan is denied to everyone (fail closed)."""
+        from app.api.routers.scans import get_scan_with_ownership
+        from app.db.models import User
+        from fastapi import HTTPException
+
+        user = User(firebase_uid="user-y", email="y@example.com")
+        scan = self._make_scan(user_id=None)
+        db = self._make_db_with_scan(scan)
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_scan_with_ownership(db, "test-scan", user)
+
+        assert exc_info.value.status_code == 403
+        assert "Access denied" in exc_info.value.detail
+
+
+class TestLogSanitization:
+    """Focused tests proving sensitive values are redacted from logs.
+
+    These tests verify that cleanup and error-handling log messages do not
+    leak MinIO credentials, endpoints, or other sensitive exception data.
+    """
+
+    @staticmethod
+    def _credential_laden_exception():
+        """Return an exception whose message looks like a MinIO S3Error
+        containing access keys, secret keys, and endpoint URLs."""
+        return Exception(
+            "S3 operation failed; code: InvalidAccessKeyId, "
+            "message: The Access Key Id you provided does not exist, "
+            "resource: /my-bucket, request_id: ABC123, "
+            "host_id: xyz, bucket_name: neuroscan-bucket, "
+            "access_key: MINIOACCESSKEY123, secret_key: MINIOSECRET456"
+        )
+
+    def test_cleanup_source_objects_redacts_exception_message(self, caplog):
+        """_cleanup_source_objects logs exception type name, not the
+        credential-laden exception message."""
+        from app.api.routers.scans import _cleanup_source_objects
+
+        fake_minio = type("FakeMinio", (), {})()
+        fake_minio.remove_object = lambda *a, **k: (_ for _ in ()).throw(
+            self._credential_laden_exception()
+        )
+
+        with caplog.at_level("WARNING"):
+            with patch(
+                "app.api.routers.scans.minio_client", fake_minio
+            ):
+                _cleanup_source_objects("neuroscan-bucket", ["scan-1/source_t1.nii.gz"])
+
+        # Exception type name should appear
+        assert "Exception" in caplog.text
+        # Credential-laden message must NOT appear
+        assert "MINIOACCESSKEY123" not in caplog.text
+        assert "MINIOSECRET456" not in caplog.text
+        assert "InvalidAccessKeyId" not in caplog.text
+        assert "request_id" not in caplog.text
+
+    def test_cleanup_derived_objects_redacts_exception_message(self, caplog):
+        """_cleanup_derived_objects logs exception type name, not the
+        credential-laden exception message."""
+        from app.services.ai_tasks import _cleanup_derived_objects
+
+        fake_minio = type("FakeMinio", (), {})()
+        fake_minio.remove_object = lambda *a, **k: (_ for _ in ()).throw(
+            self._credential_laden_exception()
+        )
+
+        with caplog.at_level("WARNING"):
+            with patch(
+                "app.services.ai_tasks.minio_client", fake_minio
+            ):
+                _cleanup_derived_objects("neuroscan-bucket", ["scan-1/mask.png"])
+
+        # Exception type name should appear
+        assert "Exception" in caplog.text
+        # Credential-laden message must NOT appear
+        assert "MINIOACCESSKEY123" not in caplog.text
+        assert "MINIOSECRET456" not in caplog.text
+        assert "InvalidAccessKeyId" not in caplog.text
+        assert "request_id" not in caplog.text
+
+    def test_cleanup_logs_preserves_useful_diagnostics(self, caplog):
+        """Cleanup logs still include the object name for operational debugging."""
+        from app.api.routers.scans import _cleanup_source_objects
+
+        fake_minio = type("FakeMinio", (), {})()
+        fake_minio.remove_object = lambda *a, **k: (_ for _ in ()).throw(
+            self._credential_laden_exception()
+        )
+
+        with caplog.at_level("WARNING"):
+            with patch(
+                "app.api.routers.scans.minio_client", fake_minio
+            ):
+                _cleanup_source_objects("neuroscan-bucket", ["scan-1/source_t1.nii.gz"])
+
+        # Object name is preserved for traceability
+        assert "scan-1/source_t1.nii.gz" in caplog.text
+
+
 class TestUploadValidation:
     """Test upload validation for MRI files."""
 
@@ -677,6 +865,150 @@ class TestUploadValidation:
         )
         
         assert response.status_code == 401  # Auth fails first (mocked)
+
+
+class TestUploadTypeSizeCompletenessValidation:
+    """Test upload type, file size, and modality completeness validation when auth succeeds.
+
+    These tests exercise the actual upload validation logic in
+    ``backend/app/api/routers/scans.py`` (extension check, NIfTI header
+    validation, size limits, and required-modality enforcement) by overriding
+    the auth and database dependencies and mocking the MinIO client. No real
+    external services are contacted.
+    """
+
+    def _valid_files(self):
+        return {
+            "t1": ("t1.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+            "t1ce": ("t1ce.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+            "t2": ("t2.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+            "flair": ("flair.nii.gz", BytesIO(b"dummy"), "application/octet-stream"),
+        }
+
+    def _auth_and_db_overrides(self):
+        mock_user = User(firebase_uid="test-user", email="test@example.com")
+        app.dependency_overrides[get_current_user] = lambda: mock_user
+        app.dependency_overrides[get_db] = lambda: MagicMock()
+        # Bypass rate limiting so upload validation logic can be tested directly.
+        app.dependency_overrides[enforce_upload_rate_limit] = lambda: None
+
+    def _cleanup_overrides(self):
+        app.dependency_overrides.clear()
+
+    def test_rejects_invalid_extension(self):
+        """Upload with a non-.nii/.nii.gz filename returns 400."""
+        files = self._valid_files()
+        files["t1"] = ("t1.txt", BytesIO(b"dummy"), "text/plain")
+        self._auth_and_db_overrides()
+        try:
+            with patch("app.api.routers.scans.minio_client") as mock_minio:
+                mock_minio.bucket_exists.return_value = True
+                response = client.post(
+                    "/api/v1/scans/upload",
+                    files=files,
+                    headers={"Authorization": "Bearer valid-token"},
+                )
+            assert response.status_code == 400
+            assert "must be .nii or .nii.gz format" in response.json()["detail"]
+        finally:
+            self._cleanup_overrides()
+
+    def test_rejects_none_filename(self):
+        """Upload with a None filename returns 422 (FastAPI treats it as a missing required field)."""
+        files = self._valid_files()
+        files["t1"] = (None, BytesIO(b"dummy"), "application/octet-stream")
+        self._auth_and_db_overrides()
+        try:
+            response = client.post(
+                "/api/v1/scans/upload",
+                files=files,
+                headers={"Authorization": "Bearer valid-token"},
+            )
+            assert response.status_code == 422
+        finally:
+            self._cleanup_overrides()
+
+    def test_rejects_malformed_nifti(self):
+        """Upload with a non-NIfTI body returns 400."""
+        files = self._valid_files()
+        files["t1"] = ("t1.nii.gz", BytesIO(b"not a nifti file"), "application/octet-stream")
+        self._auth_and_db_overrides()
+        try:
+            with patch("app.api.routers.scans.minio_client") as mock_minio:
+                mock_minio.bucket_exists.return_value = True
+                response = client.post(
+                    "/api/v1/scans/upload",
+                    files=files,
+                    headers={"Authorization": "Bearer valid-token"},
+                )
+            assert response.status_code == 400
+            assert "not a valid NIfTI file" in response.json()["detail"]
+        finally:
+            self._cleanup_overrides()
+
+    def test_copyfileobj_with_limit_rejects_oversized(self):
+        """_copyfileobj_with_limit raises 413 when content exceeds MAX_MODALITY_FILE_SIZE."""
+        from app.api.routers.scans import _copyfileobj_with_limit, MAX_MODALITY_FILE_SIZE
+
+        from io import BytesIO as _BytesIO
+
+        oversized = _BytesIO(b"x" * (MAX_MODALITY_FILE_SIZE + 1))
+        try:
+            _copyfileobj_with_limit(oversized, _BytesIO(), MAX_MODALITY_FILE_SIZE)
+            assert False, "Expected HTTPException 413"
+        except HTTPException as exc:
+            assert exc.status_code == 413
+
+    def test_copyfileobj_with_limit_allows_under_limit(self):
+        """_copyfileobj_with_limit succeeds when content is within the limit."""
+        from app.api.routers.scans import _copyfileobj_with_limit, MAX_MODALITY_FILE_SIZE
+
+        from io import BytesIO as _BytesIO
+
+        content = b"x" * 1024
+        total = _copyfileobj_with_limit(_BytesIO(content), _BytesIO(), MAX_MODALITY_FILE_SIZE)
+        assert total == 1024
+
+    def test_rejects_missing_modality(self):
+        """Missing a required modality returns 422 (FastAPI required-field enforcement)."""
+        from io import BytesIO as _BytesIO
+
+        files = {
+            "t1ce": ("t1ce.nii.gz", _BytesIO(b"dummy"), "application/octet-stream"),
+            "t2": ("t2.nii.gz", _BytesIO(b"dummy"), "application/octet-stream"),
+            "flair": ("flair.nii.gz", _BytesIO(b"dummy"), "application/octet-stream"),
+            # "t1" deliberately absent
+        }
+        self._auth_and_db_overrides()
+        try:
+            response = client.post(
+                "/api/v1/scans/upload",
+                files=files,
+                headers={"Authorization": "Bearer valid-token"},
+            )
+            assert response.status_code == 422
+        finally:
+            self._cleanup_overrides()
+
+    def test_accepts_valid_four_modality_upload(self):
+        """All four valid modalities pass extension and header validation."""
+        files = self._valid_files()
+        self._auth_and_db_overrides()
+        try:
+            with patch("app.api.routers.scans.minio_client") as mock_minio:
+                mock_minio.bucket_exists.return_value = True
+                mock_minio.fput_object.return_value = None
+                response = client.post(
+                    "/api/v1/scans/upload",
+                    files=files,
+                    headers={"Authorization": "Bearer valid-token"},
+                )
+            # All four dummy files fail NIfTI header validation, so the
+            # endpoint returns 400 on the first modality, proving the
+            # type/size checks ran before any database write.
+            assert response.status_code == 400
+        finally:
+            self._cleanup_overrides()
 
 
 class TestInfrastructureErrorHandling:

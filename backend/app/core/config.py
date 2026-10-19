@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     # ── Firebase Authentication ──
     # No default - must be provided via environment variable
     FIREBASE_PROJECT_ID: str
+    # Override the google-auth quota project for Identity Toolkit API calls.
+    # Required when local ADC authorized_user credentials have a different
+    # quota_project_id than the Firebase project. Defaults to FIREBASE_PROJECT_ID
+    # if not explicitly set. Set via GOOGLE_CLOUD_QUOTA_PROJECT env var.
+    GOOGLE_CLOUD_QUOTA_PROJECT: str = ""
 
     # ── Application ──
     APP_TITLE: str = "NeuroScan AI API"

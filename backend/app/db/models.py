@@ -86,3 +86,49 @@ class Artifact(Base):
             name='ck_artifact_status_valid'
         ),
     )
+
+
+class KaggleScan(Base):
+    """Kaggle single-image classification scan.
+
+    Distinct from BraTS Scan (4-modality NIfTI segmentation).
+    """
+    __tablename__ = "kaggle_scans"
+
+    id = Column(String, primary_key=True, index=True)
+    filename = Column(String)
+    status = Column(String, default="PENDING")
+    image_path = Column(String, nullable=True)  # MinIO object path for source JPG/PNG
+    created_at = Column(DateTime, default=datetime.utcnow)
+    processing_started_at = Column(DateTime, nullable=True)
+    user_id = Column(String, ForeignKey("users.firebase_uid"), index=True, nullable=True)
+
+
+class KaggleModelVersion(Base):
+    """Kaggle classifier model version provenance.
+
+    Separate from BraTS ModelVersion to maintain clear dataset-provenance boundary.
+    """
+    __tablename__ = "kaggle_model_versions"
+
+    id = Column(String, primary_key=True, index=True)
+    checkpoint_path = Column(String, nullable=False)
+    config_hash = Column(String, nullable=True)
+    preprocessing_version = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class KagglePrediction(Base):
+    """Kaggle classification prediction result.
+
+    Contains class probabilities for the 4 tumor types: glioma, meningioma, notumor, pituitary.
+    """
+    __tablename__ = "kaggle_predictions"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    scan_id = Column(String, ForeignKey("kaggle_scans.id"), index=True, nullable=False)
+    model_version_id = Column(String, ForeignKey("kaggle_model_versions.id"), index=True, nullable=True)
+    class_index = Column(Integer, nullable=True)  # 0=glioma, 1=meningioma, 2=notumor, 3=pituitary
+    class_name = Column(String, nullable=True)
+    probabilities = Column(sa.JSON, nullable=True)  # {"glioma": 0.1, "meningioma": 0.2, "notumor": 0.6, "pituitary": 0.1}
+    created_at = Column(DateTime, default=datetime.utcnow)

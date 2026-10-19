@@ -36,3 +36,28 @@ class ResultsResponse(BaseModel):
     tumor_detected: bool = Field(False, description="Whether a tumor was detected")
     max_tumor_probability: float = Field(0.0, description="Maximum tumor probability from model output (raw sigmoid)")
     model_version: Optional[str] = Field(None, description="Model version identifier")
+
+
+# --- Kaggle Classification Schemas ---
+
+class KaggleUploadResponse(BaseModel):
+    """Response schema for POST /api/v1/scans/kaggle/upload."""
+    message: str = Field(..., description="Human-readable upload status message")
+    scan_id: str = Field(..., description="Unique identifier for the uploaded scan")
+    status: str = Field(..., description="Current processing status")
+
+
+class KaggleStatusResponse(BaseModel):
+    """Response schema for GET /api/v1/scans/kaggle/status/{scan_id}."""
+    scan_id: str = Field(..., description="Unique identifier for the scan")
+    status: str = Field(..., description="Current processing status")
+
+
+class KaggleResultsResponse(BaseModel):
+    """Response schema for GET /api/v1/scans/kaggle/results/{scan_id}."""
+    scan_id: str = Field(..., description="Unique identifier for the scan")
+    class_index: Optional[int] = Field(None, description="Predicted class index (0=glioma, 1=meningioma, 2=notumor, 3=pituitary)")
+    class_name: Optional[str] = Field(None, description="Predicted class name")
+    probabilities: Optional[dict] = Field(None, description="Class probabilities: glioma, meningioma, notumor, pituitary")
+    model_version: Optional[str] = Field(None, description="Model version identifier")
+    image_url: Optional[str] = Field(None, description="Presigned URL for the source image")

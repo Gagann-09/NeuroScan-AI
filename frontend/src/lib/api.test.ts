@@ -122,4 +122,94 @@ describe('API Client', () => {
 
     expect(mockOnUnauthorized).not.toHaveBeenCalled()
   })
+
+  describe('Kaggle classification API', () => {
+    it('uploadKaggleScan attaches Authorization header and posts to kaggle upload endpoint', async () => {
+      mockGetIdToken.mockResolvedValue('test-id-token')
+
+      const mockResponse = {
+        ok: true,
+        json: vi.fn().mockResolvedValue({ scan_id: 'kaggle-scan-123', status: 'PROCESSING' }),
+      }
+      ;(global.fetch as vi.Mock).mockResolvedValue(mockResponse)
+
+      const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
+      await api.uploadKaggleScan(new File([''], 'mri.jpg', { type: 'image/jpeg' }))
+
+      expect(global.fetch).toHaveBeenCalledWith(
+        'http://127.0.0.1:8000/api/v1/scans/kaggle/upload',
+        expect.objectContaining({
+          method: 'POST',
+          headers: expect.any(Headers),
+        })
+      )
+
+      const fetchCall = (global.fetch as vi.Mock).mock.calls[0]
+      const headers = fetchCall[1]?.headers as Headers
+      expect(headers.get('Authorization')).toBe('Bearer test-id-token')
+    })
+
+    it('uploadKaggleScan throws on non-ok response', async () => {
+      mockGetIdToken.mockResolvedValue('test-id-token')
+
+      const mockResponse = {
+        ok: false,
+        status: 400,
+        json: vi.fn().mockResolvedValue({ detail: 'File must be .jpg, .jpeg, or .png format' }),
+      }
+      ;(global.fetch as vi.Mock).mockResolvedValue(mockResponse)
+
+      const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
+
+      await expect(
+        api.uploadKaggleScan(new File([''], 'bad.xyz'))
+      ).rejects.toThrow('File must be .jpg, .jpeg, or .png format')
+    })
+
+    it('getKaggleScanStatus calls kaggle status endpoint', async () => {
+      mockGetIdToken.mockResolvedValue('test-id-token')
+
+      const mockResponse = {
+        ok: true,
+        json: vi.fn().mockResolvedValue({ scan_id: 'kaggle-scan-123', status: 'COMPLETED' }),
+      }
+      ;(global.fetch as vi.Mock).mockResolvedValue(mockResponse)
+
+      const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
+      const result = await api.getKaggleScanStatus('kaggle-scan-123')
+
+      expect(global.fetch).toHaveBeenCalledWith(
+        'http://127.0.0.1:8000/api/v1/scans/kaggle/status/kaggle-scan-123',
+        expect.anything()
+      )
+      expect(result.status).toBe('COMPLETED')
+    })
+
+    it('getKaggleScanResults calls kaggle results endpoint', async () => {
+      mockGetIdToken.mockResolvedValue('test-id-token')
+
+      const mockResponse = {
+        ok: true,
+        json: vi.fn().mockResolvedValue({
+          scan_id: 'kaggle-scan-123',
+          class_index: 1,
+          class_name: 'meningioma',
+          probabilities: { glioma: 0.12, meningioma: 0.78, notumor: 0.05, pituitary: 0.05 },
+          model_version: 'kaggle-cnn-v1.0',
+          image_url: '/kaggle-mri-sample.jpg',
+        }),
+      }
+      ;(global.fetch as vi.Mock).mockResolvedValue(mockResponse)
+
+      const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
+      const result = await api.getKaggleScanResults('kaggle-scan-123')
+
+      expect(global.fetch).toHaveBeenCalledWith(
+        'http://127.0.0.1:8000/api/v1/scans/kaggle/results/kaggle-scan-123',
+        expect.anything()
+      )
+      expect(result.class_name).toBe('meningioma')
+      expect(result.image_url).toBe('/kaggle-mri-sample.jpg')
+    })
+  })
 })

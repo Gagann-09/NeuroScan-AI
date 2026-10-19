@@ -180,7 +180,7 @@ class TestConstants:
     def test_constants_defined_in_module(self):
         """Key constants are defined in ai_tasks module source."""
         # Read the source file directly without importing the module
-        with open(AI_TASKS_PATH, "r") as f:
+        with open(AI_TASKS_PATH, "r", encoding="utf-8") as f:
             source = f.read()
         
         assert "WEIGHTS_PATH" in source

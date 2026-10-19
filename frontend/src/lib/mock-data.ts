@@ -1,9 +1,9 @@
 export type ScanResults = {
   scanId: string
-  confidence: number
-  anomalyArea: number
+  confidence: number | null
+  anomalyArea: number | null
   tumorGrade: string
-  volume: number
+  volume: number | null
   layers: { label: string; robustness: number; adversarial: number; peak?: boolean }[]
   confidencePills: number
   anomalyPills: number
@@ -15,7 +15,17 @@ export type ScanResults = {
   patient: { label: string; value: string }[]
   dicom: { tag: string; label: string; value: string }[]
   telemetry: { label: string; value: string; sub: string }[]
-  classProbabilities: { label: string; value: number; accent: "cyan" | "lime" | "violet" | "muted" }[]
+  classProbabilities: { label: string; value: number | null; accent: "cyan" | "lime" | "violet" | "muted" }[]
+}
+
+// Kaggle classification results
+export type KaggleResults = {
+  scanId: string
+  class_name: string
+  class_index: number
+  probabilities: Record<string, number>
+  model_version: string
+  image_url: string
 }
 
 // Simulated ARMT-GAN inference output scaffold.
@@ -62,17 +72,32 @@ export const MOCK_RESULTS: ScanResults = {
     { tag: "(0020,0013)", label: "InstanceNumber", value: "042" },
   ],
   telemetry: [
-    { label: "Inference latency", value: "1.84s", sub: "ARMT-GAN forward pass" },
-    { label: "Active parameters", value: "312M", sub: "quantized int8" },
-    { label: "Dice coefficient", value: "0.947", sub: "vs. expert mask" },
-    { label: "Hausdorff dist.", value: "2.1mm", sub: "boundary error" },
+    { label: "Inference latency", value: "2.1s", sub: "ARMT-GAN forward pass" },
+    { label: "Model parameters", value: "7.7M", sub: "PyTorch float32" },
+    { label: "Benchmark Dice", value: "N/A", sub: "Unverified reference" },
+    { label: "Boundary error", value: "N/A", sub: "Unverified reference" },
   ],
   classProbabilities: [
-    { label: "Enhancing tumor", value: 98.7, accent: "lime" },
-    { label: "Peritumoral edema", value: 74.2, accent: "cyan" },
-    { label: "Necrotic core", value: 41.5, accent: "violet" },
-    { label: "Healthy tissue", value: 12.3, accent: "muted" },
+    { label: "Whole tumor (Binary)", value: 98.7, accent: "lime" },
+    { label: "Enhancing tumor (ET)", value: null, accent: "muted" },
+    { label: "Peritumoral edema (ED)", value: null, accent: "muted" },
+    { label: "Necrotic core (NCR)", value: null, accent: "muted" },
   ],
+}
+
+// Kaggle classification mock results
+export const MOCK_KAGGLE_RESULTS: KaggleResults = {
+  scanId: "SCN-KAGGLE-001",
+  class_name: "meningioma",
+  class_index: 1,
+  probabilities: {
+    glioma: 0.12,
+    meningioma: 0.78,
+    notumor: 0.05,
+    pituitary: 0.05,
+  },
+  model_version: "kaggle-cnn-v1.0",
+  image_url: "/kaggle-mri-sample.jpg",
 }
 
 export const PROCESSING_STAGES = [

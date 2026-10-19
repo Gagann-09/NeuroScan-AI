@@ -5,6 +5,7 @@ Provides lazy Firebase Admin SDK initialization and ID token verification
 with revocation checking for FastAPI dependency injection.
 """
 import logging
+import os
 from functools import lru_cache
 from typing import Optional
 
@@ -41,9 +42,18 @@ def _get_firebase_app() -> None:
         return
 
     settings = get_settings()
+    # Ensure google-auth uses the intended Firebase project for API quota
+    # (e.g. Identity Toolkit accounts:lookup during check_revoked=True).
+    # Setting GOOGLE_CLOUD_QUOTA_PROJECT in os.environ before ApplicationDefault()
+    # is the standard, documented google-auth mechanism that avoids private SDK internals.
+    quota_project = settings.GOOGLE_CLOUD_QUOTA_PROJECT or settings.FIREBASE_PROJECT_ID
+    if quota_project and "GOOGLE_CLOUD_QUOTA_PROJECT" not in os.environ:
+        os.environ["GOOGLE_CLOUD_QUOTA_PROJECT"] = quota_project
+
     try:
         cred = credentials.ApplicationDefault()
         initialize_app(cred, {"projectId": settings.FIREBASE_PROJECT_ID})
+
     except GoogleAuthError as e:
         # Missing ADC, invalid credentials, or other Google auth infrastructure failure
         logger.error("Firebase Admin SDK initialization failed: GoogleAuthError", exc_info=True)

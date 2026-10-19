@@ -1,22 +1,32 @@
 "use client";
-import React, { useState } from "react";
-import { signInWithEmailAndPassword } from "firebase/auth";
+import React, { useState, useEffect } from "react";
+import { signInWithEmailAndPassword, setPersistence, browserSessionPersistence } from "firebase/auth";
 import { auth } from "@/lib/firebase";
+import { useAuth } from "@/lib/auth-context";
 import { useRouter } from "next/navigation";
 import { Loader2, BrainCircuit, Lock } from "lucide-react";
 import { BrainNodes } from "@/components/brain-nodes";
 
 const ALLOWED_EMAILS = [
-    "1MEHK23@manipal.in",
-    "2AIMM22@aiims.in"
+    "1mehk23@manipal.ac.in",
+    "2aimm22@aiims.ac.in",
+    "1mehk23@manipal.in",
+    "2aimm22@aiims.in",
 ];
 
 export default function LoginPage() {
+    const { user, loading } = useAuth();
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
     const [error, setError] = useState<string | null>(null);
     const [isLoading, setIsLoading] = useState(false);
     const router = useRouter();
+
+    useEffect(() => {
+        if (!loading && user) {
+            router.replace("/");
+        }
+    }, [user, loading, router]);
 
     const handleLogin = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -25,20 +35,29 @@ export default function LoginPage() {
 
         const cleanEmail = email.trim();
 
-        if (!ALLOWED_EMAILS.includes(cleanEmail)) {
+        if (!ALLOWED_EMAILS.includes(cleanEmail.toLowerCase())) {
             setError("Unauthorized institutional credentials.");
             setIsLoading(false);
             return;
         }
 
         try {
+            await setPersistence(auth, browserSessionPersistence);
             await signInWithEmailAndPassword(auth, cleanEmail, password);
-            router.push("/");
+            router.replace("/");
         } catch (err: any) {
             setError("Invalid authorization key or password.");
             setIsLoading(false);
         }
     };
+
+    if (loading || user) {
+        return (
+            <div className="min-h-screen bg-[#030305] flex items-center justify-center text-white">
+                <Loader2 className="h-8 w-8 animate-spin text-[#00f0ff]" />
+            </div>
+        );
+    }
 
     return (
         <div className="min-h-screen bg-[#030305] text-white font-sans relative overflow-hidden flex items-center justify-center p-4">

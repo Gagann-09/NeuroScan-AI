@@ -36,7 +36,7 @@ FOOTER_TEXT_Y = PAGE_H_MM - 14.0
 # Section image box: wide enough for detail, short enough to keep pages
 # balanced. Aspect ratio is always preserved; the box is never stretched.
 IMAGE_MAX_W = 150.0
-IMAGE_MAX_H = 95.0
+IMAGE_MAX_H = 72.0
 UNAVAILABLE_BOX_H = 60.0
 
 # ------------------------------------------------------------------ palette
@@ -267,6 +267,153 @@ class _ReportPDF(FPDF):
             y += row_h
         self.set_y(block_top + block_h + 7.0)
 
+    def _segmentation_measurements_block(
+        self,
+        predicted_mask_pixels=None,
+        slice_coverage_percent=None,
+    ):
+        """Report technical measurements for the selected 2D slice only."""
+
+        pixels_value = (
+            f"{predicted_mask_pixels:,} pixels"
+            if predicted_mask_pixels is not None
+            else "Unavailable"
+        )
+        coverage_value = (
+            f"{slice_coverage_percent:.4f}%"
+            if slice_coverage_percent is not None
+            else "Unavailable"
+        )
+
+        rows = [
+            ("Predicted Mask Pixels", pixels_value),
+            ("Slice Coverage", coverage_value),
+            (
+                "Measurement Basis",
+                "Raw model probabilities >= 0.5 on the selected 224 x 224 slice",
+            ),
+        ]
+
+        label_w = 46.0
+        label_x = MARGIN_L + 8.0
+        value_x = label_x + label_w
+        value_w = CONTENT_W - 8.0 - label_w
+        line_h = 4.35
+        row_pad = 2.2
+        min_row_h = 6.6
+
+        row_specs = []
+        y = self.get_y()
+        for label, value in rows:
+            value_lines = self._wrap_text(value, value_w - 1.0, 9)
+            row_h = max(min_row_h, len(value_lines) * line_h + row_pad)
+            row_specs.append((label, value_lines, row_h))
+            y += row_h
+
+        block_top = self.get_y()
+        block_h = y - block_top + 4.0
+
+        heading_height = 12.0
+        if (
+            block_top + heading_height + block_h > CONTENT_BOTTOM
+        ):
+            self.add_page()
+            block_top = self.get_y()
+
+        self._section_heading("", "2D Segmentation Measurements")
+
+        self._box(MARGIN_L, block_top, CONTENT_W, block_h)
+
+        y = block_top + 2.0
+        for label, value_lines, row_h in row_specs:
+            self.set_fill_color(*ACCENT)
+            self.rect(MARGIN_L, y + 2.0, 2.6, 2.6, style="F")
+
+            self.set_font("helvetica", "B", 9)
+            self.set_text_color(*NAVY_SOFT)
+            self.set_xy(label_x, y + 1.0)
+            self.cell(label_w, line_h, label)
+
+            self.set_font("helvetica", "", 9)
+            self.set_text_color(*INK)
+            line_y = y + 1.0
+            for line in value_lines:
+                self.set_xy(value_x, line_y)
+                self.cell(value_w, line_h, line)
+                line_y += line_h
+
+            y += row_h
+
+        self.set_y(block_top + block_h + 2.0)
+        self._caption(
+            "These are technical measurements of one 2D model output slice. "
+            "They are not physical tumor area or volume, diagnostic accuracy, "
+            "or evidence of clinical validation."
+        )
+        self.ln(2.0)
+
+    # ------------------------------------------------------------- sections
+
+
+    def _classification_grading_block(self):
+        """Report classification and grading limits without inventing results."""
+        self._section_heading("", "Classification and Grading")
+
+        rows = [
+            ("Tumor Type", "Not determined by ARMT-GAN segmentation"),
+            (
+                "WHO Grade / Stage",
+                "Not determined; no validated grading output is available",
+            ),
+        ]
+
+        label_w = 46.0
+        label_x = MARGIN_L + 8.0
+        value_x = label_x + label_w
+        value_w = CONTENT_W - 8.0 - label_w
+        line_h = 4.35
+        row_pad = 2.2
+        min_row_h = 6.6
+
+        row_specs = []
+        y = self.get_y()
+        for label, value in rows:
+            value_lines = self._wrap_text(value, value_w - 1.0, 9)
+            row_h = max(min_row_h, len(value_lines) * line_h + row_pad)
+            row_specs.append((label, value_lines, row_h))
+            y += row_h
+
+        block_top = self.get_y()
+        block_h = y - block_top + 4.0
+
+        if block_top + block_h > CONTENT_BOTTOM:
+            self.add_page()
+            block_top = self.get_y()
+
+        self._box(MARGIN_L, block_top, CONTENT_W, block_h)
+
+        y = block_top + 2.0
+        for label, value_lines, row_h in row_specs:
+            self.set_fill_color(*ACCENT)
+            self.rect(MARGIN_L, y + 2.0, 2.6, 2.6, style="F")
+
+            self.set_font("helvetica", "B", 9)
+            self.set_text_color(*NAVY_SOFT)
+            self.set_xy(label_x, y + 1.0)
+            self.cell(label_w, line_h, label)
+
+            self.set_font("helvetica", "", 9)
+            self.set_text_color(*INK)
+            line_y = y + 1.0
+            for line in value_lines:
+                self.set_xy(value_x, line_y)
+                self.cell(value_w, line_h, line)
+                line_y += line_h
+
+            y += row_h
+
+        self.set_y(block_top + block_h + 7.0)
+
     # ------------------------------------------------------------- sections
     def _section_heading(self, number, title):
         self.set_font("helvetica", "B", 11.5)
@@ -339,9 +486,10 @@ class _ReportPDF(FPDF):
             "Visualisation not available.\n"
             "The source file is missing or could not be read.")
 
+
     def _image_section(self, number, title, caption, path):
         """Full section: heading, caption, visualisation (or placeholder)."""
-        block_h = 13.0 + 16.0 + IMAGE_MAX_H + 10.0  # worst-case estimate
+        block_h = 13.0 + 16.0 + max(IMAGE_MAX_H, UNAVAILABLE_BOX_H) + 10.0
         if self.get_y() + block_h > CONTENT_BOTTOM:
             self.add_page()
         self._section_heading(number, title)
@@ -373,9 +521,40 @@ class _ReportPDF(FPDF):
         self.set_y(block_top + est_h + 6.0)
 
 
-def generate_segmentation_report(patient_identifier, scan_id, model_version,
-                                 orig_path, mask_path, xai_path,
-                                 output_pdf_path):
+def generate_segmentation_report(
+    patient_identifier,
+    scan_id,
+    model_version,
+    orig_path,
+    mask_path,
+    xai_path,
+    output_pdf_path,
+):
+    """Generate a report using the original seven-argument contract."""
+    return _generate_segmentation_report_with_measurements(
+        patient_identifier,
+        scan_id,
+        model_version,
+        orig_path,
+        mask_path,
+        xai_path,
+        output_pdf_path,
+    )
+
+
+def _generate_segmentation_report_with_measurements(
+    patient_identifier,
+    scan_id,
+    model_version,
+    orig_path,
+    mask_path,
+    xai_path,
+    output_pdf_path,
+    *,
+    predicted_mask_pixels=None,
+    slice_coverage_percent=None,
+):
+    """Generate a report with optional technical 2D measurements."""
     """Compiles the MRI, Mask, and XAI overlay into a research report.
 
     The signature and call contract are unchanged from the previous
@@ -420,6 +599,11 @@ def generate_segmentation_report(patient_identifier, scan_id, model_version,
              new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(1.0)
     pdf._metadata_block(patient_identifier, scan_id, model_version)
+    pdf._classification_grading_block()
+    pdf._segmentation_measurements_block(
+        predicted_mask_pixels=predicted_mask_pixels,
+        slice_coverage_percent=slice_coverage_percent,
+    )
 
     # ---- Imaging sections
     pdf._image_section("1", "Imaging Overview: Original MRI",

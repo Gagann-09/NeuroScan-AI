@@ -130,10 +130,55 @@ class TestReportGeneration:
             b"Explainability Visualisation",
             b"XAI Attribution Map",
             b"Interpretation Boundaries",
+            b"Classification and Grading",
+            b"Not determined by ARMT-GAN segmentation",
+            b"Not determined; no validated grading output is available",
             b"clinically validated",
             b"Page 1 of",
         ]:
             assert probe in text, f"missing content: {probe!r}"
+
+    def test_measurement_enabled_report_includes_2d_slice_measurements(self, tmp_path):
+        from app.services.reporting import (
+            _generate_segmentation_report_with_measurements,
+        )
+
+        out = tmp_path / "measurement-report.pdf"
+        orig = make_png(tmp_path, "measurement-orig.png", (224, 224), "L", 180)
+        mask = make_png(
+            tmp_path, "measurement-mask.png", (224, 224), "RGB", (20, 200, 20)
+        )
+        xai = make_png(
+            tmp_path, "measurement-xai.png", (224, 224), "RGB", (200, 60, 60)
+        )
+
+        _generate_segmentation_report_with_measurements(
+            "PT-ANONYMIZED",
+            "scan-measurements",
+            "armt-gan-2d-baseline",
+            orig,
+            mask,
+            xai,
+            out,
+            predicted_mask_pixels=12345,
+            slice_coverage_percent=24.6913,
+        )
+
+        data = assert_valid_pdf(out, min_images=3)
+        text = stream_text(data)
+
+        for probe in [
+            b"2D Segmentation Measurements",
+            b"Predicted Mask Pixels",
+            b"12,345 pixels",
+            b"Slice Coverage",
+            b"24.6913%",
+            b"Measurement Basis",
+            b"224 x 224",
+            b"not physical tumor area or volume",
+            b"diagnostic accuracy",
+        ]:
+            assert probe in text, f"missing measurement report content: {probe!r}"
 
     def test_preserves_image_aspect_ratio_and_margins(self, tmp_path):
         # Non-square images: aspect ratio must be preserved and

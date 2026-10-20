@@ -59,12 +59,14 @@ class ModelVersion(Base):
 
 class Prediction(Base):
     __tablename__ = "predictions"
-    
+
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     scan_id = Column(String, ForeignKey("scans.id"), index=True, nullable=False)
     model_version_id = Column(String, ForeignKey("model_versions.id"), index=True, nullable=True)
     tumor_detected = Column(Boolean, default=False)
     max_tumor_probability = Column(Float, nullable=True)
+    predicted_mask_pixels = Column(Integer, nullable=True)
+    slice_coverage_percent = Column(Float, nullable=True)
     dice = Column(Float, nullable=True)
     iou = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

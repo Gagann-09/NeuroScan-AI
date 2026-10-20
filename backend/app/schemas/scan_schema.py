@@ -26,17 +26,51 @@ class StatusResponse(BaseModel):
     scan_id: str = Field(..., description="Unique identifier for the scan")
     status: str = Field(..., description="Current processing status")
 
-
 class ResultsResponse(BaseModel):
     """Response schema for GET /api/v1/scans/results/{scan_id}."""
     scan_id: str = Field(..., description="Unique identifier for the scan")
-    mask_url: Optional[str] = Field(None, description="Presigned URL for the segmentation mask overlay")
-    xai_url: Optional[str] = Field(None, description="Presigned URL for the XAI activation map")
-    report_url: Optional[str] = Field(None, description="Presigned URL for the PDF report")
-    tumor_detected: bool = Field(False, description="Whether a tumor was detected")
-    max_tumor_probability: float = Field(0.0, description="Maximum tumor probability from model output (raw sigmoid)")
-    model_version: Optional[str] = Field(None, description="Model version identifier")
+    mask_url: Optional[str] = Field(
+        None, description="Presigned URL for the segmentation mask overlay"
+    )
+    xai_url: Optional[str] = Field(
+        None, description="Presigned URL for the input-gradient saliency map"
+    )
+    report_url: Optional[str] = Field(
+        None, description="Presigned URL for the PDF report"
+    )
+    tumor_detected: bool = Field(
+        False, description="Whether the segmentation pipeline detected tumor pixels"
+    )
+    max_tumor_probability: float = Field(
+        0.0, description="Maximum tumor probability from model output (raw sigmoid)"
+    )
+    predicted_mask_pixels: Optional[int] = Field(
+        None,
+        description="Number of pixels at probability >= 0.5 in the selected 2D slice",
+    )
+    slice_coverage_percent: Optional[float] = Field(
+        None,
+        description="Percentage of selected 2D slice pixels at probability >= 0.5",
+    )
+    model_version: Optional[str] = Field(
+        None, description="Model version identifier"
+    )
 
+    # ARMT-GAN produces a binary segmentation mask, not a tumor classification.
+    tumor_type: Optional[str] = Field(
+        None, description="Tumor type; null when not determined by a validated classifier"
+    )
+    tumor_type_source: str = Field(
+        "Not determined by ARMT-GAN segmentation",
+        description="Source or limitation for the tumor-type field"
+    )
+    tumor_grade: Optional[str] = Field(
+        None, description="WHO grade; null when not determined by a validated grading model"
+    )
+    tumor_grade_source: str = Field(
+        "Not determined; no validated grading output is available",
+        description="Source or limitation for the tumor-grade field"
+    )
 
 # --- Kaggle Classification Schemas ---
 

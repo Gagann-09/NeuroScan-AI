@@ -17,7 +17,10 @@ import nibabel as nib
 from app.db.database import SessionLocal
 from app.db.models import Scan, ModalityFile, Prediction, ModelVersion, Artifact, KaggleScan, KagglePrediction, KaggleModelVersion
 from app.core.storage import minio_client, upload_file_to_minio
-from app.services.reporting import generate_segmentation_report
+from app.services.reporting import (
+    generate_segmentation_report,
+    _generate_segmentation_report_with_measurements,
+)
 from ai_pipeline.models.armt_gan import ARMTGenerator2D
 from app.services.xai import generate_gradient_saliency, compute_segmentation_alignment, XAIProvenance
 from ai_pipeline.preprocessing import preprocess_brats_study, PreprocessingConfig, _validate_nifti_image
@@ -895,9 +898,19 @@ def process_scan_task(
                 xai_tensor=xai_cpu
             )
             
-            # Compute max tumor probability from model output (raw sigmoid probability)
-
+            # Record technical measurements from the raw model probability mask.
+            # These describe one 224x224 slice, not diagnostic accuracy or tumor volume.
             max_tumor_probability = round(float(mask_tensor.max().item()), 4)
+
+            predicted_mask_pixels = int(
+                (mask_tensor >= 0.5).sum().item()
+            )
+            slice_coverage_percent = round(
+                predicted_mask_pixels
+                / (mask_tensor.shape[-2] * mask_tensor.shape[-1])
+                * 100,
+                4,
+            )
 
             # Get or create ModelVersion for this checkpoint (needed for report and provenance)
             model_version = _get_or_create_model_version(
@@ -920,8 +933,18 @@ def process_scan_task(
                 xai_final_pil.save(xai_path)
                 
                 # A single PDF is written to report_path and uploaded once below.
-                generate_segmentation_report("PT-ANONYMIZED", scan_id, model_version.id, source_img_path, mask_path, xai_path, report_path)
-                
+                _generate_segmentation_report_with_measurements(
+                    "PT-ANONYMIZED",
+                    scan_id,
+                    model_version.id,
+                    source_img_path,
+                    mask_path,
+                    xai_path,
+                    report_path,
+                    predicted_mask_pixels=predicted_mask_pixels,
+                    slice_coverage_percent=slice_coverage_percent,
+                )
+
                 mask_obj_name = f"{scan_id}/mask.png"
                 xai_obj_name = f"{scan_id}/xai.png"
                 report_obj_name = f"{scan_id}/report.pdf"
@@ -960,8 +983,10 @@ def process_scan_task(
                     model_version_id=model_version.id,
                     tumor_detected=tumor_detected,
                     max_tumor_probability=max_tumor_probability,
-                    dice=None,  # Populated by evaluation pipeline when ground truth available
-                    iou=None,   # Populated by evaluation pipeline when ground truth available
+                    predicted_mask_pixels=predicted_mask_pixels,
+                    slice_coverage_percent=slice_coverage_percent,
+                    dice=None,  # Requires ground-truth evaluation
+                    iou=None,   # Requires ground-truth evaluation
                 )
                 db.add(prediction)
                 db.flush()  # Get prediction.id for Artifact FK

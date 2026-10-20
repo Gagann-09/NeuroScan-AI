@@ -19,6 +19,7 @@ export type ScanStatus = {
   status: string
 }
 
+
 export type ScanResults = {
   scan_id: string
   mask_url: string | null
@@ -26,6 +27,8 @@ export type ScanResults = {
   report_url: string | null
   tumor_detected: boolean
   max_tumor_probability: number | null
+  predicted_mask_pixels: number | null
+  slice_coverage_percent: number | null
   model_version: string | null
   anomaly_area_cm2?: number | null
   confidence_score?: number | null
@@ -156,6 +159,8 @@ export function createApiClient(
         report_url: data.report_url ?? null,
         tumor_detected: Boolean(data.tumor_detected),
         max_tumor_probability: data.max_tumor_probability ?? null,
+        predicted_mask_pixels: data.predicted_mask_pixels ?? null,
+        slice_coverage_percent: data.slice_coverage_percent ?? null,
         model_version: data.model_version ?? null,
         anomaly_area_cm2: data.anomaly_area_cm2 ?? null,
         confidence_score: data.confidence_score ?? null,

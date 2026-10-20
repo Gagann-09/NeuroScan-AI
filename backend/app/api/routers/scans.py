@@ -491,16 +491,19 @@ def get_scan_status(
         status=scan.status,
     )
 
-
 @router.get("/results/{scan_id}", response_model=ResultsResponse)
 def get_scan_results(
-    scan_id: str, 
+    scan_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     scan = get_scan_with_ownership(db, scan_id, current_user)
 
-    prediction = db.query(Prediction).filter(Prediction.scan_id == scan_id).first()
+    prediction = (
+        db.query(Prediction)
+        .filter(Prediction.scan_id == scan_id)
+        .first()
+    )
 
     return ResultsResponse(
         scan_id=scan.id,
@@ -508,8 +511,22 @@ def get_scan_results(
         xai_url=get_presigned_url(scan.xai_path) if scan.xai_path else None,
         report_url=get_presigned_url(scan.report_path) if scan.report_path else None,
         tumor_detected=prediction.tumor_detected if prediction else False,
-        max_tumor_probability=prediction.max_tumor_probability if prediction else 0.0,
+        max_tumor_probability=(
+            prediction.max_tumor_probability if prediction else 0.0
+        ),
+        predicted_mask_pixels=(
+            prediction.predicted_mask_pixels if prediction else None
+        ),
+        slice_coverage_percent=(
+            prediction.slice_coverage_percent if prediction else None
+        ),
         model_version=prediction.model_version_id if prediction else None,
+        tumor_type=None,
+        tumor_type_source="Not determined by ARMT-GAN segmentation",
+        tumor_grade=None,
+        tumor_grade_source=(
+            "Not determined; no validated grading output is available"
+        ),
     )
 
 

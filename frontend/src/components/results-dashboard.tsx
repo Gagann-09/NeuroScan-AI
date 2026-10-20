@@ -365,6 +365,7 @@ function SegmentationView({
 }) {
   const [activeOverlay, setActiveOverlay] = useState<"xai" | "mask">("xai")
 
+
   return (
     <div className="grid grid-cols-1 md:grid-cols-12 gap-4 sm:gap-5">
       {/* Confidence */}
@@ -376,9 +377,13 @@ function SegmentationView({
           <div>
             <span className="text-5xl sm:text-6xl font-semibold text-white tracking-tighter">
               {Math.floor(results.confidence)}
-              <span className="text-2xl text-white/40">.{results.confidence.toString().includes(".") ? results.confidence.toString().split(".")[1] : "0"}%</span>
+              <span className="text-2xl text-white/40">
+                .{results.confidence.toString().includes(".") ? results.confidence.toString().split(".")[1] : "0"}%
+              </span>
             </span>
-            <span className="text-xs text-white/40 block font-normal mt-1">Raw ARMT-GAN sigmoid output</span>
+            <span className="text-xs text-white/40 block font-normal mt-1">
+              Raw ARMT-GAN sigmoid output — not accuracy
+            </span>
           </div>
         ) : (
           <span className="text-3xl sm:text-4xl font-semibold text-white/50 tracking-tight">
@@ -388,25 +393,43 @@ function SegmentationView({
         <Pills filled={results.confidence != null ? results.confidencePills : 0} />
       </div>
 
-      {/* Anomaly area */}
+
+      {/* Technical measurements from the selected 2D slice */}
       <div className="md:col-span-4 bg-neuro-lime text-black rounded-[1.75rem] p-6 sm:p-8 flex flex-col min-h-[220px] shadow-[0_0_50px_rgba(190,255,60,0.15)]">
         <div className="flex items-center gap-2 text-black text-sm font-semibold mb-4">
-          <Activity className="h-4 w-4" /> Detected anomaly area
+          <Activity className="h-4 w-4" /> 2D segmentation measurements
         </div>
-        {results.anomalyArea != null ? (
-          <span className="text-5xl sm:text-6xl font-semibold tracking-tighter">
-            {Math.floor(results.anomalyArea)}
-            <span className="text-2xl text-black/60">.{results.anomalyArea.toString().includes(".") ? results.anomalyArea.toString().split(".")[1] : "0"} cmÂ²</span>
-          </span>
+
+        {results.predictedMaskPixels != null ? (
+          <>
+            <span className="text-4xl sm:text-5xl font-semibold tracking-tighter">
+              {results.predictedMaskPixels.toLocaleString()}
+              <span className="text-base text-black/70 font-medium ml-2">
+                pixels
+              </span>
+            </span>
+            <div className="mt-3 text-sm text-black/75">
+              {results.sliceCoveragePercent != null
+                ? `${results.sliceCoveragePercent.toFixed(4)}% of selected slice`
+                : "Slice coverage unavailable"}
+            </div>
+          </>
         ) : (
           <span className="text-3xl sm:text-4xl font-semibold text-black/60 tracking-tight">
-            N/A <span className="text-xs text-black/60 block font-normal mt-1">Voxel spacing metadata required for cmÂ² calibration</span>
+            Unavailable
+            <span className="text-xs text-black/70 block font-normal mt-2 leading-relaxed">
+              No stored measurement is available for this scan.
+            </span>
           </span>
         )}
-        <Pills filled={results.anomalyArea != null ? results.anomalyPills : 0} dark />
+
+        <div className="mt-auto pt-4 text-xs text-black/70 leading-relaxed">
+          Pixels with model probability ≥ 0.5 on one 2D slice. Not physical
+          tumor area, tumor volume, or diagnostic accuracy.
+        </div>
       </div>
 
-      {/* Visual Overlay Card (XAI Saliency & Segmentation Mask) */}
+      {/* Visual overlay */}
       <div className="md:col-span-4 relative rounded-[1.75rem] p-6 sm:p-8 flex flex-col min-h-[220px] overflow-hidden border border-white/10">
         <div
           className="absolute inset-0 bg-cover bg-center opacity-60 transition-all duration-300"
@@ -461,94 +484,101 @@ function SegmentationView({
         </div>
       </div>
 
-      {/* Layer analysis chart */}
-      <div className="md:col-span-8 bg-white/5 border border-white/10 rounded-[1.75rem] p-6 sm:p-8 flex flex-col">
-        <div className="flex flex-wrap justify-between items-center gap-3 mb-8">
-          <div className="flex items-center gap-4">
-            <h3 className="text-base font-semibold text-white flex items-center gap-2">
-              <Activity className="h-5 w-5 text-neuro-lime" /> Layer analysis (Architecture Profile)
-            </h3>
-            <div className="flex gap-3 text-xs font-medium text-white/40">
-              <span className="flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-white" /> Robustness
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-neuro-lime" /> Adversarial loss
-              </span>
-            </div>
-          </div>
-          <span className="bg-white/10 px-4 py-1.5 rounded-full text-xs font-medium text-white/80">Reference profile</span>
-        </div>
 
-        <div className="flex items-end justify-between gap-3 h-48">
-          {results.layers.map((bar) => (
-            <div key={bar.label} className="flex flex-col items-center gap-3 flex-1 h-full justify-end relative">
-              <div className="w-full max-w-[36px] mx-auto h-full bg-black/40 rounded-full relative overflow-hidden border border-white/5">
-                <div
-                  className={`absolute bottom-0 w-full rounded-full transition-all duration-1000 ${
-                    bar.peak ? "bg-black" : "bg-white"
-                  }`}
-                  style={{ height: `${bar.robustness}%` }}
-                />
-                <div
-                  className="absolute bottom-0 w-full rounded-full bg-neuro-lime transition-all duration-1000"
-                  style={{ height: `${bar.adversarial}%` }}
-                >
-                  <div className="absolute top-2 left-1/2 -translate-x-1/2 w-1.5 h-1.5 bg-black rounded-full" />
-                </div>
-              </div>
-              {bar.peak && (
-                <div className="absolute top-0 -mt-6 bg-black text-white text-[10px] font-semibold px-2 py-1 rounded-md">
-                  {bar.robustness}%
-                </div>
-              )}
-              <span className="text-[10px] font-mono text-white/40">{bar.label}</span>
+      {/* Classification and grading: explicitly not inferred from segmentation */}
+      <div className="md:col-span-8 grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-5">
+        <section className="bg-white/5 border border-white/10 rounded-[1.75rem] p-6 sm:p-7 flex flex-col justify-between min-h-[220px]">
+          <div>
+            <div className="flex items-center gap-2 text-sm text-white/60 font-medium">
+              <Target className="h-4 w-4 text-neuro-cyan" />
+              Tumor type
             </div>
-          ))}
-        </div>
+            <p className="mt-5 text-2xl sm:text-3xl font-semibold text-white tracking-tight">
+              {results.tumorType}
+            </p>
+            <p className="text-xs sm:text-sm text-white/55 mt-2 leading-relaxed">
+              {results.tumorTypeSource}
+            </p>
+          </div>
+          <div className="mt-5 rounded-xl border border-neuro-cyan/20 bg-neuro-cyan/5 p-3">
+            <p className="text-xs font-medium text-neuro-cyan">Available model output</p>
+            <p className="text-sm text-white/75 mt-1">
+              Single-channel, 2D tumor segmentation mask
+            </p>
+            <p className="text-xs text-white/40 mt-1">
+              This workflow does not classify tumor histology.
+            </p>
+          </div>
+        </section>
+
+        <section className="bg-white/5 border border-white/10 rounded-[1.75rem] p-6 sm:p-7 flex flex-col justify-between min-h-[220px]">
+          <div>
+            <div className="flex items-center gap-2 text-sm text-white/60 font-medium">
+              <Activity className="h-4 w-4 text-neuro-lime" />
+              WHO grade / stage
+            </div>
+            <p className="mt-5 text-2xl sm:text-3xl font-semibold text-white tracking-tight">
+              {results.tumorGrade}
+            </p>
+            <p className="text-xs sm:text-sm text-white/55 mt-2 leading-relaxed">
+              {results.tumorGradeSource}
+            </p>
+          </div>
+          <div className="mt-5 rounded-xl border border-white/10 bg-white/[0.03] p-3">
+            <p className="text-xs font-medium text-white/70">Evidence required</p>
+            <p className="text-sm text-white/65 mt-1">
+              A validated grading model and/or appropriate clinical and pathological evidence.
+            </p>
+            <p className="text-xs text-white/40 mt-1">
+              Segmentation output alone cannot establish WHO grade.
+            </p>
+          </div>
+        </section>
       </div>
 
-      {/* Action stack */}
-      <div className="md:col-span-4 grid grid-rows-3 gap-4">
-        <div className="grid grid-cols-2 gap-4">
-          <button
-            onClick={onRawMask}
-            className="bg-white/5 border border-white/10 rounded-2xl flex flex-col items-center justify-center p-4 hover:bg-white/10 transition-colors group cursor-pointer"
-          >
-            <Download className="h-6 w-6 text-white/50 mb-2 group-hover:text-white" />
-            <span className="text-xs font-semibold text-white">Raw mask</span>
-          </button>
-          <button
-            onClick={onDicom}
-            className="bg-white/5 border border-white/10 rounded-2xl flex flex-col items-center justify-center p-4 hover:bg-white/10 transition-colors group cursor-pointer"
-          >
-            <FileText className="h-6 w-6 text-white/50 mb-2 group-hover:text-neuro-cyan" />
-            <span className="text-xs font-semibold text-white">DICOM data</span>
-          </button>
-        </div>
+      {/* Actions */}
+      <div className="md:col-span-4 grid grid-cols-2 gap-3 sm:gap-4">
+        <button
+          onClick={onRawMask}
+          className="bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center gap-3 p-4 hover:bg-white/10 transition-colors group cursor-pointer min-h-[76px]"
+        >
+          <Download className="h-5 w-5 text-white/50 group-hover:text-white" />
+          <span className="text-xs sm:text-sm font-semibold text-white">Raw mask</span>
+        </button>
+        <button
+          onClick={onDicom}
+          className="bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center gap-3 p-4 hover:bg-white/10 transition-colors group cursor-pointer min-h-[76px]"
+        >
+          <FileText className="h-5 w-5 text-white/50 group-hover:text-neuro-cyan" />
+          <span className="text-xs sm:text-sm font-semibold text-white">DICOM data</span>
+        </button>
         <button
           onClick={onGuidelines}
-          className="bg-white/5 border border-white/10 rounded-2xl p-5 flex items-center justify-between hover:bg-white/10 transition-colors text-left group cursor-pointer"
+          className="col-span-2 bg-white/5 border border-white/10 rounded-2xl p-5 flex items-center justify-between hover:bg-white/10 transition-colors text-left group cursor-pointer"
         >
           <div>
             <h4 className="text-sm font-semibold text-white mb-0.5">Clinical guidelines</h4>
-            <p className="text-[11px] text-white/40">Review WHO tumor grading metrics</p>
+            <p className="text-[11px] text-white/40">Reference guidance only — not a grading prediction</p>
           </div>
           <ArrowUpRight className="h-4 w-4 text-white/40 group-hover:text-white" />
         </button>
-        <button
-          onClick={onFlag}
-          className="bg-destructive/10 border border-destructive/25 rounded-2xl p-5 flex items-center justify-between hover:bg-destructive/20 transition-colors text-left group cursor-pointer"
-        >
-          <div>
-            <h4 className="text-sm font-semibold text-destructive mb-0.5 flex items-center gap-2">
-              <ShieldAlert className="h-4 w-4" /> Flag for review
-            </h4>
-            <p className="text-[11px] text-destructive/70">Send scan to head radiologist</p>
-          </div>
-          <ArrowUpRight className="h-4 w-4 text-destructive" />
-        </button>
       </div>
+
+      {/* Full-width review action */}
+      <button
+        onClick={onFlag}
+          className="md:col-span-12 mt-6 sm:mt-8 w-full bg-destructive/10 border border-destructive/25 rounded-2xl px-6 py-5 sm:px-8 sm:py-6 flex items-center justify-between gap-4 hover:bg-destructive/20 transition-colors text-left group cursor-pointer min-h-[100px]"      >
+        <div>
+          <h4 className="text-base font-semibold text-destructive mb-1 flex items-center gap-2">
+            <ShieldAlert className="h-5 w-5" />
+            Flag for review
+          </h4>
+          <p className="text-xs sm:text-sm text-destructive/70">
+            Request review by a qualified radiologist. Research output only; not a clinical diagnosis.
+          </p>
+        </div>
+        <ArrowUpRight className="h-5 w-5 shrink-0 text-destructive group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
+      </button>
     </div>
   )
 }
@@ -600,42 +630,56 @@ function PatientView({ results }: { results: ScanResults }) {
     <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-5">
       <div className="bg-white/5 border border-white/10 rounded-[1.75rem] p-6 sm:p-8">
         <h3 className="text-base font-semibold text-white flex items-center gap-2 mb-6">
-          <Target className="h-5 w-5 text-neuro-cyan" /> Study parameters
+          <Target className="h-5 w-5 text-neuro-cyan" />
+          Study parameters
         </h3>
+
         <dl className="divide-y divide-white/5">
           {results.patient.map((row) => (
-            <div key={row.label} className="flex items-center justify-between py-3.5">
+            <div
+              key={row.label}
+              className="flex items-center justify-between gap-4 py-3.5"
+            >
               <dt className="text-sm text-white/50">{row.label}</dt>
-              <dd className="text-sm font-medium text-white font-mono">{row.value}</dd>
+              <dd className="text-sm font-medium text-white font-mono text-right break-words">
+                {row.value}
+              </dd>
             </div>
           ))}
         </dl>
       </div>
+
       <div className="grid grid-rows-2 gap-4 sm:gap-5">
         <div className="bg-neuro-lime text-black rounded-[1.75rem] p-6 sm:p-8 flex flex-col justify-between shadow-[0_0_50px_rgba(190,255,60,0.15)]">
           <span className="text-sm font-semibold flex items-center gap-2">
-            <Activity className="h-4 w-4" /> Tumor grade
+            <Target className="h-4 w-4" />
+            Tumor type
           </span>
+
           <div>
-            <p className="text-5xl font-semibold tracking-tighter">{results.tumorGrade}</p>
-            <p className="text-sm text-black/60 mt-1">Not classified (WHO grading out of scope)</p>
+            <p className="text-3xl font-semibold tracking-tight">
+              {results.tumorType}
+            </p>
+            <p className="text-sm text-black/60 mt-2">
+              {results.tumorTypeSource}
+            </p>
           </div>
         </div>
+
         <div className="bg-white/5 border border-white/10 rounded-[1.75rem] p-6 sm:p-8 flex flex-col justify-between">
           <span className="text-sm font-medium text-white/50 flex items-center gap-2">
-            <Database className="h-4 w-4" /> Estimated volume
+            <Activity className="h-4 w-4" />
+            WHO grade / stage
           </span>
-          {results.volume != null ? (
-            <p className="text-5xl font-semibold text-white tracking-tighter">
-              {results.volume}
-              <span className="text-2xl text-white/40"> cmÂ³</span>
+
+          <div>
+            <p className="text-3xl font-semibold text-white tracking-tight">
+              {results.tumorGrade}
             </p>
-          ) : (
-            <div>
-              <p className="text-3xl font-semibold text-white/50 tracking-tight">N/A</p>
-              <p className="text-xs text-white/40 mt-1">Requires 3D volumetric series (2D axial model)</p>
-            </div>
-          )}
+            <p className="text-xs text-white/40 mt-2">
+              {results.tumorGradeSource}
+            </p>
+          </div>
         </div>
       </div>
     </div>
@@ -647,7 +691,7 @@ function ConfidenceView({ results }: { results: ScanResults }) {
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-5">
       <div className="lg:col-span-7 bg-white/5 border border-white/10 rounded-[1.75rem] p-6 sm:p-8">
         <h3 className="text-base font-semibold text-white flex items-center gap-2 mb-8">
-          <Network className="h-5 w-5 text-neuro-cyan" /> Class probabilities (BraTS Sub-regions)
+          <Network className="h-5 w-5 text-neuro-cyan" /> Segmentation Output
         </h3>
         <div className="space-y-6">
           {results.classProbabilities.map((c) => (

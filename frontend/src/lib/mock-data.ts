@@ -2,9 +2,16 @@ export type ScanResults = {
   scanId: string
   confidence: number | null
   anomalyArea: number | null
+  predictedMaskPixels: number | null
+  sliceCoveragePercent: number | null
+
+  // Model-derived classification is distinct from clinical diagnosis.
+  tumorType: string
+  tumorTypeSource: string
   tumorGrade: string
+  tumorGradeSource: string
+
   volume: number | null
-  layers: { label: string; robustness: number; adversarial: number; peak?: boolean }[]
   confidencePills: number
   anomalyPills: number
   maskUrl: string
@@ -15,7 +22,11 @@ export type ScanResults = {
   patient: { label: string; value: string }[]
   dicom: { tag: string; label: string; value: string }[]
   telemetry: { label: string; value: string; sub: string }[]
-  classProbabilities: { label: string; value: number | null; accent: "cyan" | "lime" | "violet" | "muted" }[]
+  classProbabilities: {
+    label: string
+    value: number | null
+    accent: "cyan" | "lime" | "violet" | "muted"
+  }[]
 }
 
 // Kaggle classification results
@@ -30,10 +41,15 @@ export type KaggleResults = {
 
 // Simulated ARMT-GAN inference output scaffold.
 export const MOCK_RESULTS: ScanResults = {
+  predictedMaskPixels: null,
+  sliceCoveragePercent: null,
   scanId: "SCN-4F9A2C",
   confidence: 98.7,
   anomalyArea: 14.3,
-  tumorGrade: "Grade II",
+  tumorType: "Not determined",
+  tumorTypeSource: "Demo data - no classifier result",
+  tumorGrade: "Not determined",
+  tumorGradeSource: "Demo data - no validated grading result",
   volume: 32.6,
   confidencePills: 6,
   anomalyPills: 4,
@@ -41,14 +57,7 @@ export const MOCK_RESULTS: ScanResults = {
   reportUrl: "/mri-heatmap.png",
   mask_url: "/mri-segmentation.png",
   xai_url: "/mri-heatmap.png",
-  layers: [
-    { label: "L1", robustness: 80, adversarial: 40 },
-    { label: "L2", robustness: 60, adversarial: 30 },
-    { label: "L3", robustness: 90, adversarial: 20 },
-    { label: "L4", robustness: 100, adversarial: 45, peak: true },
-    { label: "L5", robustness: 50, adversarial: 40 },
-    { label: "L6", robustness: 60, adversarial: 35 },
-  ],
+
   patient: [
     { label: "Patient ID", value: "PT-90231" },
     { label: "Study date", value: "2026-08-15" },

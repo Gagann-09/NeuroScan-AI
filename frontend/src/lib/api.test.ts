@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createApiClient } from '@/lib/api'
+import type { Mock } from "vitest"
 
 describe('API Client', () => {
   const mockGetIdToken = vi.fn()
@@ -21,7 +22,7 @@ describe('API Client', () => {
       ok: true,
       json: vi.fn().mockResolvedValue({ scan_id: 'test-scan', status: 'PROCESSING', message: 'OK' }),
     }
-    ;(global.fetch as vi.Mock).mockResolvedValue(mockResponse)
+    ;(global.fetch as Mock).mockResolvedValue(mockResponse)
 
     const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
     await api.uploadScan({
@@ -39,7 +40,7 @@ describe('API Client', () => {
       })
     )
 
-    const fetchCall = (global.fetch as vi.Mock).mock.calls[0]
+    const fetchCall = (global.fetch as Mock).mock.calls[0]
     const headers = fetchCall[1]?.headers as Headers
     expect(headers.get('Authorization')).toBe('Bearer test-id-token')
   })
@@ -51,7 +52,7 @@ describe('API Client', () => {
       ok: true,
       json: vi.fn().mockResolvedValue({ scan_id: 'test-scan', status: 'PROCESSING', message: 'OK' }),
     }
-    ;(global.fetch as vi.Mock).mockResolvedValue(mockResponse)
+    ;(global.fetch as Mock).mockResolvedValue(mockResponse)
 
     const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
     await api.uploadScan({
@@ -61,7 +62,7 @@ describe('API Client', () => {
       flair: new File([''], 'flair.nii'),
     })
 
-    const fetchCall = (global.fetch as vi.Mock).mock.calls[0]
+    const fetchCall = (global.fetch as Mock).mock.calls[0]
     const headers = fetchCall[1]?.headers as Headers
     expect(headers.get('Authorization')).toBeNull()
   })
@@ -74,7 +75,7 @@ describe('API Client', () => {
       status: 401,
       json: vi.fn().mockResolvedValue({ detail: 'Invalid token' }),
     }
-    ;(global.fetch as vi.Mock).mockResolvedValue(mockResponse)
+    ;(global.fetch as Mock).mockResolvedValue(mockResponse)
 
     const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
 
@@ -93,7 +94,7 @@ describe('API Client', () => {
       status: 401,
       json: vi.fn().mockResolvedValue({ detail: 'Invalid token' }),
     }
-    ;(global.fetch as vi.Mock).mockResolvedValue(mockResponse)
+    ;(global.fetch as Mock).mockResolvedValue(mockResponse)
 
     const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
 
@@ -112,7 +113,7 @@ describe('API Client', () => {
       status: 500,
       json: vi.fn().mockResolvedValue({ detail: 'Internal server error' }),
     }
-    ;(global.fetch as vi.Mock).mockResolvedValue(mockResponse)
+    ;(global.fetch as Mock).mockResolvedValue(mockResponse)
 
     const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
 
@@ -131,7 +132,7 @@ describe('API Client', () => {
         ok: true,
         json: vi.fn().mockResolvedValue({ scan_id: 'kaggle-scan-123', status: 'PROCESSING' }),
       }
-      ;(global.fetch as vi.Mock).mockResolvedValue(mockResponse)
+      ;(global.fetch as Mock).mockResolvedValue(mockResponse)
 
       const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
       await api.uploadKaggleScan(new File([''], 'mri.jpg', { type: 'image/jpeg' }))
@@ -144,7 +145,7 @@ describe('API Client', () => {
         })
       )
 
-      const fetchCall = (global.fetch as vi.Mock).mock.calls[0]
+      const fetchCall = (global.fetch as Mock).mock.calls[0]
       const headers = fetchCall[1]?.headers as Headers
       expect(headers.get('Authorization')).toBe('Bearer test-id-token')
     })
@@ -157,7 +158,7 @@ describe('API Client', () => {
         status: 400,
         json: vi.fn().mockResolvedValue({ detail: 'File must be .jpg, .jpeg, or .png format' }),
       }
-      ;(global.fetch as vi.Mock).mockResolvedValue(mockResponse)
+      ;(global.fetch as Mock).mockResolvedValue(mockResponse)
 
       const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
 
@@ -173,7 +174,7 @@ describe('API Client', () => {
         ok: true,
         json: vi.fn().mockResolvedValue({ scan_id: 'kaggle-scan-123', status: 'COMPLETED' }),
       }
-      ;(global.fetch as vi.Mock).mockResolvedValue(mockResponse)
+      ;(global.fetch as Mock).mockResolvedValue(mockResponse)
 
       const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
       const result = await api.getKaggleScanStatus('kaggle-scan-123')
@@ -199,7 +200,7 @@ describe('API Client', () => {
           image_url: '/kaggle-mri-sample.jpg',
         }),
       }
-      ;(global.fetch as vi.Mock).mockResolvedValue(mockResponse)
+      ;(global.fetch as Mock).mockResolvedValue(mockResponse)
 
       const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
       const result = await api.getKaggleScanResults('kaggle-scan-123')

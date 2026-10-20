@@ -91,7 +91,7 @@ class TestScanClaimIntegration:
     @patch("app.services.ai_tasks.preprocess_brats_study")
     @patch("app.services.ai_tasks.generate_gradient_saliency")
     @patch("app.services.ai_tasks.generate_clinical_overlays")
-    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks._generate_segmentation_report_with_measurements")
     @patch("app.services.ai_tasks.upload_file_to_minio")
     def test_successful_processing_claims_pending_scan(
         self,
@@ -192,7 +192,7 @@ class TestScanClaimIntegration:
     @patch("app.services.ai_tasks.preprocess_brats_study")
     @patch("app.services.ai_tasks.generate_gradient_saliency")
     @patch("app.services.ai_tasks.generate_clinical_overlays")
-    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks._generate_segmentation_report_with_measurements")
     @patch("app.services.ai_tasks.upload_file_to_minio")
     def test_duplicate_dispatch_no_duplicate_predictions(
         self,
@@ -313,7 +313,7 @@ class TestScanClaimIntegration:
     @patch("app.services.ai_tasks.preprocess_brats_study")
     @patch("app.services.ai_tasks.generate_gradient_saliency")
     @patch("app.services.ai_tasks.generate_clinical_overlays")
-    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks._generate_segmentation_report_with_measurements")
     @patch("app.services.ai_tasks.upload_file_to_minio")
     def test_failed_scan_can_be_claimed_again(
         self,
@@ -372,7 +372,7 @@ class TestScanClaimIntegration:
     @patch("app.services.ai_tasks.preprocess_brats_study")
     @patch("app.services.ai_tasks.generate_gradient_saliency")
     @patch("app.services.ai_tasks.generate_clinical_overlays")
-    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks._generate_segmentation_report_with_measurements")
     @patch("app.services.ai_tasks.upload_file_to_minio")
     def test_commit_failure_after_upload_rolls_back_artifacts(
         self,
@@ -494,7 +494,7 @@ class TestSessionCleanup:
     @patch("app.services.ai_tasks.preprocess_brats_study")
     @patch("app.services.ai_tasks.generate_gradient_saliency")
     @patch("app.services.ai_tasks.generate_clinical_overlays")
-    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks._generate_segmentation_report_with_measurements")
     @patch("app.services.ai_tasks.upload_file_to_minio")
     def test_successful_processing_closes_primary_session(
         self,
@@ -1155,7 +1155,7 @@ class TestDerivedArtifactCompensation:
     @patch("app.services.ai_tasks.preprocess_brats_study")
     @patch("app.services.ai_tasks.generate_gradient_saliency")
     @patch("app.services.ai_tasks.generate_clinical_overlays")
-    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks._generate_segmentation_report_with_measurements")
     @patch("app.services.ai_tasks.upload_file_to_minio")
     def test_later_derived_upload_failure_cleans_up_previous(
         self,
@@ -1233,7 +1233,7 @@ class TestDerivedArtifactCompensation:
     @patch("app.services.ai_tasks.preprocess_brats_study")
     @patch("app.services.ai_tasks.generate_gradient_saliency")
     @patch("app.services.ai_tasks.generate_clinical_overlays")
-    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks._generate_segmentation_report_with_measurements")
     @patch("app.services.ai_tasks.upload_file_to_minio")
     def test_all_derived_uploads_succeed_commit_fails_cleans_up_all(
         self,
@@ -1316,7 +1316,7 @@ class TestDerivedArtifactCompensation:
     @patch("app.services.ai_tasks.preprocess_brats_study")
     @patch("app.services.ai_tasks.generate_gradient_saliency")
     @patch("app.services.ai_tasks.generate_clinical_overlays")
-    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks._generate_segmentation_report_with_measurements")
     @patch("app.services.ai_tasks.upload_file_to_minio")
     def test_cleanup_failure_does_not_mask_original_error(
         self,
@@ -1388,7 +1388,7 @@ class TestDerivedArtifactCompensation:
     @patch("app.services.ai_tasks.preprocess_brats_study")
     @patch("app.services.ai_tasks.generate_gradient_saliency")
     @patch("app.services.ai_tasks.generate_clinical_overlays")
-    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks._generate_segmentation_report_with_measurements")
     @patch("app.services.ai_tasks.upload_file_to_minio")
     def test_first_upload_failure_no_cleanup_of_unrelated(
         self,
@@ -1762,7 +1762,7 @@ class TestWorkerFailureStates:
     @patch("app.services.ai_tasks.preprocess_brats_study")
     @patch("app.services.ai_tasks.generate_gradient_saliency")
     @patch("app.services.ai_tasks.generate_clinical_overlays")
-    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks._generate_segmentation_report_with_measurements")
     def test_report_generation_failure_marks_failed_no_uploads(
         self,
         mock_generate_segmentation_report,
@@ -1824,7 +1824,7 @@ class TestWorkerFailureStates:
     @patch("app.services.ai_tasks.preprocess_brats_study")
     @patch("app.services.ai_tasks.generate_gradient_saliency")
     @patch("app.services.ai_tasks.generate_clinical_overlays")
-    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks._generate_segmentation_report_with_measurements")
     @patch("app.services.ai_tasks.upload_file_to_minio")
     def test_derived_upload_failure_marks_failed_cleans_previous(
         self,
@@ -1895,7 +1895,7 @@ class TestWorkerFailureStates:
     @patch("app.services.ai_tasks.preprocess_brats_study")
     @patch("app.services.ai_tasks.generate_gradient_saliency")
     @patch("app.services.ai_tasks.generate_clinical_overlays")
-    @patch("app.services.ai_tasks.generate_segmentation_report")
+    @patch("app.services.ai_tasks._generate_segmentation_report_with_measurements")
     @patch("app.services.ai_tasks.upload_file_to_minio")
     def test_all_derived_uploads_succeed_db_commit_failure_cleans_all(
         self,

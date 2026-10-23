@@ -132,8 +132,8 @@ function ResultsDashboard({ results, onReset }: { results: ScanResults; onReset:
 
   const notify = useCallback((msg: string) => setToast(msg), [])
 
-  const xaiImageUrl = results.xai_url || "/mri-heatmap.png"
-  const maskImageUrl = results.mask_url || results.maskUrl || "/mri-segmentation.png"
+  const xaiImageUrl = results.xai_url || ""
+  const maskImageUrl = results.mask_url || results.maskUrl || ""
 
   // PDF report download or generation
   const handleGenerateReport = () => {
@@ -192,8 +192,7 @@ function ResultsDashboard({ results, onReset }: { results: ScanResults; onReset:
       </nav>
 
       {/* Main panel */}
-      <div className="flex-1 min-w-0 bg-white/[0.02] backdrop-blur-2xl rounded-[2rem] sm:rounded-[2.5rem] border border-white/10 p-5 sm:p-8 lg:p-10 flex flex-col shadow-[0_30px_80px_rgba(0,0,0,0.8)]">
-        {/* Header */}
+      <div className="flex-1 min-w-0 min-h-[calc(100vh-2.5rem)] self-start bg-white/[0.02] backdrop-blur-2xl rounded-[2rem] sm:rounded-[2.5rem] border border-white/10 p-5 sm:p-8 lg:p-10 flex flex-col shadow-[0_30px_80px_rgba(0,0,0,0.8)]">
         <div className="flex flex-wrap justify-between items-center gap-4 mb-8">
           <div className="flex items-center gap-4">
             <button
@@ -431,12 +430,29 @@ function SegmentationView({
 
       {/* Visual overlay */}
       <div className="md:col-span-4 relative rounded-[1.75rem] p-6 sm:p-8 flex flex-col min-h-[220px] overflow-hidden border border-white/10">
+        {(activeOverlay === "mask" ? maskImageUrl : xaiImageUrl) ? (
+          <div
+            className="absolute inset-0 bg-cover bg-center opacity-60 transition-all duration-300"
+            style={{
+              backgroundImage: `url('${activeOverlay === "mask" ? maskImageUrl : xaiImageUrl}')`,
+            }}
+            aria-hidden="true"
+          />
+        ) : (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/70 p-6 text-center">
+            <p className="text-sm text-white/60">
+              {activeOverlay === "mask"
+                ? "Segmentation mask unavailable for this scan."
+                : "XAI saliency artifact unavailable for this scan."}
+            </p>
+          </div>
+        )}
+
         <div
-          className="absolute inset-0 bg-cover bg-center opacity-60 transition-all duration-300"
-          style={{ backgroundImage: `url('${activeOverlay === "mask" ? maskImageUrl : xaiImageUrl}')` }}
+          className="absolute inset-0 bg-gradient-to-t from-black via-black/50 to-black/10"
           aria-hidden="true"
         />
-        <div className="absolute inset-0 bg-gradient-to-t from-black via-black/50 to-black/10" aria-hidden="true" />
+
         <div className="relative z-10 flex flex-col h-full">
           <div className="flex items-center justify-between gap-2 mb-2">
             <div className="flex bg-black/60 backdrop-blur-md p-0.5 rounded-full border border-white/10 text-[11px]">
@@ -444,7 +460,9 @@ function SegmentationView({
                 type="button"
                 onClick={() => setActiveOverlay("xai")}
                 className={`px-2.5 py-0.5 rounded-full font-medium transition-colors cursor-pointer ${
-                  activeOverlay === "xai" ? "bg-white/20 text-white" : "text-white/50 hover:text-white"
+                  activeOverlay === "xai"
+                    ? "bg-white/20 text-white"
+                    : "text-white/50 hover:text-white"
                 }`}
               >
                 XAI Saliency
@@ -453,13 +471,16 @@ function SegmentationView({
                 type="button"
                 onClick={() => setActiveOverlay("mask")}
                 className={`px-2.5 py-0.5 rounded-full font-medium transition-colors cursor-pointer ${
-                  activeOverlay === "mask" ? "bg-neuro-lime text-black font-semibold" : "text-white/50 hover:text-white"
+                  activeOverlay === "mask"
+                    ? "bg-neuro-lime text-black font-semibold"
+                    : "text-white/50 hover:text-white"
                 }`}
               >
                 Segmentation
               </button>
             </div>
           </div>
+
           <h3 className="text-xl font-semibold text-white leading-tight">
             {activeOverlay === "mask" ? (
               <>Coregistered <span className="text-neuro-lime">tumor mask</span></>
@@ -467,6 +488,7 @@ function SegmentationView({
               <>Full <span className="text-neuro-cyan">XAI activation map</span></>
             )}
           </h3>
+
           <div className="mt-auto flex flex-wrap gap-2">
             <button
               onClick={() => onExpandOverlay(activeOverlay)}
@@ -484,9 +506,9 @@ function SegmentationView({
         </div>
       </div>
 
-
       {/* Classification and grading: explicitly not inferred from segmentation */}
-      <div className="md:col-span-8 grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-5">
+      <div className="md:col-span-8 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4 sm:gap-5">
+        {/* Tumor type */}
         <section className="bg-white/5 border border-white/10 rounded-[1.75rem] p-6 sm:p-7 flex flex-col justify-between min-h-[220px]">
           <div>
             <div className="flex items-center gap-2 text-sm text-white/60 font-medium">
@@ -511,6 +533,7 @@ function SegmentationView({
           </div>
         </section>
 
+        {/* WHO grade / stage */}
         <section className="bg-white/5 border border-white/10 rounded-[1.75rem] p-6 sm:p-7 flex flex-col justify-between min-h-[220px]">
           <div>
             <div className="flex items-center gap-2 text-sm text-white/60 font-medium">
@@ -534,6 +557,38 @@ function SegmentationView({
             </p>
           </div>
         </section>
+
+        {/* BraTS dataset cohort metadata */}
+        {results.datasetCohortLabel && (
+          <section
+            className="bg-white/5 border border-white/10 rounded-[1.75rem] p-6 sm:p-7 flex flex-col justify-between min-h-[220px]"
+            aria-label="BraTS dataset cohort metadata"
+          >
+            <div>
+              <div className="flex items-center gap-2 text-sm text-white/60 font-medium">
+                <Activity className="h-4 w-4 text-neuro-cyan" />
+                BraTS dataset cohort
+              </div>
+              <p className="mt-5 text-2xl sm:text-3xl font-semibold text-white tracking-tight">
+                {results.datasetCohortLabel}
+              </p>
+              <p className="text-xs sm:text-sm text-white/55 mt-2 leading-relaxed">
+                {results.datasetCohortSource}
+              </p>
+            </div>
+            <div className="mt-5 rounded-xl border border-neuro-cyan/20 bg-neuro-cyan/5 p-3">
+              <p className="text-xs font-medium text-neuro-cyan">
+                Dataset metadata only
+              </p>
+              <p className="text-sm text-white/75 mt-1">
+                This cohort label comes from the verified BraTS subject mapping.
+              </p>
+              <p className="text-xs text-white/40 mt-1">
+                It is not an ARMT-GAN prediction or a WHO grade.
+              </p>
+            </div>
+          </section>
+        )}
       </div>
 
       {/* Actions */}

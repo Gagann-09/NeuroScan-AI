@@ -30,6 +30,12 @@ export type ScanResults = {
   predicted_mask_pixels: number | null
   slice_coverage_percent: number | null
   model_version: string | null
+  tumor_type: string | null
+  tumor_type_source: string
+  tumor_grade: string | null
+  tumor_grade_source: string
+  dataset_cohort_label: string | null
+  dataset_cohort_source: string | null
   anomaly_area_cm2?: number | null
   confidence_score?: number | null
   who_grade?: string | null
@@ -100,13 +106,21 @@ export function createApiClient(
   onUnauthorized: () => void
 ) {
   return {
-    async uploadScan(files: BraTSFiles): Promise<UploadResponse> {
+    async uploadScan(
+      files: BraTSFiles,
+      datasetSubjectId?: string
+    ): Promise<UploadResponse> {
       const formData = new FormData()
 
       formData.append("t1", files.t1)
       formData.append("t1ce", files.t1ce)
       formData.append("t2", files.t2)
       formData.append("flair", files.flair)
+
+      const normalizedSubjectId = datasetSubjectId?.trim()
+      if (normalizedSubjectId) {
+        formData.append("dataset_subject_id", normalizedSubjectId)
+      }
 
       const response = await authedFetch(
         getIdToken,
@@ -162,6 +176,15 @@ export function createApiClient(
         predicted_mask_pixels: data.predicted_mask_pixels ?? null,
         slice_coverage_percent: data.slice_coverage_percent ?? null,
         model_version: data.model_version ?? null,
+        tumor_type: data.tumor_type ?? null,
+        tumor_type_source:
+          data.tumor_type_source ?? "Not determined by ARMT-GAN segmentation",
+        tumor_grade: data.tumor_grade ?? null,
+        tumor_grade_source:
+          data.tumor_grade_source ??
+          "Not determined; no validated grading output is available",
+        dataset_cohort_label: data.dataset_cohort_label ?? null,
+        dataset_cohort_source: data.dataset_cohort_source ?? null,
         anomaly_area_cm2: data.anomaly_area_cm2 ?? null,
         confidence_score: data.confidence_score ?? null,
         who_grade: data.who_grade ?? null,

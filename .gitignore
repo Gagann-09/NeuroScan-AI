@@ -70,3 +70,14 @@ Thumbs.db
 .idea/
 .openclaude*
 neuroscan_inspection.txt
+# Local evaluation outputs and generated report previews
+backend/evaluation_results/
+backend/neuroscan_measurement_layout_check.pdf
+backend/neuroscan_measurement_page-*.png
+backend/neuroscan_pattern_check/
+
+# Local-only verification helpers
+backend/check_tables.py
+backend/verify_migration.py
+backend/run_tests*.bat
+frontend/build_frontend.bat

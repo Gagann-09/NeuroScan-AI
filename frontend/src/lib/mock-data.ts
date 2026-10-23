@@ -10,6 +10,8 @@ export type ScanResults = {
   tumorTypeSource: string
   tumorGrade: string
   tumorGradeSource: string
+  datasetCohortLabel: string | null
+  datasetCohortSource: string | null
 
   volume: number | null
   confidencePills: number
@@ -50,6 +52,8 @@ export const MOCK_RESULTS: ScanResults = {
   tumorTypeSource: "Demo data - no classifier result",
   tumorGrade: "Not determined",
   tumorGradeSource: "Demo data - no validated grading result",
+  datasetCohortLabel: null,
+  datasetCohortSource: null,
   volume: 32.6,
   confidencePills: 6,
   anomalyPills: 4,

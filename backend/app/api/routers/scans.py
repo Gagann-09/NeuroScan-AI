@@ -19,6 +19,7 @@ from app.api.dependencies import get_db, get_current_user
 from app.core.rate_limiting import enforce_upload_rate_limit
 from app.db.models import Scan, ModalityFile, Prediction, User, KaggleScan, KagglePrediction, KaggleModelVersion
 from app.core.storage import minio_client, get_presigned_url
+from app.services.brats_metadata import resolve_brats2020_cohort
 from app.services.ai_tasks import process_scan_task, process_kaggle_task
 from app.schemas.scan_schema import UploadRequest, UploadResponse, StatusResponse, ResultsResponse, KaggleUploadResponse, KaggleStatusResponse, KaggleResultsResponse
 from ai_pipeline.preprocessing import (
@@ -321,11 +322,27 @@ async def upload_scan(
     t1ce: UploadFile = File(...),
     t2: UploadFile = File(...),
     flair: UploadFile = File(...),
+    dataset_subject_id: str | None = Form(default=None, max_length=64),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
     _rate_limit: None = Depends(enforce_upload_rate_limit),
 ):
     scan_id = str(uuid.uuid4())
+    if isinstance(dataset_subject_id, str):
+        dataset_subject_id = dataset_subject_id.strip() or None
+    else:
+        dataset_subject_id = None
+
+    if (
+        dataset_subject_id is not None
+        and resolve_brats2020_cohort(dataset_subject_id) is None
+    ):
+        dataset_subject_id = None
+
+        raise HTTPException(
+            status_code=422,
+            detail="dataset_subject_id must be a BraTS 2020 training subject ID",
+        )
     bucket_name = "neuroscan-bucket"
 
     modality_files = {
@@ -402,6 +419,7 @@ async def upload_scan(
         scan_record = Scan(
             id=scan_id,
             filename=f"{scan_id}/source_study",  # Reference to study folder
+            dataset_subject_id=dataset_subject_id,
             status="PENDING",
             user_id=current_user.firebase_uid,
         )
@@ -498,6 +516,9 @@ def get_scan_results(
     current_user: User = Depends(get_current_user),
 ):
     scan = get_scan_with_ownership(db, scan_id, current_user)
+    cohort_metadata = resolve_brats2020_cohort(
+        getattr(scan, "dataset_subject_id", None)
+    )
 
     prediction = (
         db.query(Prediction)
@@ -526,6 +547,15 @@ def get_scan_results(
         tumor_grade=None,
         tumor_grade_source=(
             "Not determined; no validated grading output is available"
+        ),
+        dataset_cohort_label=(
+            cohort_metadata["cohort_label"] if cohort_metadata else None
+        ),
+        dataset_cohort_source=(
+            "BraTS2020_TrainingData/name_mapping.csv; supplied subject ID; "
+            "dataset metadata only, not an ARMT-GAN prediction or WHO grade"
+            if cohort_metadata
+            else None
         ),
     )
 

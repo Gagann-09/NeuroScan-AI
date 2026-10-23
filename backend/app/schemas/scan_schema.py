@@ -71,6 +71,14 @@ class ResultsResponse(BaseModel):
         "Not determined; no validated grading output is available",
         description="Source or limitation for the tumor-grade field"
     )
+    dataset_cohort_label: Optional[str] = Field(
+        None,
+        description="BraTS cohort label from the supplied subject ID; not a model prediction or WHO grade",
+    )
+    dataset_cohort_source: Optional[str] = Field(
+        None,
+        description="Provenance for dataset cohort metadata, when a mapping match exists",
+    )
 
 # --- Kaggle Classification Schemas ---
 

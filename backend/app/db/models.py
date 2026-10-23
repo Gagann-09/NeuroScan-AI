@@ -24,6 +24,7 @@ class Scan(Base):
     
     id = Column(String, primary_key=True, index=True)
     filename = Column(String)
+    dataset_subject_id = Column(String(64), nullable=True)
     status = Column(String, default="PENDING")
     mask_path = Column(String, nullable=True)
     xai_path = Column(String, nullable=True)

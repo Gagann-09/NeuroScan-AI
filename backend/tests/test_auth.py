@@ -390,18 +390,75 @@ class TestCrossUserOwnership:
         
         # Mock get_presigned_url
         with patch("app.api.routers.scans.get_presigned_url", side_effect=lambda x: f"https://presigned/{x}"):
+            mock_scan_owned_by_a.dataset_subject_id = "BraTS20_Training_001"
             result = get_scan_results(
                 scan_id="test-scan-owned-by-a",
                 db=mock_db,
                 current_user=mock_user_a,
             )
         
+        assert result.dataset_cohort_label == "HGG"
+        assert result.dataset_cohort_source is not None
+        assert "dataset metadata only" in result.dataset_cohort_source
+        assert result.tumor_type is None
+        assert result.tumor_grade is None
+
         assert result.scan_id == "test-scan-owned-by-a"
         assert result.tumor_detected is True
         assert result.max_tumor_probability == 0.95
         assert result.mask_url == "https://presigned/test-scan-owned-by-a/mask.png"
         assert result.xai_url == "https://presigned/test-scan-owned-by-a/xai.png"
         assert result.report_url == "https://presigned/test-scan-owned-by-a/report.pdf"
+
+    def test_unmatched_brats_subject_returns_no_cohort_metadata(
+        self, mock_user_a, mock_scan_owned_by_a
+        ):
+        """An unmatched BraTS subject must not produce cohort metadata."""
+        from app.api.routers.scans import get_scan_results
+        from app.db.models import Prediction
+        from unittest.mock import MagicMock, patch
+
+        mock_prediction = Prediction(
+            id=1,
+            scan_id="test-scan-owned-by-a",
+            model_version_id="model-test",
+            tumor_detected=True,
+            max_tumor_probability=0.95,
+        )
+
+        mock_db = MagicMock()
+        call_count = [0]
+
+        def query_side_effect(model):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                mock_scan_query = MagicMock()
+                mock_scan_query.filter.return_value.first.return_value = (
+                    mock_scan_owned_by_a
+                )
+                return mock_scan_query
+
+            mock_pred_query = MagicMock()
+            mock_pred_query.filter.return_value.first.return_value = mock_prediction
+            return mock_pred_query
+
+        mock_db.query.side_effect = query_side_effect
+        mock_scan_owned_by_a.dataset_subject_id = "BraTS20_Training_999999"
+
+        with patch(
+            "app.api.routers.scans.get_presigned_url",
+            side_effect=lambda x: f"https://presigned/{x}",
+        ):
+            result = get_scan_results(
+                scan_id="test-scan-owned-by-a",
+                db=mock_db,
+                current_user=mock_user_a,
+            )
+
+        assert result.dataset_cohort_label is None
+        assert result.dataset_cohort_source is None
+        assert result.tumor_type is None
+        assert result.tumor_grade is None
 
     def test_user_b_cannot_access_user_a_scan_results(self, mock_user_b, mock_scan_owned_by_a, mock_prediction_for_scan, monkeypatch):
         """User B receives 403 when requesting User A's results."""

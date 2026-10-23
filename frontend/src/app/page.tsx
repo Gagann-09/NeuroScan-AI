@@ -64,10 +64,16 @@ export default function Dashboard() {
         predictedMaskPixels: apiResults.predicted_mask_pixels ?? null,
         sliceCoveragePercent: apiResults.slice_coverage_percent ?? null,
         anomalyPills: 0,
-        tumorType: "Not determined",
-        tumorTypeSource: "ARMT-GAN segmentation does not classify tumor type",
-        tumorGrade: "Not determined",
-        tumorGradeSource: "WHO grade/stage requires separate validated evidence",
+        tumorType: apiResults.tumor_type ?? "Not determined",
+        tumorTypeSource:
+          apiResults.tumor_type_source ??
+          "Not determined by ARMT-GAN segmentation",
+        tumorGrade: apiResults.tumor_grade ?? "Not determined",
+        tumorGradeSource:
+          apiResults.tumor_grade_source ??
+          "No validated grading output is available",
+        datasetCohortLabel: apiResults.dataset_cohort_label ?? null,
+        datasetCohortSource: apiResults.dataset_cohort_source ?? null,
         volume: null,
         dicom: [],
         confidencePills: maxProb != null ? Math.min(7, Math.max(1, Math.round((maxProb / 100) * 7))) : 0,
@@ -288,7 +294,10 @@ export default function Dashboard() {
    * 2. Poll GET /api/v1/scans/status/{scan_id}
    * 3. On SEGMENTED → GET /api/v1/scans/results/{scan_id} → hydrate results
    */
-  const handleAnalyze = async (file: Record<"t1" | "t1ce" | "t2" | "flair", File>) => {
+  const handleAnalyze = async (
+    file: Record<"t1" | "t1ce" | "t2" | "flair", File>,
+    datasetSubjectId?: string
+  ) => {
     if (intervalRef.current) {
       clearInterval(intervalRef.current)
       intervalRef.current = null
@@ -301,7 +310,7 @@ export default function Dashboard() {
 
     // ── Step 1: Upload Scan ──────────────────────────────────────────────────
     try {
-      const uploadResponse = await api.uploadScan(file)
+      const uploadResponse = await api.uploadScan(file, datasetSubjectId)
       scan_id = uploadResponse.scan_id
     } catch (err: any) {
       setPipelineError(err.message || "Failed to upload scan. Ensure the backend server is running on port 8000.")

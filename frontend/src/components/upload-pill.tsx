@@ -21,7 +21,10 @@ const MODALITY_DESCRIPTIONS: Record<BraTSModality, string> = {
 }
 
 type UploadPillProps = {
-  onAnalyze: (files: Record<BraTSModality, File>) => void
+  onAnalyze: (
+    files: Record<BraTSModality, File>,
+    datasetSubjectId?: string
+  ) => void
 }
 
 export function UploadPill({ onAnalyze }: UploadPillProps) {
@@ -29,6 +32,7 @@ export function UploadPill({ onAnalyze }: UploadPillProps) {
   const [previewUrls, setPreviewUrls] = useState<Partial<Record<BraTSModality, string>>>({})
   const [isMenuOpen, setIsMenuOpen] = useState(false)
   const [isDragging, setIsDragging] = useState<BraTSModality | null>(null)
+  const [datasetSubjectId, setDatasetSubjectId] = useState("")
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
@@ -200,6 +204,34 @@ export function UploadPill({ onAnalyze }: UploadPillProps) {
         })}
       </div>
 
+      <div className="mt-5 w-full max-w-md">
+        <label
+          htmlFor="brats-dataset-subject-id"
+          className="mb-2 block text-xs font-medium text-white/70"
+        >
+          BraTS 2020 subject ID <span className="text-white/40">(optional)</span>
+        </label>
+        <input
+          id="brats-dataset-subject-id"
+          type="text"
+          value={datasetSubjectId}
+          onChange={(event) => setDatasetSubjectId(event.target.value)}
+          placeholder="e.g. BraTS20_Training_001"
+          maxLength={64}
+          autoComplete="off"
+          spellCheck={false}
+          className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white placeholder:text-white/30 focus:border-neuro-cyan/50 focus:outline-none"
+          aria-describedby="brats-dataset-subject-id-help"
+        />
+        <p
+          id="brats-dataset-subject-id-help"
+          className="mt-2 text-xs leading-relaxed text-white/40"
+        >
+          Enter the exact BraTS 2020 training subject ID only when it is known.
+          The matching cohort label is dataset metadata, not an ARMT-GAN prediction or WHO grade.
+        </p>
+      </div>
+
       <div className="flex items-center gap-3 justify-center">
         <div className={`flex items-center gap-2 px-4 py-2 rounded-full border transition-colors ${
           isComplete
@@ -218,7 +250,13 @@ export function UploadPill({ onAnalyze }: UploadPillProps) {
         </div>
 
         <button
-          onClick={() => isComplete && onAnalyze(files as Record<BraTSModality, File>)}
+          onClick={() =>
+            isComplete &&
+            onAnalyze(
+              files as Record<BraTSModality, File>,
+              datasetSubjectId.trim() || undefined
+            )
+          }
           disabled={!isComplete}
           aria-label="Analyze scan"
           className={`w-12 h-12 rounded-full flex items-center justify-center transition-all duration-300 shrink-0 ${

@@ -12,7 +12,10 @@ class XAIProvenance:
     This records the exact method configuration for auditability.
     """
     method: str = "gradient-based input saliency"
-    target: str = "sum of tumor logits across spatial dimensions"
+    target: str = (
+        "sum of predicted tumor probabilities at pixels "
+        "with probability >= 0.5"
+    )
     normalization: str = "min-max [0, 1]"
     aggregation: str = "max absolute gradient across input channels"
     model_checkpoint: Optional[str] = None
@@ -47,10 +50,10 @@ def generate_gradient_saliency(
     influence the segmentation prediction.
     
     Method: Input-gradient saliency (also known as sensitivity analysis)
-    Target: Sum of output logits across spatial dimensions (tumor probability mass)
+    Target: Sum of predicted tumor probabilities at pixels with probability >= 0.5
     Normalization: Min-max to [0, 1]
     Channel aggregation: Max of absolute gradients across input channels
-    
+
     This is NOT Grad-CAM, which requires a specific target layer and
     computes gradients with respect to feature maps, not input pixels.
     
@@ -76,12 +79,42 @@ def generate_gradient_saliency(
     # Clone and enable gradients for input
     input_tensor = input_tensor.clone().detach().requires_grad_(True)
     
-    # Forward pass through ARMT-GAN generator
+    # Forward pass through the ARMT-GAN generator.
+    # The documented model output is a tumor probability mask.
     output = model(input_tensor)
-    
-    # Compute attribution gradients with respect to the output prediction
-    # Target: sum of tumor logits across all spatial positions
-    score = output.sum()
+
+    if not output.requires_grad:
+        raise RuntimeError(
+            "Gradients unavailable: model output is detached "
+            "from the input computation graph."
+        )
+
+    if output.ndim != 4 or output.shape[1] != 1:
+        raise ValueError(
+            "Expected model output shape [B, 1, H, W], "
+            f"got {tuple(output.shape)}"
+        )
+
+    if output.shape[0] != input_tensor.shape[0]:
+        raise ValueError("Model output batch size does not match input batch size.")
+
+    if not torch.isfinite(output).all():
+        raise ValueError("Model output contains non-finite values.")
+
+    if torch.any(output < 0) or torch.any(output > 1):
+        raise ValueError(
+            "Expected tumor probabilities in [0, 1]; "
+            "verify the model output contract."
+        )
+
+    # Freeze the predicted binary region for attribution.
+    # This is the same fixed threshold used by segmentation overlays.
+    tumor_mask = (output.detach() >= 0.5)
+
+    # Attribute the predicted tumor-region probability mass,
+    # not the sum of tumor and background probabilities.
+    # An empty predicted mask produces a zero target with a valid graph.
+    score = (output * tumor_mask.to(dtype=output.dtype)).sum()
     score.backward()
     
     if input_tensor.grad is None:
@@ -99,16 +132,16 @@ def generate_gradient_saliency(
     # Normalize between 0 and 1 using min-max
     saliency_min = saliency.min()
     saliency_max = saliency.max()
-    
+
     if saliency_max > saliency_min:
         saliency = (saliency - saliency_min) / (saliency_max - saliency_min)
     else:
         # Flat gradient case: all values identical (typically all zeros)
         # Return zero map explicitly rather than dividing by zero
         saliency = torch.zeros_like(saliency)
-    
+
     saliency_np = saliency.cpu().detach().numpy()
-    
+
     # Build provenance record
     provenance = XAIProvenance(
         model_checkpoint=model_checkpoint,
@@ -116,7 +149,7 @@ def generate_gradient_saliency(
         input_shape=tuple(input_tensor.shape),
         output_shape=tuple(saliency_np.shape),
     )
-    
+
     return saliency_np, provenance
 
 
@@ -147,16 +180,16 @@ def compute_segmentation_alignment(
     # Squeeze to [H, W] for computation
     attr = attribution.squeeze()
     mask = segmentation_mask.squeeze()
-    
+
     if attr.shape != mask.shape:
         raise ValueError(f"Shape mismatch: attribution {attr.shape} vs mask {mask.shape}")
-    
+
     # Binarize segmentation mask
-    binary_mask = (mask > threshold).astype(bool)
-    
+    binary_mask = (mask >= threshold).astype(bool)
+
     tumor_pixels = binary_mask.sum()
     background_pixels = (~binary_mask).sum()
-    
+
     if tumor_pixels == 0:
         # Empty tumor mask: no tumor region to measure
         return {
@@ -167,12 +200,12 @@ def compute_segmentation_alignment(
             "background_pixel_count": int(background_pixels),
             "note": "Empty tumor mask - no alignment measurable",
         }
-    
+
     mean_inside = float(attr[binary_mask].mean())
     mean_outside = float(attr[~binary_mask].mean()) if background_pixels > 0 else 0.0
-    
+
     ratio = mean_inside / mean_outside if mean_outside > 0 else float('inf')
-    
+
     return {
         "mean_inside": mean_inside,
         "mean_outside": mean_outside,

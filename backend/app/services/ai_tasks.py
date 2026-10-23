@@ -679,71 +679,142 @@ def _get_or_create_model_version(db: Session, version_id: str, checkpoint_path: 
     return model_version
 
 
-def generate_clinical_overlays(original_pil: Image.Image, mask_tensor: np.ndarray, xai_tensor: np.ndarray):
-    """Generate visualization overlays for segmentation and XAI."""
-    orig_np = np.array(original_pil.convert('RGB'))
-    orig_bgr = cv2.cvtColor(orig_np, cv2.COLOR_RGB2BGR)
+def generate_clinical_overlays(original_pil, mask_tensor, xai_tensor):
+    """
+    Render the raw ARMT-GAN probability mask and gradient-based input
+    saliency independently.
 
-    mask_np = mask_tensor.squeeze()
-    
-    if mask_np.max() > mask_np.min():
-        norm_mask = (mask_np - mask_np.min()) / (mask_np.max() - mask_np.min())
-    else:
-        norm_mask = mask_np
+    Returns:
+        segmentation_overlay: RGB PIL image.
+        saliency_overlay: RGB PIL image.
+        tumor_detected: Whether any pixel meets the fixed 0.5 threshold.
+        probability_mask: Unmodified model probabilities as a 2D array.
+    """
 
-    thresh_val = np.percentile(norm_mask, 85) if np.max(norm_mask) > 0.1 else 0.2
-    _, binary_mask = cv2.threshold((norm_mask * 255).astype(np.uint8), int(thresh_val * 255), 255, cv2.THRESH_BINARY)
+    def to_numpy_2d(value, name):
+        # Support NumPy arrays and PyTorch tensors without changing the
+        # model's stored prediction or attribution.
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    clean_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
-    
-    if cv2.countNonZero(clean_mask) < 5:
-        _, clean_mask = cv2.threshold((norm_mask * 255).astype(np.uint8), 50, 255, cv2.THRESH_BINARY)
+        array = np.asarray(value).squeeze()
 
-    glow_mask = cv2.GaussianBlur(clean_mask, (21, 21), 0)
-    glow_mask_float = glow_mask.astype(float) / 255.0
+        if array.ndim != 2:
+            raise ValueError(
+                f"{name} must resolve to a 2D array; got shape {array.shape}"
+            )
 
-    color_layer = np.zeros_like(orig_bgr)
-    color_layer[:] = [150, 255, 50] 
+        if not np.isfinite(array).all():
+            raise ValueError(f"{name} contains non-finite values")
 
-    alpha = 0.70
-    mask_3d = np.repeat(glow_mask_float[:, :, np.newaxis], 3, axis=2)
-    seg_overlay = (orig_bgr * (1 - mask_3d * alpha) + color_layer * (mask_3d * alpha)).astype(np.uint8)
+        return array.astype(np.float32, copy=False)
 
-    contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(seg_overlay, contours, -1, (180, 255, 100), 2)
+    original_rgb = np.asarray(original_pil.convert("RGB"))
+    height, width = original_rgb.shape[:2]
 
-    heatmap_np = xai_tensor.squeeze()
-    if heatmap_np.max() > heatmap_np.min():
-        heatmap_np = (heatmap_np - heatmap_np.min()) / (heatmap_np.max() - heatmap_np.min())
+    probability_mask = to_numpy_2d(mask_tensor, "mask_tensor")
+    saliency = to_numpy_2d(xai_tensor, "xai_tensor")
 
-    context_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
-    localized_area = cv2.dilate(clean_mask, context_kernel, iterations=1)
-    localized_area_float = localized_area.astype(float) / 255.0
+    if probability_mask.shape != (height, width):
+        raise ValueError(
+            "Mask/image shape mismatch: "
+            f"{probability_mask.shape} != {(height, width)}"
+        )
 
-    localized_heatmap = heatmap_np * localized_area_float
-    if np.max(localized_heatmap) > 0:
-        localized_heatmap = localized_heatmap / np.max(localized_heatmap)
+    if saliency.shape != (height, width):
+        raise ValueError(
+            "Saliency/image shape mismatch: "
+            f"{saliency.shape} != {(height, width)}"
+        )
 
-    heatmap_colored = cv2.applyColorMap((localized_heatmap * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+    if np.any(probability_mask < 0.0) or np.any(probability_mask > 1.0):
+        raise ValueError("Expected sigmoid probabilities in [0, 1]")
 
-    xai_alpha_mask = localized_heatmap[:, :, np.newaxis]
-    xai_overlay = (orig_bgr * (1 - xai_alpha_mask * 0.7) + heatmap_colored * (xai_alpha_mask * 0.7)).astype(np.uint8)
+    # Use the frozen evaluation threshold. Do not normalize, blur, clean,
+    # dilate, or apply a fallback threshold to the model prediction.
+    binary_mask = probability_mask >= 0.5
+    tumor_detected = bool(np.any(binary_mask))
 
-    seg_final_pil = Image.fromarray(cv2.cvtColor(seg_overlay, cv2.COLOR_BGR2RGB))
-    xai_final_pil = Image.fromarray(cv2.cvtColor(xai_overlay, cv2.COLOR_BGR2RGB))
-    
-    tumor_area_px = cv2.countNonZero(clean_mask)
-    # No heuristic cmÂ² conversion - pixel count only for internal thresholding
-    tumor_detected = tumor_area_px > 0
-    
-    return seg_final_pil, xai_final_pil, tumor_detected, norm_mask
+    # Segmentation overlay: color only pixels selected by the fixed
+    # threshold. The contour follows that same binary prediction.
+    original_bgr = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2BGR)
+    segmentation_bgr = original_bgr.copy()
 
+    color_bgr = np.zeros_like(original_bgr)
+    color_bgr[:] = (50, 255, 150)  # Green-toned overlay in BGR order.
+
+    alpha = 0.45
+    segmentation_bgr[binary_mask] = (
+        original_bgr[binary_mask].astype(np.float32) * (1.0 - alpha)
+        + color_bgr[binary_mask].astype(np.float32) * alpha
+    ).astype(np.uint8)
+
+    contours, _ = cv2.findContours(
+        binary_mask.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if contours:
+        cv2.drawContours(segmentation_bgr, contours, -1, (100, 255, 180), 1)
+
+    # Tumor-focused visualization of gradient-based input saliency.
+    # This changes display only; it does not alter the underlying attribution.
+    # The raw attribution artifact is persisted separately below.
+    saliency_display = np.zeros_like(saliency, dtype=np.float32)
+
+    if tumor_detected:
+        tumor_saliency = saliency[binary_mask]
+
+        saliency_min = float(tumor_saliency.min())
+        saliency_max = float(tumor_saliency.max())
+
+        if saliency_max > saliency_min:
+            saliency_display[binary_mask] = (
+                (tumor_saliency - saliency_min)
+                / (saliency_max - saliency_min)
+            )
+
+    saliency_u8 = np.round(
+        np.clip(saliency_display, 0.0, 1.0) * 255.0
+    ).astype(np.uint8)
+
+    heatmap_bgr = cv2.applyColorMap(
+        saliency_u8,
+        cv2.COLORMAP_TURBO,
+    )
+
+    # Apply XAI coloring only inside the exact predicted binary mask.
+    saliency_alpha = (saliency_display * 0.65)[..., None]
+
+    saliency_bgr = (
+        original_bgr.astype(np.float32) * (1.0 - saliency_alpha)
+        + heatmap_bgr.astype(np.float32) * saliency_alpha
+    )
+
+    saliency_bgr = np.clip(
+        saliency_bgr, 0, 255
+    ).astype(np.uint8)
+
+    segmentation_overlay = Image.fromarray(
+        cv2.cvtColor(segmentation_bgr, cv2.COLOR_BGR2RGB)
+    )
+    saliency_overlay = Image.fromarray(
+        cv2.cvtColor(saliency_bgr, cv2.COLOR_BGR2RGB)
+    )
+
+    # Keep the existing four-value return contract. The fourth value is
+    # the raw probability map, not a min-max-normalized mask.
+    return (
+        segmentation_overlay,
+        saliency_overlay,
+        tumor_detected,
+        probability_mask,
+    )
 
 def create_reference_image(modality_arrays: dict[str, np.ndarray], slice_index: int) -> Image.Image:
     """
     Create a reference RGB image from the 4 modalities for visualization.
-    Uses FLAIR as base, overlays T1ce for contrast enhancement.
+    Uses the FLAIR slice as the grayscale reference image.
     """
     # Use FLAIR as the base (good for tumor visualization)
     flair_slice = modality_arrays["flair"][:, :, slice_index]

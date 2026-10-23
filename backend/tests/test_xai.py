@@ -28,7 +28,7 @@ class TestXAIProvenance:
         """Test default provenance values."""
         prov = XAIProvenance()
         assert prov.method == "gradient-based input saliency"
-        assert prov.target == "sum of tumor logits across spatial dimensions"
+        assert prov.target == "sum of predicted tumor probabilities at pixels with probability >= 0.5"
         assert prov.normalization == "min-max [0, 1]"
         assert prov.aggregation == "max absolute gradient across input channels"
         assert prov.model_checkpoint is None
@@ -59,7 +59,7 @@ class TestXAIProvenance:
         )
         d = prov.to_dict()
         assert d["method"] == "gradient-based input saliency"
-        assert d["target"] == "sum of tumor logits across spatial dimensions"
+        assert d["target"] == "sum of predicted tumor probabilities at pixels with probability >= 0.5"
         assert d["normalization"] == "min-max [0, 1]"
         assert d["model_checkpoint"] == "test.pth"
         assert d["model_version"] == "v1"
@@ -98,11 +98,17 @@ class TestGenerateGradientSaliency:
         assert saliency.min() >= 0.0
         assert saliency.max() <= 1.0
 
-    def test_normalization_non_flat(self, model, input_tensor):
-        """Test normalization with non-flat gradients."""
+    def test_normalization_non_flat(self, input_tensor):
+        class SpatialProbabilityModel(torch.nn.Module):
+            def forward(self, x):
+                spatial_signal = x[:, :1, :, :]
+                return torch.sigmoid(spatial_signal + 1.0)
+
+        model = SpatialProbabilityModel().eval()
         saliency, _ = generate_gradient_saliency(input_tensor, model)
-        
-        # Should have variation (not all same value)
+
+        assert saliency.min() >= 0.0
+        assert saliency.max() <= 1.0
         assert saliency.max() > saliency.min()
 
     def test_deterministic(self, model, input_tensor):
@@ -162,7 +168,7 @@ class TestGenerateGradientSaliency:
         )
         
         assert provenance.method == "gradient-based input saliency"
-        assert provenance.target == "sum of tumor logits across spatial dimensions"
+        assert provenance.target == "sum of predicted tumor probabilities at pixels with probability >= 0.5"
         assert provenance.normalization == "min-max [0, 1]"
         assert provenance.aggregation == "max absolute gradient across input channels"
         assert provenance.model_checkpoint == "test.pth"
@@ -217,7 +223,7 @@ class TestFlatGradientHandling:
         class ConstantNonzeroModel(torch.nn.Module):
             def forward(self, x):
                 # Use x in a way that produces constant output but preserves grad flow
-                return torch.ones_like(x[:, :1, :, :]) * 5.0 + (x * 0).sum()
+                return torch.ones_like(x[:, :1, :, :]) * 0.8 + (x * 0).sum()
         
         model = ConstantNonzeroModel()
         model.eval()

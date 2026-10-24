@@ -136,7 +136,7 @@ class TestProvenanceWiringLogic:
         
         d = prov.to_dict()
         assert d['method'] == "gradient-based input saliency"
-        assert d['target'] == "sum of tumor logits across spatial dimensions"
+        assert d['target'] == "sum of predicted tumor probabilities at pixels with probability >= 0.5"
         assert d['normalization'] == "min-max [0, 1]"
         assert d['aggregation'] == "max absolute gradient across input channels"
         assert d['model_checkpoint'] == "test.pth"

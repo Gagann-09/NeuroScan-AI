@@ -70,6 +70,10 @@ class Prediction(Base):
     slice_coverage_percent = Column(Float, nullable=True)
     dice = Column(Float, nullable=True)
     iou = Column(Float, nullable=True)
+    # BraTS dataset-cohort HGG/LGG classifier output (not WHO grade, cancer
+    # stage, histological diagnosis, or clinical diagnosis).
+    hgg_lgg_class = Column(String, nullable=True)
+    hgg_lgg_probability = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Artifact(Base):

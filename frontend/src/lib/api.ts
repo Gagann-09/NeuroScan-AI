@@ -36,9 +36,9 @@ export type ScanResults = {
   tumor_grade_source: string
   dataset_cohort_label: string | null
   dataset_cohort_source: string | null
-  anomaly_area_cm2?: number | null
-  confidence_score?: number | null
-  who_grade?: string | null
+  hgg_lgg_class: string | null
+  hgg_lgg_probability: number | null
+  hgg_lgg_source: string | null
 }
 
 /**
@@ -185,9 +185,9 @@ export function createApiClient(
           "Not determined; no validated grading output is available",
         dataset_cohort_label: data.dataset_cohort_label ?? null,
         dataset_cohort_source: data.dataset_cohort_source ?? null,
-        anomaly_area_cm2: data.anomaly_area_cm2 ?? null,
-        confidence_score: data.confidence_score ?? null,
-        who_grade: data.who_grade ?? null,
+        hgg_lgg_class: data.hgg_lgg_class ?? null,
+        hgg_lgg_probability: data.hgg_lgg_probability ?? null,
+        hgg_lgg_source: data.hgg_lgg_source ?? null,
       }
     },
 

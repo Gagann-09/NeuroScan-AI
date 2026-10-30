@@ -273,6 +273,71 @@ describe('API Client', () => {
     )
   })
 
+  it('maps BraTS HGG/LGG cohort-classifier fields returned by the API', async () => {
+    mockGetIdToken.mockResolvedValue('test-id-token')
+
+    const mockResponse = {
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        scan_id: 'brats-scan-hgg-001',
+        mask_url: null,
+        xai_url: null,
+        report_url: null,
+        tumor_detected: true,
+        max_tumor_probability: 0.9,
+        predicted_mask_pixels: 1200,
+        slice_coverage_percent: 2.4,
+        model_version: 'armt-gan-test',
+        tumor_type: null,
+        tumor_type_source: 'Not determined by ARMT-GAN segmentation',
+        tumor_grade: null,
+        tumor_grade_source: 'No validated grading output is available',
+        dataset_cohort_label: null,
+        dataset_cohort_source: null,
+        hgg_lgg_class: 'HGG',
+        hgg_lgg_probability: 0.85,
+        hgg_lgg_source:
+          'BraTS HGG/LGG cohort classifier (volume-middle slice, 224x224); dataset-cohort prediction only, not WHO grade, cancer stage, histological diagnosis, or clinical diagnosis',
+      }),
+    }
+    ;(global.fetch as Mock).mockResolvedValue(mockResponse)
+
+    const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
+    const result = await api.getScanResults('brats-scan-hgg-001')
+
+    expect(result.hgg_lgg_class).toBe('HGG')
+    expect(result.hgg_lgg_probability).toBe(0.85)
+    expect(result.hgg_lgg_source).toContain('dataset-cohort prediction only')
+    expect(result.hgg_lgg_source).toContain('not WHO grade')
+  })
+
+  it('uses safe fallbacks when BraTS HGG/LGG cohort-classifier fields are absent', async () => {
+    mockGetIdToken.mockResolvedValue('test-id-token')
+
+    const mockResponse = {
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        scan_id: 'brats-scan-hgg-002',
+        mask_url: null,
+        xai_url: null,
+        report_url: null,
+        tumor_detected: false,
+        max_tumor_probability: null,
+        predicted_mask_pixels: null,
+        slice_coverage_percent: null,
+        model_version: null,
+      }),
+    }
+    ;(global.fetch as Mock).mockResolvedValue(mockResponse)
+
+    const api = createApiClient(mockGetIdToken, mockOnUnauthorized)
+    const result = await api.getScanResults('brats-scan-hgg-002')
+
+    expect(result.hgg_lgg_class).toBeNull()
+    expect(result.hgg_lgg_probability).toBeNull()
+    expect(result.hgg_lgg_source).toBeNull()
+  })
+
   it('parses error detail from response', async () => {
     mockGetIdToken.mockResolvedValue('test-id-token')
 

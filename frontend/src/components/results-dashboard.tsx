@@ -153,7 +153,7 @@ function ResultsDashboard({ results, onReset }: { results: ScanResults; onReset:
 
   const handleRawMask = () => {
     window.open(maskImageUrl, "_blank")
-    notify("Segmentation mask exported (NIfTI .nii.gz / PNG).")
+    notify("Segmentation overlay opened in a new tab (rendered 2D axial overlay).")
   }
 
   const handleFlag = () => notify("Scan successfully flagged and routed to head radiologist queue.")
@@ -278,8 +278,9 @@ function ResultsDashboard({ results, onReset }: { results: ScanResults; onReset:
             <img src={xaiImageUrl} alt="High-resolution XAI activation heatmap of the MRI scan" className="w-full h-full object-cover" />
           </div>
           <p className="text-sm text-white/50 mt-4 leading-relaxed">
-            Gradient-based input saliency map highlighting the voxels that most influenced the ARMT-GAN segmentation prediction. Warmer
-            lime regions indicate higher attribution toward the detected tumor class.
+            Gradient-based input saliency map highlighting the voxels that most influenced the ARMT-GAN segmentation prediction. The rendered
+            heatmap is normalized within the predicted tumor region and shows relative attribution within that region, not calibrated
+            attribution magnitude. It does not prove the segmentation is correct.
           </p>
         </Modal>
       )}
@@ -513,7 +514,7 @@ function SegmentationView({
           <div>
             <div className="flex items-center gap-2 text-sm text-white/60 font-medium">
               <Target className="h-4 w-4 text-neuro-cyan" />
-              Tumor type
+              Tumor type (not assessed)
             </div>
             <p className="mt-5 text-2xl sm:text-3xl font-semibold text-white tracking-tight">
               {results.tumorType}
@@ -528,7 +529,7 @@ function SegmentationView({
               Single-channel, 2D tumor segmentation mask
             </p>
             <p className="text-xs text-white/40 mt-1">
-              This workflow does not classify tumor histology.
+              This BraTS workflow produces a segmentation mask and does not independently determine tumor type, grade, or stage.
             </p>
           </div>
         </section>
@@ -538,7 +539,7 @@ function SegmentationView({
           <div>
             <div className="flex items-center gap-2 text-sm text-white/60 font-medium">
               <Activity className="h-4 w-4 text-neuro-lime" />
-              WHO grade / stage
+              Grade / stage (not assessed)
             </div>
             <p className="mt-5 text-2xl sm:text-3xl font-semibold text-white tracking-tight">
               {results.tumorGrade}
@@ -553,7 +554,7 @@ function SegmentationView({
               A validated grading model and/or appropriate clinical and pathological evidence.
             </p>
             <p className="text-xs text-white/40 mt-1">
-              Segmentation output alone cannot establish WHO grade.
+              This BraTS workflow produces a segmentation mask and does not independently determine tumor type, grade, or stage.
             </p>
           </div>
         </section>
@@ -585,6 +586,47 @@ function SegmentationView({
               </p>
               <p className="text-xs text-white/40 mt-1">
                 It is not an ARMT-GAN prediction or a WHO grade.
+              </p>
+              <p className="text-xs text-white/40 mt-1">
+                The optional subject ID is looked up in the BraTS 2020 mapping but is not verified against the uploaded MRI files.
+              </p>
+            </div>
+          </section>
+        )}
+        {/* BraTS HGG/LGG dataset-cohort prediction (not a clinical diagnosis) */}
+        {results.hggLggClass && (
+          <section
+            className="bg-white/5 border border-white/10 rounded-[1.75rem] p-6 sm:p-7 flex flex-col justify-between min-h-[220px]"
+            aria-label="BraTS HGG/LGG dataset-cohort prediction"
+          >
+            <div>
+              <div className="flex items-center gap-2 text-sm text-white/60 font-medium">
+                <Activity className="h-4 w-4 text-neuro-cyan" />
+                BraTS dataset-cohort prediction (HGG/LGG)
+              </div>
+              <p className="mt-5 text-2xl sm:text-3xl font-semibold text-white tracking-tight">
+                {results.hggLggClass}
+              </p>
+              <p className="text-xs sm:text-sm text-white/55 mt-2 leading-relaxed">
+                {results.hggLggSource}
+              </p>
+              {results.hggLggProbability != null && (
+                <p className="text-xs sm:text-sm text-white/55 mt-1 leading-relaxed">
+                  Model softmax probability: {(results.hggLggProbability * 100).toFixed(1)}%
+                </p>
+              )}
+            </div>
+            <div className="mt-5 rounded-xl border border-neuro-cyan/20 bg-neuro-cyan/5 p-3">
+              <p className="text-xs font-medium text-neuro-cyan">
+                Dataset-cohort prediction only
+              </p>
+              <p className="text-sm text-white/75 mt-1">
+                This is a BraTS dataset-cohort HGG/LGG prediction from the
+                trained cohort classifier. It is not WHO grade, cancer stage,
+                histological diagnosis, or a clinical diagnosis.
+              </p>
+              <p className="text-xs text-white/40 mt-1">
+                Research proof of concept — not clinically validated.
               </p>
             </div>
           </section>
@@ -708,7 +750,7 @@ function PatientView({ results }: { results: ScanResults }) {
         <div className="bg-neuro-lime text-black rounded-[1.75rem] p-6 sm:p-8 flex flex-col justify-between shadow-[0_0_50px_rgba(190,255,60,0.15)]">
           <span className="text-sm font-semibold flex items-center gap-2">
             <Target className="h-4 w-4" />
-            Tumor type
+            Tumor type (not assessed)
           </span>
 
           <div>
@@ -724,7 +766,7 @@ function PatientView({ results }: { results: ScanResults }) {
         <div className="bg-white/5 border border-white/10 rounded-[1.75rem] p-6 sm:p-8 flex flex-col justify-between">
           <span className="text-sm font-medium text-white/50 flex items-center gap-2">
             <Activity className="h-4 w-4" />
-            WHO grade / stage
+            Grade / stage (not assessed)
           </span>
 
           <div>
@@ -846,7 +888,7 @@ function DicomView({
           <Download className="h-6 w-6" />
           <div>
             <p className="text-lg font-semibold">Export mask</p>
-            <p className="text-xs text-black/60">NIfTI .nii.gz segmentation</p>
+            <p className="text-xs text-black/60">Rendered 2D axial overlay (PNG)</p>
           </div>
         </button>
         <button

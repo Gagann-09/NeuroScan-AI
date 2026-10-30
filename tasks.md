@@ -355,23 +355,82 @@ Verify the complete NeuroScan pipeline.
 
 ### Tasks
 
--   [ ] Upload study.
--   [ ] Persist source artifacts.
--   [ ] Run preprocessing.
--   [ ] Run ARMT-GAN.
--   [ ] Generate mask.
--   [ ] Generate XAI.
--   [ ] Store artifacts.
--   [ ] Persist prediction metadata.
--   [ ] Render frontend.
--   [ ] Generate report.
--   [ ] Verify report values.
--   [ ] Verify failure handling.
--   [ ] Run complete automated test suite.
+-   [x] Upload study. (Live HTTP upload returned 200; scan created in disposable PostgreSQL.)
+-   [x] Persist source artifacts. (ModalityFile records persisted; MinIO objects stored.)
+-   [x] Run preprocessing. (Preprocessing ran inside process_scan_task.)
+-   [x] Run ARMT-GAN. (ARMT-GAN inference ran; mask generated.)
+-   [x] Generate mask. (mask_path persisted; mask_url in results.)
+-   [x] Generate XAI. (xai_path persisted; xai_url in results.)
+-   [x] Store artifacts. (Artifact records created; MinIO objects uploaded.)
+-   [x] Persist prediction metadata. (Prediction.hgg_lgg_class/hgg_lgg_probability stored and returned.)
+-   [ ] Render frontend. (tsc clean, vitest passes; no live browser render performed.)
+-   [x] Generate report. (PDF generated; HTTP 200, valid PDF, 101KB.)
+-   [ ] Verify report values. (Report downloaded and valid PDF; content not parsed.)
+-   [x] Verify failure handling. (HGG/LGG failure → scan still SEGMENTED, ARMT-GAN mask preserved, HGG/LGG fields null.)
+-   [ ] Run complete automated test suite. (86 backend + 17 frontend passed; DB-backed suites require live PostgreSQL, not re-run in current state.)
 
 ### Gate
 
 A clean environment reproduces the documented workflow.
+
+### Status
+
+PARTIAL -- implementation exists and live HTTP end-to-end verification passed (Steps 5-9, 17), but the gate is not fully satisfied:
+
+Evidence-backed (PASS-equivalent):
+- Upload study, persist source artifacts, run preprocessing, run ARMT-GAN, generate mask, generate XAI, store artifacts, persist prediction metadata, generate report -- all verified via live HTTP test against disposable infrastructure (PostgreSQL 16 port 15432, Redis 7 port 16379, MinIO port 19000; all containers cleaned up after verification).
+- HGG/LGG cohort prediction verified end-to-end: hgg_lgg_class, hgg_lgg_probability, hgg_lgg_source returned with correct types; source labels output as "BraTS dataset-cohort prediction" with explicit non-clinical disclaimer (not WHO grade/cancer stage/histological diagnosis/clinical diagnosis); tumor_type/tumor_grade remain None/unassessed; ARMT-GAN segmentation fields intact.
+- Full-training checkpoint verified: ai_pipeline/weights_full_train/hgg_lgg_classifier_best.pth, epoch 6, seed 42, SHA-256 4361c0e9aa27682e833b01f51796d99b07c9805bc7802d0f92cbd71f991795ed (not the 1-epoch smoke-test copy).
+- Migration 011_add_hgg_lgg_prediction_fields.py verified applied to disposable database (revision 011 (head); both nullable columns present); not applied to any persistent database; all disposable containers removed.
+- Backend tests tests/: 86 passed (includes new focused baseline regression test test_majority_class_baseline_ordinary_accuracy_held_out_distribution verifying ordinary_accuracy == 44/56 ≈ 0.785714, not 1.0).
+- Frontend api.test.ts: 17 passed (includes 2 new HGG/LGG mapping tests); tsc --noEmit clean.
+- Historical evaluation JSON backend/ai_pipeline/weights/hgg_lgg_classifier_evaluation.json remains unchanged (contains pre-fix baseline ordinary_accuracy: 1.0 as the historical record); source fix corrects calculation to ordinary_accuracy(predictions, targets).
+
+Unverified / remaining gaps:
+- Live browser/rendering frontend test not performed (tsc clean + vitest pass is not browser-rendering proof).
+- Report content not parsed (valid PDF downloaded; field values inside not verified).
+- Complete automated test suite not run against live PostgreSQL (DB-backed suites test_scan_claim.py, test_artifact_lifecycle.py, test_scan_claim_integration.py require live PostgreSQL).
+- Full non-database backend suite not re-run against current source in this state (last full pass 254/0 per D-040/D-041/D-048; selected suites re-verified in Steps 8-9: 86 passed).
+
+Migration and storage correctness verified (migration 011 applied to disposable DB; columns nullable).
+
+### Step 21 P9 Gate Audit (2026-10-27)
+
+Decision: P9 remains PARTIAL. P9 is not marked PASS, and P10 is not authorized.
+
+Gate wording (tasks.md): "A clean environment reproduces the documented workflow."
+Completion rule (rules.md #20): a phase closes only after implementation passes, tests pass,
+documentation matches code, no known contract contradiction remains, memory.md records
+consequential decisions, and tasks.md marks the phase verified. rules.md #18: an incomplete task
+blocks the phase.
+
+Requirement-by-requirement assessment:
+- Live HTTP upload-to-results: VERIFIED (Step 17 live HTTP test, D-049) — synthetic 4-modality
+  NIfTI upload → status SEGMENTED → GET /results/{scan_id} returned 200.
+- Persistence/retrieval of source and derived artifacts: VERIFIED (ModalityFile + Artifact
+  records; MinIO objects; D-049).
+- ARMT-GAN mask and XAI generation: VERIFIED (mask_path/xai_path persisted; mask_url/xai_url in
+  results; D-049).
+- HGG/LGG metadata, provenance, failure isolation: VERIFIED (nullable hgg_lgg_class /
+  hgg_lgg_probability + ModelVersion provenance keyed by checkpoint SHA-256; HGG/LGG failure
+  leaves scan SEGMENTED with null HGG/LGG fields; D-049 Step 17 failure-isolation test).
+- PDF generation: VERIFIED (valid PDF, HTTP 200, 101KB; D-049). PDF content/field values NOT
+  parsed — task "[ ] Verify report values" remains unchecked.
+- Backend test suite: reported "413 passed, 0 failed" does not appear in any workspace file and
+  is treated as reported-only, not independently inspected. Workspace-verified record (D-049):
+  86 backend passed (non-database suite). Last full-suite pass 254/0 (D-040–D-042) is reported,
+  not re-verifiable here because no PostgreSQL instance is available in this environment.
+- Frontend test suite: 17 passed, tsc --noEmit clean (D-049; workspace-verified).
+- Live browser rendering: NOT verified. No Playwright/Cypress/e2e browser-rendering setup exists
+  in the frontend (only vitest + tsc). Dependency installation is prohibited, so it cannot be
+  verified using an existing, approved setup in this step. Whether browser rendering is mandatory
+  under the gate text is ambiguous; per the decision rule the ambiguity is preserved and P9 stays
+  PARTIAL rather than being reinterpreted to PASS.
+
+Overall: three P9 tasks remain unchecked ("Render frontend", "Verify report values",
+"Run complete automated test suite"), and rules.md #18/#20 require every gate condition satisfied.
+P9 = PARTIAL. Outstanding limitations preserved: live browser rendering, report content parsing,
+complete DB-backed test suite re-run.
 
 ------------------------------------------------------------------------
 

@@ -1,0 +1,63 @@
+{
+  "seed": 42,
+  "device": "cpu",
+  "data_dir": "C:\\Users\\gagan\\Downloads\\Major project\\neuroscan-ai\\datasets\\BraTS_data\\BraTS2020_TrainingData",
+  "epochs": 1,
+  "batch_size": 16,
+  "learning_rate": 0.001,
+  "train_fraction": 0.7,
+  "validation_fraction": 0.15,
+  "test_fraction": 0.15,
+  "train_samples": 258,
+  "validation_samples": 55,
+  "test_samples": 56,
+  "class_names": [
+    "HGG",
+    "LGG"
+  ],
+  "class_to_index": {
+    "HGG": 0,
+    "LGG": 1
+  },
+  "parameter_count": 1174018,
+  "best_epoch": 1,
+  "best_validation_balanced_accuracy": 0.7272727272727273,
+  "history": [
+    {
+      "epoch": 1,
+      "train": {
+        "loss": 0.6408397211122883,
+        "balanced_accuracy": 0.6300046019328118,
+        "lgg_sensitivity": 0.5283018867924528,
+        "hgg_sensitivity": 0.7317073170731707,
+        "confusion_matrix": [
+          [
+            150,
+            55
+          ],
+          [
+            25,
+            28
+          ]
+        ]
+      },
+      "validation": {
+        "loss": 0.653526817668568,
+        "balanced_accuracy": 0.7272727272727273,
+        "lgg_sensitivity": 1.0,
+        "hgg_sensitivity": 0.45454545454545453,
+        "confusion_matrix": [
+          [
+            20,
+            24
+          ],
+          [
+            0,
+            11
+          ]
+        ]
+      }
+    }
+  ],
+  "created_at": "2026-10-24T10:35:14.799060+00:00"
+}

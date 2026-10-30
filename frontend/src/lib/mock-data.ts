@@ -13,6 +13,12 @@ export type ScanResults = {
   datasetCohortLabel: string | null
   datasetCohortSource: string | null
 
+  // BraTS dataset-cohort HGG/LGG classifier output (not WHO grade, cancer
+  // stage, histological diagnosis, or clinical diagnosis).
+  hggLggClass: string | null
+  hggLggProbability: number | null
+  hggLggSource: string | null
+
   volume: number | null
   confidencePills: number
   anomalyPills: number
@@ -54,6 +60,9 @@ export const MOCK_RESULTS: ScanResults = {
   tumorGradeSource: "Demo data - no validated grading result",
   datasetCohortLabel: null,
   datasetCohortSource: null,
+  hggLggClass: null,
+  hggLggProbability: null,
+  hggLggSource: null,
   volume: 32.6,
   confidencePills: 6,
   anomalyPills: 4,

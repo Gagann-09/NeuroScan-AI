@@ -79,6 +79,20 @@ class ResultsResponse(BaseModel):
         None,
         description="Provenance for dataset cohort metadata, when a mapping match exists",
     )
+    # BraTS dataset-cohort HGG/LGG classifier output (not WHO grade, cancer
+    # stage, histological diagnosis, or clinical diagnosis).
+    hgg_lgg_class: Optional[str] = Field(
+        None,
+        description="BraTS dataset-cohort HGG/LGG prediction; not a clinical diagnosis",
+    )
+    hgg_lgg_probability: Optional[float] = Field(
+        None,
+        description="Softmax probability for the predicted HGG/LGG cohort class",
+    )
+    hgg_lgg_source: Optional[str] = Field(
+        None,
+        description="Provenance/limitation for the HGG/LGG cohort-label field",
+    )
 
 # --- Kaggle Classification Schemas ---
 

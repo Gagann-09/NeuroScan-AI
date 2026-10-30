@@ -1,0 +1,126 @@
+{
+  "seed": 42,
+  "device": "cpu",
+  "data_dir": "C:\\Users\\gagan\\Downloads\\Major project\\neuroscan-ai\\datasets\\BraTS_data\\BraTS2020_TrainingData",
+  "checkpoint": "C:\\Users\\gagan\\Downloads\\Major project\\neuroscan-ai\\ai_pipeline\\weights_full_train\\hgg_lgg_classifier_best.pth",
+  "checkpoint_epoch": 6,
+  "checkpoint_seed": 42,
+  "test_patient_ids": [
+    "BraTS20_Training_004",
+    "BraTS20_Training_013",
+    "BraTS20_Training_014",
+    "BraTS20_Training_016",
+    "BraTS20_Training_017",
+    "BraTS20_Training_023",
+    "BraTS20_Training_032",
+    "BraTS20_Training_045",
+    "BraTS20_Training_048",
+    "BraTS20_Training_050",
+    "BraTS20_Training_053",
+    "BraTS20_Training_058",
+    "BraTS20_Training_072",
+    "BraTS20_Training_080",
+    "BraTS20_Training_082",
+    "BraTS20_Training_102",
+    "BraTS20_Training_111",
+    "BraTS20_Training_112",
+    "BraTS20_Training_113",
+    "BraTS20_Training_115",
+    "BraTS20_Training_118",
+    "BraTS20_Training_120",
+    "BraTS20_Training_126",
+    "BraTS20_Training_136",
+    "BraTS20_Training_138",
+    "BraTS20_Training_141",
+    "BraTS20_Training_143",
+    "BraTS20_Training_173",
+    "BraTS20_Training_175",
+    "BraTS20_Training_177",
+    "BraTS20_Training_184",
+    "BraTS20_Training_187",
+    "BraTS20_Training_195",
+    "BraTS20_Training_215",
+    "BraTS20_Training_217",
+    "BraTS20_Training_230",
+    "BraTS20_Training_237",
+    "BraTS20_Training_250",
+    "BraTS20_Training_259",
+    "BraTS20_Training_260",
+    "BraTS20_Training_267",
+    "BraTS20_Training_279",
+    "BraTS20_Training_284",
+    "BraTS20_Training_287",
+    "BraTS20_Training_293",
+    "BraTS20_Training_296",
+    "BraTS20_Training_297",
+    "BraTS20_Training_309",
+    "BraTS20_Training_314",
+    "BraTS20_Training_318",
+    "BraTS20_Training_322",
+    "BraTS20_Training_348",
+    "BraTS20_Training_356",
+    "BraTS20_Training_357",
+    "BraTS20_Training_360",
+    "BraTS20_Training_363"
+  ],
+  "test_class_counts": {
+    "HGG": 44,
+    "LGG": 12,
+    "total": 56
+  },
+  "results": {
+    "balanced_accuracy": 0.7727272727272727,
+    "balanced_accuracy_ci": {
+      "lower": 0.6931818181818181,
+      "upper": 0.8409090909090908,
+      "valid_replicates": 1000,
+      "replicates_requested": 1000
+    },
+    "lgg_sensitivity": 1.0,
+    "lgg_sensitivity_ci": {
+      "lower": 1.0,
+      "upper": 1.0,
+      "valid_replicates": 1000,
+      "replicates_requested": 1000
+    },
+    "hgg_sensitivity": 0.5454545454545454,
+    "hgg_sensitivity_ci": {
+      "lower": 0.38636363636363635,
+      "upper": 0.6818181818181818,
+      "valid_replicates": 1000,
+      "replicates_requested": 1000
+    },
+    "ordinary_accuracy": 0.6428571428571429,
+    "confusion_matrix": [
+      [
+        24,
+        20
+      ],
+      [
+        0,
+        12
+      ]
+    ],
+    "majority_class_baseline": {
+      "balanced_accuracy": 0.5,
+      "lgg_sensitivity": 0.0,
+      "ordinary_accuracy": 1.0,
+      "hgg_sensitivity": 1.0
+    },
+    "roc_auc": 0.9015151515151515,
+    "test_class_counts": {
+      "HGG": 44,
+      "LGG": 12,
+      "total": 56
+    }
+  },
+  "evaluation_config": {
+    "image_size": 224,
+    "batch_size": 16,
+    "num_workers": 0,
+    "seed": 42,
+    "bootstrap_replicates": 1000,
+    "ci_alpha": 0.05
+  },
+  "created_at": "2026-10-27T15:39:26.912435+00:00"
+}

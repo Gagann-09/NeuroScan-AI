@@ -22,6 +22,7 @@ from app.services.reporting import (
     _generate_segmentation_report_with_measurements,
 )
 from ai_pipeline.models.armt_gan import ARMTGenerator2D
+from ai_pipeline.models.hgg_lgg_classifier import HggLggClassifier
 from app.services.xai import generate_gradient_saliency, compute_segmentation_alignment, XAIProvenance
 from ai_pipeline.preprocessing import preprocess_brats_study, PreprocessingConfig, _validate_nifti_image
 from ai_pipeline.preprocessing.brats_preprocessing import (
@@ -116,6 +117,14 @@ _DEFAULT_PREPROCESSING_CONFIG = None
 _PREPROCESSING_VERSION = None
 _MODEL_VERSION_CONFIG_HASH = "arch:armt-gan-2d-unet|generator:lightweight|discriminator:conditional-patchgan|loss:l1_100_adv_1"
 
+# HGG/LGG cohort classifier (BraTS dataset-cohort prediction, not clinical diagnosis).
+_HGG_LGG_DEVICE = None
+_HGG_LGG_MODEL = None
+_HGG_LGG_WEIGHTS_PATH = None
+_HGG_LGG_CHECKPOINT_IDENTIFIER = None
+_HGG_LGG_MODEL_VERSION_ID = None
+_HGG_LGG_CLASS_NAMES = ("HGG", "LGG")
+
 
 def _get_device():
     global _DEVICE
@@ -177,6 +186,59 @@ def _get_preprocessing_version():
 
 def _get_model_version_config_hash():
     return _MODEL_VERSION_CONFIG_HASH
+
+
+def _get_hgg_lgg_device():
+    global _HGG_LGG_DEVICE
+    if _HGG_LGG_DEVICE is None:
+        _HGG_LGG_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return _HGG_LGG_DEVICE
+
+
+def _get_hgg_lgg_weights_path():
+    global _HGG_LGG_WEIGHTS_PATH
+    if _HGG_LGG_WEIGHTS_PATH is None:
+        _HGG_LGG_WEIGHTS_PATH = os.path.join(
+            os.path.dirname(__file__),
+            "../../../ai_pipeline/weights_full_train/hgg_lgg_classifier_best.pth",
+        )
+    return _HGG_LGG_WEIGHTS_PATH
+
+
+def _get_hgg_lgg_model():
+    """Lazily load and return the global HGG/LGG cohort classifier."""
+    global _HGG_LGG_MODEL, _HGG_LGG_CHECKPOINT_IDENTIFIER
+    if _HGG_LGG_MODEL is None:
+        logger.info("Initializing HGG/LGG cohort classifier into global memory...")
+        _HGG_LGG_MODEL = HggLggClassifier().to(_get_hgg_lgg_device())
+        weights_path = _get_hgg_lgg_weights_path()
+        if os.path.exists(weights_path):
+            checkpoint = torch.load(weights_path, map_location=_get_hgg_lgg_device())
+            state_dict = (
+                checkpoint.get("model_state_dict", checkpoint)
+                if isinstance(checkpoint, dict)
+                else checkpoint
+            )
+            _HGG_LGG_MODEL.load_state_dict(state_dict)
+        _HGG_LGG_MODEL.eval()
+        _HGG_LGG_CHECKPOINT_IDENTIFIER = (
+            os.path.basename(weights_path) if os.path.exists(weights_path) else "unknown"
+        )
+        logger.info("HGG/LGG cohort classifier successfully cached in memory.")
+    return _HGG_LGG_MODEL
+
+
+def _get_hgg_lgg_checkpoint_identifier():
+    _get_hgg_lgg_model()  # Ensures model is loaded and identifier set
+    return _HGG_LGG_CHECKPOINT_IDENTIFIER
+
+
+def _get_hgg_lgg_model_version_id():
+    global _HGG_LGG_MODEL_VERSION_ID
+    if _HGG_LGG_MODEL_VERSION_ID is None:
+        weights_path = _get_hgg_lgg_weights_path()
+        _HGG_LGG_MODEL_VERSION_ID = _compute_model_version_id(weights_path)
+    return _HGG_LGG_MODEL_VERSION_ID
 
 
 def _compute_model_version_id(weights_path: str) -> str:
@@ -983,7 +1045,40 @@ def process_scan_task(
                 4,
             )
 
-            # Get or create ModelVersion for this checkpoint (needed for report and provenance)
+            # HGG/LGG cohort-classifier inference on the same preprocessed
+            # image_tensor (no re-download or re-preprocessing). Wrapped in its
+            # own try/except so ARMT-GAN segmentation results are preserved if
+            # the cohort classifier fails.
+            hgg_lgg_class = None
+            hgg_lgg_probability = None
+            hgg_lgg_model_version = None
+            try:
+                hgg_lgg_model = _get_hgg_lgg_model()
+                with torch.inference_mode():
+                    hgg_lgg_logits = hgg_lgg_model(image_tensor)
+                hgg_lgg_probs = torch.softmax(hgg_lgg_logits, dim=1).cpu().numpy()[0]
+                hgg_lgg_class_index = int(hgg_lgg_probs.argmax())
+                hgg_lgg_class = _HGG_LGG_CLASS_NAMES[hgg_lgg_class_index]
+                hgg_lgg_probability = round(float(hgg_lgg_probs[hgg_lgg_class_index]), 4)
+
+                # Get or create ModelVersion for the HGG/LGG checkpoint provenance.
+                hgg_lgg_model_version = _get_or_create_model_version(
+                    db,
+                    _get_hgg_lgg_model_version_id(),
+                    _get_hgg_lgg_weights_path(),
+                    "arch:hgg-lgg-classifier-2d-cnn|classes:2|loss:crossentropy",
+                    _get_preprocessing_version(),
+                )
+            except Exception as hgg_lgg_exc:
+                # Log only the exception type; ARMT-GAN results are preserved.
+                logger.error(
+                    "HGG/LGG cohort classifier inference failed for Scan ID %s: %s",
+                    scan_id,
+                    type(hgg_lgg_exc).__name__,
+                    exc_info=True,
+                )
+
+            # Get or create ModelVersion for the ARMT-GAN checkpoint
             model_version = _get_or_create_model_version(
                 db, _get_model_version_id(), _get_weights_path(), _get_model_version_config_hash(), _get_preprocessing_version()
             )
@@ -1048,7 +1143,9 @@ def process_scan_task(
                 
                 # Create Prediction with model version linkage and nullable metrics
                 # Note: dice/iou are nullable here since inference doesn't compute ground-truth metrics
-                # They are populated by the evaluation pipeline when ground truth is available
+                # They are populated by the evaluation pipeline when ground truth is available.
+                # hgg_lgg_class/hgg_lgg_probability are the BraTS dataset-cohort
+                # classifier output (not WHO grade, cancer stage, or clinical diagnosis).
                 prediction = Prediction(
                     scan_id=scan_id,
                     model_version_id=model_version.id,
@@ -1058,6 +1155,8 @@ def process_scan_task(
                     slice_coverage_percent=slice_coverage_percent,
                     dice=None,  # Requires ground-truth evaluation
                     iou=None,   # Requires ground-truth evaluation
+                    hgg_lgg_class=hgg_lgg_class,
+                    hgg_lgg_probability=hgg_lgg_probability,
                 )
                 db.add(prediction)
                 db.flush()  # Get prediction.id for Artifact FK

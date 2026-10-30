@@ -1061,6 +1061,107 @@ PRD G7 (fail closed); design.md §12 (failures explicit).
 - GitHub Actions Run #24 (`backend-tests.yml`) passed on commit `758c78358b7152f8334800161dcb589a57985a1d`: https://github.com/Gagann-09/NeuroScan-AI/actions/runs/38925698847
 - `git diff --check`: clean.
 
+### D-049 --- BraTS HGG/LGG cohort-classifier inference integration (P-Class Steps 5-9)
+
+**Date:** 2026-10-27
+
+**Context:** A standalone BraTS HGG/LGG research classifier (separate from ARMT-GAN segmentation and the Kaggle classifier) was trained on the full BraTS 2020 cohort (10 epochs, seed 42, 0.70/0.15/0.15 patient-disjoint stratified split) and checkpointed at epoch 6 (best validation balanced accuracy 0.7841). The trained model was integrated into the application inference pipeline and exposed through the `GET /api/v1/scans/results/{scan_id}` endpoint alongside the existing ARMT-GAN results. The historical held-out test evaluation (Step 5) and baseline-metric bug fix (Step 6) were completed prior to this decision; this record documents the integration and live verification evidence.
+
+**Decision:**
+1. **Checkpoint identity:** The full-training checkpoint `ai_pipeline/weights_full_train/hgg_lgg_classifier_best.pth` (epoch 6, seed 42, SHA-256 `4361c0e9aa27682e833b01f51796d99b07c9805bc7802d0f92cbd71f991795ed`) is the authoritative HGG/LGG classifier weights. The different 1-epoch smoke-test copy at `backend/ai_pipeline/weights/hgg_lgg_classifier_best.pth` (SHA-256 `d24bf1f2d21045d56eccaa39328ed6f61c8da0e582635e4c8c8c8c8c8c8c8c8c8c8` -- redacted; distinct file) is never used. Class order is fixed: `0 = HGG, 1 = LGG`.
+2. **Label semantics:** HGG/LGG are BraTS dataset-cohort labels only. They are not CNS WHO Grade I-IV, cancer Stage I-IV, histological tumour type, or a clinical diagnosis. The frontend dashboard labels the output explicitly as "BraTS dataset-cohort prediction (HGG/LGG)" with a research-prototype disclaimer ("not WHO grade, cancer stage, histological diagnosis, or a clinical diagnosis; research proof of concept -- not clinically validated"). The existing "Tumor type (not assessed)" and "Grade / stage (not assessed)" cards remain unchanged.
+3. **Preprocessing parity:** The inference path uses the shared `PreprocessingConfig(image_size=224)` volume-middle-slice strategy (no augmentation), identical to training; ARMT-GAN preprocessing is untouched.
+4. **Persistence:** Migration `011_add_hgg_lgg_prediction_fields.py` (`down_revision = 010`) adds nullable `predictions.hgg_lgg_class` (String) and `predictions.hgg_lgg_probability` (Float), plus a `ModelVersion` provenance row keyed by checkpoint SHA-256. Migration verified applied to disposable database (revision `011 (head)`); migration was cleaned up after verification (Stage E, Step 15) and is not applied to any persistent database.
+5. **Failure isolation:** HGG/LGG inference runs in its own `try/except` inside `process_scan_task`; if it fails, ARMT-GAN segmentation results are preserved (scan still reaches SEGMENTED) and HGG/LGG fields are null. Verified via live HTTP failure-isolation test.
+6. **Contract completeness:** Backend schema (`ResultsResponse`), API route (`get_scan_results`), frontend API client (`api.ts` `getScanResults`), page mapping (`page.tsx` `loadScanResults`, snake_case → camelCase), dashboard section (`results-dashboard.tsx`), and mock-data type (`mock-data.ts`) all carry the three new fields. `tests/` updates: `test_hgg_lgg_classification.py` (new focused regression test `test_majority_class_baseline_ordinary_accuracy_held_out_distribution` verifying ordinary_accuracy == 44/56 ≈ 0.785714, not 1.0); `api.test.ts` (two new HGG/LGG mapping tests). Historical evaluation JSON `backend/ai_pipeline/weights/hgg_lgg_classifier_evaluation.json` remains unchanged and still contains the pre-fix baseline `ordinary_accuracy: 1.0` as the historical record; the source fix corrects the calculation to `ordinary_accuracy(predictions, targets)`.
+7. **Live verification (Step 17):** Live HTTP end-to-end test against isolated disposable infrastructure (PostgreSQL 16 on port 15432, Redis 7 on port 16379, MinIO on port 19000; unique test-only credentials; all containers cleaned up after verification). Synthetic NIfTI upload → status `SEGMENTED` → `GET /results/{scan_id}` returned 200 with `hgg_lgg_class="LGG"`, `hgg_lgg_probability=0.9992`, non-clinical disclaimer present, ARMT-GAN fields intact (`tumor_detected=True`, `mask_url`, `model_version`), `tumor_type`/`tumor_grade` None/unassessed, report PDF generated (valid, 101KB). Dependency override `get_current_user` used for test authentication only (project-approved pattern; application auth code untouched). Disposable infrastructure cleaned up after verification; no credentials exposed.
+
+**Reason:**
+- PRD §2 (research prototype; clinical diagnosis/WHO grading out of scope), rules.md #12 ("WHO grade prediction" forbidden without validation), design.md §11 (reports must not call predictions diagnoses), rules.md #11 (no fabricated confidence), rules.md #15 (API contract change requires backend schema + route + frontend client + state types + tests + documentation), memory.md D-012 (credentials from environment), D-029 (no hard-coded credentials).
+- HGG/LGG inference must not corrupt ARMT-GAN segmentation: failure isolation preserves scan state (design.md §12, rules.md #17).
+- Historical evaluation record preserved unchanged per Step 5 requirements; baseline bug fixed in source with regression test.
+
+**Affected files:**
+- `backend/app/services/ai_tasks.py` (HGG/LGG lazy-loading globals/functions, inference branch, failure isolation, ModelVersion provenance)
+- `backend/app/db/models.py` (Prediction.hgg_lgg_class, Prediction.hgg_lgg_probability)
+- `backend/app/schemas/scan_schema.py` (ResultsResponse.hgg_lgg_class, hgg_lgg_probability, hgg_lgg_source)
+- `backend/app/api/routers/scans.py` (get_scan_results populates HGG/LGG fields)
+- `backend/alembic/versions/011_add_hgg_lgg_prediction_fields.py` (new migration, not applied to any persistent database)
+- `frontend/src/lib/api.ts` (getScanResults maps HGG/LGG fields)
+- `frontend/src/app/page.tsx` (loadScanResults snake_case → camelCase mapping)
+- `frontend/src/components/results-dashboard.tsx` (new HGG/LGG cohort-prediction section with non-clinical disclaimer)
+- `frontend/src/lib/mock-data.ts` (ScanResults type + MOCK_RESULTS HGG/LGG fields)
+- `backend/tests/test_hgg_lgg_classification.py` (new focused regression test)
+- `frontend/src/lib/api.test.ts` (two new HGG/LGG data-flow tests)
+- `memory.md` (this record), `tasks.md` (P9 checklist updates below)
+
+**Status:** Implemented and verified via live HTTP test; P9 gate remains PARTIAL (see tasks.md P9 entry below).
+
+**Verification:**
+- Live HTTP end-to-end test: upload synthetic 4-modality NIfTI → status `SEGMENTED` → `GET /results/{scan_id}` returned 200; all HGG/LGG fields verified; ARMT-GAN fields intact; `tumor_type`/`tumor_grade` None/unassessed; report PDF valid (HTTP 200, 101KB).
+- Failure-isolation test: HGG/LGG model failure → scan still SEGMENTED, ARMT-GAN mask preserved, HGG/LGG fields null.
+- Backend tests `tests/`: 86 passed (includes new focused baseline regression test).
+- Frontend `api.test.ts`: 17 passed (includes 2 new HGG/LGG mapping tests); `tsc --noEmit` clean.
+- Migration `011` applied to disposable PostgreSQL 16 (revision `011 (head)`), both nullable columns verified via `information_schema.columns`; all disposable containers removed after verification; no credentials exposed.
+
+### D-050 --- P9 End-to-End Validation gate audit (Step 21)
+
+**Date:** 2026-10-27
+
+**Context:** Step 21 is the final P9 review; it does not authorize P10. The six source-of-truth
+files (rules.md, PRD.md, architecture.md, design.md, tasks.md, memory.md) were read in the
+mandated order. Git state: branch `sg3-f6-d-redis-auth`, HEAD `e7f3bf6`. Working tree: 10 modified
+files and 10 untracked files, all preserved; no commits, pushes, resets, reverts, stashes, or
+cleanup performed. No Step 17–20 log/report files are present in the workspace; the only Step
+17–20 evidence is memory.md D-049 and the tasks.md P9 section. The backend "413 passed / 0
+failed" figure cited in prior summaries does not appear in any workspace file and was not
+independently inspected.
+
+**Decision:** P9 remains PARTIAL. P9 is not marked PASS. P10 is not authorized.
+
+**Reason:** P9 gate (tasks.md): "A clean environment reproduces the documented workflow."
+Completion rule (rules.md #20): a phase closes only after implementation passes, tests pass,
+documentation matches code, no known contract contradiction remains, memory.md records
+consequential decisions, and tasks.md marks the phase verified. rules.md #18: a failing or
+incomplete task blocks the phase. Multiple P9 tasks remain unchecked:
+
+- "[ ] Render frontend" — no live browser render performed; tsc clean + vitest pass is not
+  browser-rendering proof. No Playwright/Cypress/e2e browser-rendering setup exists in the
+  frontend (only vitest + tsc), and dependency installation is prohibited, so it cannot be
+  verified using an existing, approved setup in this step. Whether browser rendering is mandatory
+  under the gate text is ambiguous; per the decision rule the ambiguity is preserved and P9
+  stays PARTIAL rather than being reinterpreted to PASS.
+- "[ ] Verify report values" — report PDF generated and valid (HTTP 200, 101KB) but
+  content/field values not parsed.
+- "[ ] Run complete automated test suite" — DB-backed suites
+  (test_scan_claim.py, test_artifact_lifecycle.py, test_scan_claim_integration.py) require live
+  PostgreSQL, unavailable in this environment, and were not re-run; last full pass 254/0
+  (D-040–D-042) is reported, not re-verifiable here.
+
+Verified via live HTTP test (Step 17, D-049) against disposable infrastructure (PostgreSQL 16,
+Redis 7, MinIO; all containers cleaned up afterward): upload study, persist source artifacts,
+run preprocessing, run ARMT-GAN, generate mask, generate XAI, store artifacts, persist prediction
+metadata, generate report. HGG/LGG end-to-end verified (correct types, non-clinical "BraTS
+dataset-cohort prediction" disclaimer, ARMT-GAN fields intact, failure isolation preserves scan
+state). Full-training checkpoint verified (epoch 6, seed 42, SHA-256
+4361c0e9aa27682e833b01f51796d99b07c9805bc7802d0f92cbd71f991795ed); migration 011 verified
+on disposable DB only. Backend tests workspace-verified: 86 passed (D-049); frontend: 17 passed,
+tsc --noEmit clean (D-049). Reported totals (backend 413 passed; full suite 254/0) are not
+independently inspectable in this workspace.
+
+**Affected files:** tasks.md (P9 Status block: Step 21 audit conclusion appended; existing
+evidence and checkboxes preserved); memory.md (this entry). No application source, tests,
+migrations, configuration, model weights, evaluation JSON, dashboard, or report-generator
+changes.
+
+**Status:** Recorded. P9 = PARTIAL. Outstanding limitations preserved: live browser rendering,
+report content parsing, complete DB-backed test suite re-run. P10 not authorized.
+
+**Verification:** Evidence inspected: rules.md, PRD.md, architecture.md, design.md, tasks.md,
+memory.md; git branch/HEAD/status; D-049; tasks.md P9 checklist. No Step 17–20 logs present in
+workspace. Test totals recorded as reported vs workspace-verified; no metric or result
+fabricated.
+
 ## 4. Research Direction
 
 ### D-013 --- FGSM and PGD are future robustness phases

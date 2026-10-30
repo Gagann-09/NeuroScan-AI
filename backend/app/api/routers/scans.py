@@ -557,6 +557,19 @@ def get_scan_results(
             if cohort_metadata
             else None
         ),
+        hgg_lgg_class=(
+            prediction.hgg_lgg_class if prediction else None
+        ),
+        hgg_lgg_probability=(
+            prediction.hgg_lgg_probability if prediction else None
+        ),
+        hgg_lgg_source=(
+            "BraTS HGG/LGG cohort classifier (volume-middle slice, 224x224); "
+            "dataset-cohort prediction only, not WHO grade, cancer stage, "
+            "histological diagnosis, or clinical diagnosis"
+            if prediction and prediction.hgg_lgg_class is not None
+            else None
+        ),
     )
 
 
